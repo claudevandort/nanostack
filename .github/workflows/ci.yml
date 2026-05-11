@@ -156,17 +156,17 @@ jobs:
           cache-dependency-path: bench/driver/go.sum
 
       - name: Run perf gate
-        run: zig build bench -- --out bench-result.json
+        run: zig build bench -- --out "$GITHUB_WORKSPACE/bench-result.json"
 
       - name: Post bench summary
         if: always()
         run: |
-          if [ -f bench-result.json ]; then
+          if [ -f "$GITHUB_WORKSPACE/bench-result.json" ]; then
             {
               echo "## Perf gate result"
               echo ""
               echo '```json'
-              cat bench-result.json
+              cat "$GITHUB_WORKSPACE/bench-result.json"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
