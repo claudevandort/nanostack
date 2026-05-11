@@ -48,7 +48,7 @@ func TestBadSignatureIsRejected(t *testing.T) {
 	// replay. Expect 403 SignatureDoesNotMatch.
 	signer := v4.NewSigner()
 	req, _ := http.NewRequest(http.MethodGet, endpoint()+"/", nil)
-	req.Host = "127.0.0.1:4577" // Host header used by signing
+	req.Host = endpointHost() // Host header used by signing
 	if err := signer.SignHTTP(context.Background(), testCreds(), req, sha256Empty, "s3", "us-east-1", time.Now()); err != nil {
 		t.Fatalf("SignHTTP: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestBadSignatureIsRejected(t *testing.T) {
 func TestPresignedHappyPath(t *testing.T) {
 	signer := v4.NewSigner()
 	req, _ := http.NewRequest(http.MethodHead, endpoint()+"/test-bucket/test-key?X-Amz-Expires=3600", nil)
-	req.Host = "127.0.0.1:4577"
+	req.Host = endpointHost()
 	signedURL, _, err := signer.PresignHTTP(context.Background(), testCreds(), req, "UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Now())
 	if err != nil {
 		t.Fatalf("PresignHTTP: %v", err)
@@ -99,7 +99,7 @@ func TestPresignedHappyPath(t *testing.T) {
 func TestPresignedExpired(t *testing.T) {
 	signer := v4.NewSigner()
 	req, _ := http.NewRequest(http.MethodHead, endpoint()+"/test-bucket/test-key?X-Amz-Expires=1", nil)
-	req.Host = "127.0.0.1:4577"
+	req.Host = endpointHost()
 	// Sign as if 5 seconds ago — already expired against a 1-second window.
 	signedURL, _, err := signer.PresignHTTP(context.Background(), testCreds(), req, "UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Now().Add(-5*time.Second))
 	if err != nil {
@@ -230,7 +230,7 @@ func presignWithHeader(t *testing.T, method, path, headerName, headerValue strin
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
-	req.Host = "127.0.0.1:4577"
+	req.Host = endpointHost()
 	req.Header.Set(headerName, headerValue)
 	signedURL, _, err := signer.PresignHTTP(context.Background(), testCreds(), req, "UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Now())
 	if err != nil {

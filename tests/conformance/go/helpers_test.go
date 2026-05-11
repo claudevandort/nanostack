@@ -4,6 +4,7 @@ package conformance
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -19,6 +20,17 @@ func endpoint() string {
 		return e
 	}
 	return "http://127.0.0.1:4577"
+}
+
+// endpointHost returns the Host header value the SDK should sign with —
+// derived from NANOSTACK_ENDPOINT so tests work on any port. CI uses
+// 14566; local dev typically uses 4577.
+func endpointHost() string {
+	u, err := url.Parse(endpoint())
+	if err != nil {
+		return "127.0.0.1:4577"
+	}
+	return u.Host
 }
 
 func newClient(t *testing.T) *s3.Client {
