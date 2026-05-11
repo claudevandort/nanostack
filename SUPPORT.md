@@ -39,8 +39,11 @@ This file is updated as part of every release. The source of truth for the v1 cu
 
 | Capability | Status | Milestone |
 |---|---|---|
-| SigV4 — header authentication | stub (accept any) | M2 |
-| SigV4 — presigned URLs (incl. custom headers) | stub (accept any) | M2 |
+| SigV4 — header authentication | supported | M2 |
+| SigV4 — presigned URLs (incl. custom headers) | supported | M2 |
+| `--no-auth` opt-out (dev convenience) | supported | M2 |
+| Configurable clock-skew tolerance (`--skew-seconds`) | supported | M2 |
+| Streaming payload hashes (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) | planned | M3 |
 | Path-style addressing | supported | M1 |
 | Virtual-hosted-style addressing | supported | M1 |
 | AWS-strict bucket-name validation | supported | M1 |

@@ -18,6 +18,11 @@ pub const Config = struct {
     /// Internal: start everything, then exit. Used to benchmark cold start
     /// without holding the listener open.
     self_test_ready: bool = false,
+    /// Skip SigV4 verification entirely (curl-friendly dev mode). Off by
+    /// default — real AWS rejects unsigned requests, and so do we.
+    no_auth: bool = false,
+    /// SigV4 clock-skew tolerance (seconds). AWS default is 900 (15 min).
+    skew_seconds: i64 = 900,
 };
 
 pub const ParseError = error{
@@ -36,6 +41,12 @@ pub fn parse(args: []const [:0]const u8) ParseError!Config {
             c.ephemeral = true;
         } else if (std.mem.eql(u8, arg, "--self-test-ready")) {
             c.self_test_ready = true;
+        } else if (std.mem.eql(u8, arg, "--no-auth")) {
+            c.no_auth = true;
+        } else if (std.mem.eql(u8, arg, "--skew-seconds")) {
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            c.skew_seconds = std.fmt.parseInt(i64, args[i], 10) catch return ParseError.InvalidValue;
         } else if (std.mem.eql(u8, arg, "--port")) {
             i += 1;
             if (i >= args.len) return ParseError.MissingValue;
@@ -98,6 +109,12 @@ test "overrides" {
     try testing.expectEqualStrings("0.0.0.0", c.bind);
     try testing.expect(c.ephemeral);
     try testing.expectEqualStrings("eu-west-1", c.region);
+}
+
+test "no-auth + skew flags" {
+    const c = try parse(&.{ "nanostack", "--no-auth", "--skew-seconds", "60" });
+    try testing.expect(c.no_auth);
+    try testing.expectEqual(@as(i64, 60), c.skew_seconds);
 }
 
 test "unknown flag" {
