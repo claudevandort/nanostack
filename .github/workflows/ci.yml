@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build
+        run: zig build
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Start nanostack
+        env:
+          NANOSTACK_PORT: '14566'
+        run: |
+          ./zig-out/bin/nanostack --port "$NANOSTACK_PORT" > nanostack.log 2>&1 &
+          echo $! > nanostack.pid
+          # Wait until the listener is up (max 5 s).
+          for i in $(seq 1 50); do
+            if curl -sf -o /dev/null "http://127.0.0.1:${NANOSTACK_PORT}/_/health" \
+               || curl -s -o /dev/null "http://127.0.0.1:${NANOSTACK_PORT}/"; then
+              echo "nanostack ready"
+              exit 0
+            fi
+            sleep 0.1
+          done
+          echo "nanostack failed to start" >&2
+          cat nanostack.log >&2
+          exit 1
+
+      - name: Go conformance smoke test
+        working-directory: tests/conformance/go
+        env:
+          NANOSTACK_ENDPOINT: 'http://127.0.0.1:14566'
+        run: go test -v -count=1 ./...
+
+      - name: Stop nanostack
+        if: always()
+        run: |
+          if [ -f nanostack.pid ]; then
+            kill "$(cat nanostack.pid)" 2>/dev/null || true
+          fi
+          if [ -f nanostack.log ]; then
+            echo "::group::nanostack.log"
+            cat nanostack.log
+            echo "::endgroup::"
+          fi

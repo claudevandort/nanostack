@@ -1,0 +1,13 @@
+# Zig build artefacts
+zig-cache/
+zig-out/
+.zig-cache/
+zig-pkg/
+
+# Editor
+.DS_Store
+.idea/
+.vscode/
+
+# Go conformance test artefacts
+tests/conformance/go/go.sum.local
