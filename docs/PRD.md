@@ -124,7 +124,9 @@ A **single-binary, sub-second-startup, Apache-2.0, accurate-on-the-core-surface*
 - **Comptime** is used for in-place optimizations (e.g., perfect-hash route tables), not for whole-schema parsing.
 
 ### Storage
-- **Filesystem-backed by default.** Object data lives under `~/.nanostack/<profile>/s3/<bucket>/<key>` (or wherever `--data-dir` points). Metadata in a sidecar (SQLite or simple per-object JSON, decided in §8).
+- **Filesystem-backed by default.** Object data lives under `<data-dir>/<profile>/s3/<bucket>/<key-hash>/data` per the on-disk layout in §9.
+- **Per-object JSON metadata** in a sidecar (`meta.json`) next to each object body. Chosen for inspectability (`cat meta.json` answers debugging questions in one command), zero external dependencies, and atomic per-object writes. The convenience win matters for a dev/test emulator; we accept the linear listing cost and offset it with…
+- **In-memory sorted listing index** built by scanning bucket directories at startup. `ListObjects` / `ListObjectsV2` resolve against this index instead of walking the filesystem. Mutations on PUT/DELETE update the index incrementally. Promote to SQLite later if profiling ever shows listing is the bottleneck — unlikely for local dev workloads.
 - **`--ephemeral` flag** runs entirely in a tmpfs-style memory backend; the process owns its lifetime.
 - **`io_uring` on Linux** via `Cloudef/zig-aio` for hot read/write paths; standard POSIX file I/O on macOS via kqueue.
 
@@ -359,10 +361,13 @@ Anything beyond that (SNS, EventBridge, Kinesis, IAM) is reconsidered after v1.4
 
 ## 17. Open Questions
 
-- **Metadata store on disk:** single SQLite per profile, or per-object JSON files? Initial lean is per-object JSON for v1 (no extra dependency, simple to reason about); revisit if listing performance suffers on buckets > 100k objects.
 - **TLS in v1 or v1.1?** Currently planned for post-v1. If early users need it for browser-driven presigned URL workflows, we accelerate.
-- **Profile concept** (multi-profile state isolation under one running binary) — designed in but not implemented in v1. Should we ship single-profile-only and add multi-profile in v1.1?
-- **Cargo of AWS error catalog**: we extract from Smithy at build time, but some legacy/special errors aren't in the Smithy model. Decide between hard-coding the deltas vs maintaining a small `errors.zig` overlay file.
+- **AWS error catalog overlay:** we extract from Smithy at build time, but some legacy/special errors aren't in the Smithy model. Decide between hard-coding the deltas vs maintaining a small `errors.zig` overlay file.
+
+## 17a. Decisions Locked
+
+- **Metadata format (2026-05-12):** per-object JSON sidecar (`meta.json`) + in-memory sorted listing index built at startup. Resolves the §9 / §17 open question. Chosen for inspectability and zero deps; offsets listing cost with the index. See §6 / §9.
+- **Multi-profile state isolation (2026-05-12):** deferred to v1.1. v1 ships single-profile-only. The `--profile` flag still exists and is honoured for the data-dir path so that v1.1 can layer multi-profile in without breaking existing users.
 
 ---
 
