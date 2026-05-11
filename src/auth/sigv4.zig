@@ -60,6 +60,7 @@ pub const VerifyError = error{
     RequestTimeTooSkewed,
     PresignedExpired,
     StreamingUnsupported,
+    XAmzContentSha256Mismatch,
     OutOfMemory,
     MalformedQuery,
     MalformedHeaders,
@@ -336,7 +337,12 @@ fn resolvePayloadHash(req: Request, allocator: Allocator) VerifyError!PayloadHas
         if (std.mem.startsWith(u8, v, "STREAMING-")) {
             return VerifyError.StreamingUnsupported;
         }
-        if (v.len == 64) {
+        if (v.len == 64 and isLowercaseHex(v)) {
+            // Hex digest mode: verify the body actually matches what the
+            // client signed. Without this, the body could be tampered in
+            // transit and we'd accept it.
+            const actual = canonical.sha256Hex(req.body);
+            if (!std.mem.eql(u8, v, &actual)) return VerifyError.XAmzContentSha256Mismatch;
             return .{ .bytes = v, .owned = false };
         }
         // Otherwise treat as opaque and use literally — AWS allows raw values.
@@ -346,6 +352,14 @@ fn resolvePayloadHash(req: Request, allocator: Allocator) VerifyError!PayloadHas
     const buf = allocator.alloc(u8, 64) catch return VerifyError.OutOfMemory;
     @memcpy(buf, &hex);
     return .{ .bytes = buf, .owned = true };
+}
+
+fn isLowercaseHex(s: []const u8) bool {
+    for (s) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        if (!ok) return false;
+    }
+    return true;
 }
 
 fn freePayloadHash(allocator: Allocator, p: PayloadHash) void {

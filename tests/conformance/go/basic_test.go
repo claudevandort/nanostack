@@ -2,14 +2,11 @@
 // official aws-sdk-go-v2 client.
 //
 // This file keeps the basic NotImplemented contract for un-mapped
-// operations. M2 added SigV4 verification: anonymous requests are now
-// denied, so we exercise the unrouted-op path with a signed PutObject
-// (object operations are M3's territory; they currently resolve to
-// `unknown` → 501).
+// operations. M3 routed all object operations; the remaining unrouted
+// path in M3 is ListObjects(V2), which is M4's territory.
 package conformance
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -22,12 +19,16 @@ import (
 
 func TestUnroutedOperationReturnsNotImplemented(t *testing.T) {
 	c := newClient(t)
-	// PutObject is an object op — currently unrouted; expect a signed
-	// request to land in the s3.unknown branch and surface as 501.
-	_, err := c.PutObject(context.Background(), &s3.PutObjectInput{
-		Bucket: aws.String("any-bucket"),
-		Key:    aws.String("any-key"),
-		Body:   bytes.NewReader([]byte("hello")),
+	bucket := uniqueBucketName(t, "unrouted")
+	if _, err := c.CreateBucket(context.Background(), &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("seed CreateBucket: %v", err)
+	}
+	defer cleanupBucket(t, c, bucket)
+
+	// ListObjectsV2 lands in M4 — `GET /bucket?list-type=2` is currently
+	// unrouted and should surface as 501 NotImplemented.
+	_, err := c.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
 	})
 	if err == nil {
 		t.Fatalf("expected NotImplemented error, got nil")

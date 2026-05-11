@@ -4,7 +4,10 @@
 pub const xml = @import("wire/xml.zig");
 pub const errors = @import("wire/errors.zig");
 pub const s3_responses = @import("wire/s3_responses.zig");
+pub const object_responses = @import("wire/object_responses.zig");
+pub const delete_objects_parser = @import("wire/delete_objects_parser.zig");
 pub const router = @import("router.zig");
+pub const http_range = @import("http/range.zig");
 pub const sigv4 = @import("auth/sigv4.zig");
 pub const iso8601 = @import("auth/iso8601.zig");
 pub const signing_key = @import("auth/signing_key.zig");
@@ -20,7 +23,10 @@ test {
     _ = xml;
     _ = errors;
     _ = s3_responses;
+    _ = object_responses;
+    _ = delete_objects_parser;
     _ = router;
+    _ = http_range;
     _ = sigv4;
     _ = iso8601;
     _ = signing_key;

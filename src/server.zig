@@ -55,14 +55,14 @@ pub const App = struct {
 
         // ---------- SigV4 verification ----------
         if (!self.config.no_auth) {
-            const all_headers = collectHeaders(arena, req) catch {
+            const verify_headers = collectHeaders(arena, req) catch {
                 return respondError(res, request_id, host_id, .internal_error, req.url.path);
             };
             sigv4.verify(arena, .{
                 .method = method_str,
                 .path = req.url.path,
                 .query = req.url.query,
-                .headers = all_headers,
+                .headers = verify_headers,
                 .body = req.body() orelse "",
             }, .{
                 .access_key = self.config.access_key,
@@ -78,12 +78,29 @@ pub const App = struct {
         }
 
         // ---------- Service dispatch ----------
-        const parsed = router.parse(method_str, host_header, req.url.path);
+        const parsed = router.parse(method_str, host_header, req.url.path, req.url.query);
+
+        // Bridge sigv4-collected headers into storage.Header for the service.
+        // Same shape, just a cast — but Zig 0.16 won't let us @ptrCast slices
+        // of different declared types, so rebuild explicitly.
+        const all_headers = collectHeaders(arena, req) catch
+            return respondError(res, request_id, host_id, .internal_error, req.url.path);
+        const svc_headers = arena.alloc(storage.Header, all_headers.len) catch
+            return respondError(res, request_id, host_id, .internal_error, req.url.path);
+        for (all_headers, 0..) |h, i| svc_headers[i] = .{ .name = h.name, .value = h.value };
+
+        const range_header = req.header("range");
+
         const result = s3.handle(.{
             .backend = self.backend,
             .allocator = arena,
             .owner_id = self.config.access_key,
             .owner_display_name = "nanostack",
+            .request = .{
+                .headers = svc_headers,
+                .body = req.body() orelse "",
+                .range = range_header,
+            },
         }, parsed);
 
         switch (result) {
@@ -102,6 +119,7 @@ fn mapVerifyError(e: sigv4.VerifyError) errors.Code {
         sigv4.VerifyError.PresignedExpired => .access_denied,
         sigv4.VerifyError.MissingSignedHeader => .signature_does_not_match,
         sigv4.VerifyError.StreamingUnsupported => .not_implemented,
+        sigv4.VerifyError.XAmzContentSha256Mismatch => .bad_digest,
         sigv4.VerifyError.MalformedAuthorization,
         sigv4.VerifyError.MalformedCredentialScope,
         sigv4.VerifyError.MalformedPresignedQuery,
@@ -132,7 +150,14 @@ fn respondOk(
     res.header("x-amz-request-id", request_id);
     res.header("x-amz-id-2", host_id);
     for (out.extra_headers) |h| res.header(h.name, h.value);
-    if (out.body.len > 0) {
+
+    // Object responses surface the stored content type; bucket-op success
+    // bodies are AWS XML. Empty bodies (PutObject, DeleteBucket, HeadObject)
+    // get no Content-Type — let httpz decide.
+    if (out.content_type_override) |ct| {
+        res.header("Content-Type", ct);
+        res.content_type = null;
+    } else if (out.body.len > 0) {
         res.header("Content-Type", "application/xml");
         res.content_type = null;
     }

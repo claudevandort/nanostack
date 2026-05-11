@@ -11,6 +11,12 @@ pub fn build(b: *std.Build) void {
     });
     const httpz_mod = httpz_dep.module("httpz");
 
+    const xml_dep = b.dependency("xml", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const xml_mod = xml_dep.module("xml");
+
     // Library module: re-exports the modules used in tests so we have one
     // place to hang `zig build test` off.
     const lib_mod = b.addModule("nanostack", .{
@@ -18,6 +24,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
     lib_mod.addImport("httpz", httpz_mod);
+    lib_mod.addImport("xml", xml_mod);
 
     const exe = b.addExecutable(.{
         .name = "nanostack",
@@ -29,6 +36,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "nanostack", .module = lib_mod },
                 .{ .name = "httpz", .module = httpz_mod },
+                .{ .name = "xml", .module = xml_mod },
             },
         }),
     });

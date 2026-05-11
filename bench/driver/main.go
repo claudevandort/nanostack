@@ -10,6 +10,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -38,23 +40,51 @@ import (
 // Budget schema (matches bench/budgets.json)
 
 type Metric struct {
-	Key        string  `json:"key"`
-	Label      string  `json:"label"`
-	Unit       string  `json:"unit"`
-	Target     float64 `json:"target,omitempty"`
-	TargetMin  float64 `json:"target_min,omitempty"`
-	Comparison string  `json:"comparison,omitempty"` // "le" (default) or "ge"
-	Gate       bool    `json:"gate"`
-	How        string  `json:"how,omitempty"`
+	Key        string             `json:"key"`
+	Label      string             `json:"label"`
+	Unit       string             `json:"unit"`
+	Target     float64            `json:"target,omitempty"`
+	Targets    map[string]float64 `json:"targets,omitempty"`     // per-backend `le` budgets
+	TargetMin  float64            `json:"target_min,omitempty"`
+	TargetsMin map[string]float64 `json:"targets_min,omitempty"` // per-backend `ge` budgets
+	Comparison string             `json:"comparison,omitempty"`  // "le" (default) or "ge"
+	Gate       bool               `json:"gate"`
+	How        string             `json:"how,omitempty"`
 
 	Measured *float64 `json:"measured,omitempty"`
 	Pass     *bool    `json:"pass,omitempty"`
+}
+
+// effectiveTarget returns the budget to compare against for the active
+// backend. Per-backend maps win over the single-value fields when present.
+func (m *Metric) effectiveTarget(backend string) (target float64, comparison string, ok bool) {
+	if m.Comparison == "ge" {
+		if m.TargetsMin != nil {
+			if v, present := m.TargetsMin[backend]; present {
+				return v, "ge", true
+			}
+		}
+		if m.TargetMin > 0 {
+			return m.TargetMin, "ge", true
+		}
+		return 0, "ge", false
+	}
+	if m.Targets != nil {
+		if v, present := m.Targets[backend]; present {
+			return v, "le", true
+		}
+	}
+	if m.Target > 0 {
+		return m.Target, "le", true
+	}
+	return 0, "le", false
 }
 
 type Budgets struct {
 	SchemaVersion int      `json:"schema_version"`
 	Source        string   `json:"source"`
 	Notes         []string `json:"notes,omitempty"`
+	Backend       string   `json:"backend,omitempty"`
 	Metrics       []Metric `json:"metrics"`
 	Informational []Metric `json:"informational_metrics,omitempty"`
 }
@@ -71,7 +101,7 @@ func loadBudgets(path string) (*Budgets, error) {
 	return &b, nil
 }
 
-func recordMetric(metrics []Metric, key string, measured float64) []Metric {
+func recordMetric(metrics []Metric, key string, measured float64, backend string) []Metric {
 	for i := range metrics {
 		if metrics[i].Key != key {
 			continue
@@ -79,12 +109,12 @@ func recordMetric(metrics []Metric, key string, measured float64) []Metric {
 		v := measured
 		metrics[i].Measured = &v
 		pass := true
-		switch metrics[i].Comparison {
-		case "ge":
-			pass = v >= metrics[i].TargetMin
-		default: // "le" or empty
-			if metrics[i].Target > 0 {
-				pass = v <= metrics[i].Target
+		target, comparison, ok := metrics[i].effectiveTarget(backend)
+		if ok {
+			if comparison == "ge" {
+				pass = v >= target
+			} else {
+				pass = v <= target
 			}
 		}
 		metrics[i].Pass = &pass
@@ -109,7 +139,7 @@ func anyGateFailed(b *Budgets) bool {
 // Process / measurement helpers
 
 func spawnNanostack(binPath string, port int, extra ...string) (*exec.Cmd, error) {
-	args := append([]string{"--port", strconv.Itoa(port), "--ephemeral"}, extra...)
+	args := append([]string{"--port", strconv.Itoa(port)}, extra...)
 	cmd := exec.Command(binPath, args...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
@@ -118,6 +148,23 @@ func spawnNanostack(binPath string, port int, extra ...string) (*exec.Cmd, error
 		return nil, err
 	}
 	return cmd, nil
+}
+
+// backendArgs returns the flags to spawn the requested backend variant.
+// fs: --data-dir under a temp dir. mem: --ephemeral.
+func backendArgs(mode string, tempBase string) ([]string, error) {
+	switch mode {
+	case "mem", "":
+		return []string{"--ephemeral"}, nil
+	case "fs":
+		dir, err := os.MkdirTemp(tempBase, "ns-bench-fs-")
+		if err != nil {
+			return nil, err
+		}
+		return []string{"--data-dir", dir}, nil
+	default:
+		return nil, fmt.Errorf("unknown --backend %q (mem|fs)", mode)
+	}
 }
 
 func waitTCP(port int, timeout time.Duration) error {
@@ -222,20 +269,19 @@ func readRSSMB(pid int) (float64, error) {
 }
 
 // measureWipeRestart kills `cmd`, respawns nanostack on the same port, and
-// returns median time-to-bind in ms across `samples` cycles. The supplied
-// `cmd` is consumed (closed); caller must capture the final spawned cmd
-// from the returned pointer.
-func measureWipeRestart(binPath string, port int, samples int) (float64, *exec.Cmd, error) {
+// returns median time-to-bind in ms across `samples` cycles. Backend args
+// are forwarded so we measure the configured storage path. The returned
+// final cmd is owned by the caller.
+func measureWipeRestart(binPath string, port int, samples int, extra []string) (float64, *exec.Cmd, error) {
 	durs := make([]float64, 0, samples)
 	var current *exec.Cmd
 	for i := 0; i < samples; i++ {
 		if current != nil {
 			killProcessGroup(current)
-			// Allow the OS to release the port.
 			time.Sleep(20 * time.Millisecond)
 		}
 		start := time.Now()
-		cmd, err := spawnNanostack(binPath, port)
+		cmd, err := spawnNanostack(binPath, port, extra...)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -308,6 +354,84 @@ func measureHeadBucketThroughput(c *s3.Client, bucket string, workers int, dur t
 	return float64(ops.Load()) / dur.Seconds()
 }
 
+// measurePutObjectLatency loops n sequential PutObject calls of a fixed-size
+// body, into rotating keys so we exercise the hot path (not the overwrite
+// shortcut).
+func measurePutObjectLatency(c *s3.Client, bucket string, body []byte, n int) (p50, p99 float64) {
+	durs := make([]float64, 0, n)
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("p/%d", i)
+		start := time.Now()
+		_, err := c.PutObject(context.Background(), &s3.PutObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+			Body:   bytes.NewReader(body),
+		})
+		if err != nil {
+			continue
+		}
+		durs = append(durs, ms(time.Since(start)))
+	}
+	return percentile(durs, 50), percentile(durs, 99)
+}
+
+// measureGetObjectLatency seeds one key, then loops n GetObject calls
+// against it. The body is drained so the timing includes the full read.
+func measureGetObjectLatency(c *s3.Client, bucket string, body []byte, n int) float64 {
+	const key = "g/probe"
+	if _, err := c.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(body),
+	}); err != nil {
+		return math.NaN()
+	}
+	durs := make([]float64, 0, n)
+	for i := 0; i < n; i++ {
+		start := time.Now()
+		out, err := c.GetObject(context.Background(), &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			continue
+		}
+		_, _ = bytes.NewBuffer(nil).ReadFrom(out.Body)
+		_ = out.Body.Close()
+		durs = append(durs, ms(time.Since(start)))
+	}
+	return percentile(durs, 99)
+}
+
+// measurePutObjectThroughput uses `workers` goroutines for `dur`, each
+// PUTting unique keys so we measure write throughput (not overwrite).
+func measurePutObjectThroughput(c *s3.Client, bucket string, body []byte, workers int, dur time.Duration) float64 {
+	var ops atomic.Int64
+	end := time.Now().Add(dur)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			var local int64 = 0
+			for time.Now().Before(end) {
+				key := fmt.Sprintf("t/%d/%d", worker, local)
+				_, err := c.PutObject(context.Background(), &s3.PutObjectInput{
+					Bucket: aws.String(bucket),
+					Key:    aws.String(key),
+					Body:   bytes.NewReader(body),
+				})
+				if err == nil {
+					ops.Add(1)
+				}
+				local++
+			}
+		}(w)
+	}
+	wg.Wait()
+	return float64(ops.Load()) / dur.Seconds()
+}
+
 // -----------------------------------------------------------------------------
 // Stats helpers
 
@@ -336,33 +460,35 @@ func percentile(xs []float64, p float64) float64 {
 
 func printTable(b *Budgets) {
 	fmt.Fprintln(os.Stderr)
-	fmt.Fprintln(os.Stderr, "nanostack perf gate")
-	fmt.Fprintln(os.Stderr, strings.Repeat("-", 90))
-	fmt.Fprintf(os.Stderr, "%-30s %12s %12s %10s %s\n", "metric", "measured", "target", "gate", "result")
-	fmt.Fprintln(os.Stderr, strings.Repeat("-", 90))
+	fmt.Fprintf(os.Stderr, "nanostack perf gate (backend=%s)\n", b.Backend)
+	fmt.Fprintln(os.Stderr, strings.Repeat("-", 92))
+	fmt.Fprintf(os.Stderr, "%-30s %12s %14s %10s %s\n", "metric", "measured", "target", "gate", "result")
+	fmt.Fprintln(os.Stderr, strings.Repeat("-", 92))
 	for _, m := range b.Metrics {
-		printRow(m)
+		printRow(m, b.Backend)
 	}
 	if len(b.Informational) > 0 {
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintln(os.Stderr, "informational (no gate)")
-		fmt.Fprintln(os.Stderr, strings.Repeat("-", 90))
+		fmt.Fprintln(os.Stderr, strings.Repeat("-", 92))
 		for _, m := range b.Informational {
-			printRow(m)
+			printRow(m, b.Backend)
 		}
 	}
 }
 
-func printRow(m Metric) {
+func printRow(m Metric, backend string) {
 	measured := "-"
 	if m.Measured != nil {
 		measured = fmt.Sprintf("%.3f %s", *m.Measured, m.Unit)
 	}
 	target := "-"
-	if m.Target > 0 {
-		target = fmt.Sprintf("≤ %.3f %s", m.Target, m.Unit)
-	} else if m.TargetMin > 0 {
-		target = fmt.Sprintf("≥ %.0f %s", m.TargetMin, m.Unit)
+	if t, comp, ok := m.effectiveTarget(backend); ok {
+		if comp == "ge" {
+			target = fmt.Sprintf("≥ %.0f %s", t, m.Unit)
+		} else {
+			target = fmt.Sprintf("≤ %.3f %s", t, m.Unit)
+		}
 	}
 	gate := "no"
 	if m.Gate {
@@ -376,7 +502,7 @@ func printRow(m Metric) {
 			result = "FAIL"
 		}
 	}
-	fmt.Fprintf(os.Stderr, "%-30s %12s %12s %10s %s\n", m.Key, measured, target, gate, result)
+	fmt.Fprintf(os.Stderr, "%-30s %12s %14s %10s %s\n", m.Key, measured, target, gate, result)
 }
 
 // -----------------------------------------------------------------------------
@@ -387,29 +513,43 @@ func main() {
 	budgetsPath := flag.String("budgets", "bench/budgets.json", "path to budgets JSON")
 	outPath := flag.String("out", "", "if set, write JSON to this path (default stdout)")
 	port := flag.Int("port", 14990, "base port for the bench")
+	backend := flag.String("backend", "mem", "storage backend (mem|fs)")
 	flag.Parse()
 
 	b, err := loadBudgets(*budgetsPath)
 	if err != nil {
 		die("load budgets: %v", err)
 	}
+	b.Backend = *backend
+
+	tempBase := os.Getenv("RUNNER_TEMP")
+	if tempBase == "" {
+		tempBase = filepath.Join(os.TempDir(), "nanostack-bench")
+		_ = os.MkdirAll(tempBase, 0o755)
+	}
+	extraArgs, err := backendArgs(*backend, tempBase)
+	if err != nil {
+		die("backend: %v", err)
+	}
 
 	// 1. Binary size (no process needed).
 	if size, err := measureBinarySize(*binPath); err != nil {
 		die("binary size: %v", err)
 	} else {
-		b.Metrics = recordMetric(b.Metrics, "binary_size_mb", size)
+		b.Metrics = recordMetric(b.Metrics, "binary_size_mb", size, *backend)
 	}
 
-	// 2. Cold start — 5 samples on rotating ports so we don't trip TIME_WAIT.
+	// 2. Cold start — `--self-test-ready` binds + exits, no backend state
+	//    involved, so we keep it on `--ephemeral` regardless of mode.
 	if cs, err := measureColdStart(*binPath, *port+10, 5); err != nil {
 		die("cold start: %v", err)
 	} else {
-		b.Metrics = recordMetric(b.Metrics, "cold_start_ms", cs)
+		b.Metrics = recordMetric(b.Metrics, "cold_start_ms", cs, *backend)
 	}
 
-	// 3. Spawn a long-lived nanostack for idle-RSS + latency + throughput.
-	live, err := spawnNanostack(*binPath, *port)
+	// 3. Spawn a long-lived nanostack for idle-RSS + latency + throughput
+	//    on the configured backend.
+	live, err := spawnNanostack(*binPath, *port, extraArgs...)
 	if err != nil {
 		die("spawn: %v", err)
 	}
@@ -418,7 +558,6 @@ func main() {
 		die("ready wait: %v", err)
 	}
 
-	// Seed a bucket for HeadBucket / ListBuckets workloads.
 	client := newS3Client(*port)
 	bucket := "bench-bucket"
 	if _, err := client.CreateBucket(context.Background(), &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
@@ -429,27 +568,46 @@ func main() {
 	if rss, err := measureIdleRSS(live.Process.Pid, 3); err != nil {
 		die("idle rss: %v", err)
 	} else {
-		b.Metrics = recordMetric(b.Metrics, "idle_rss_mb", rss)
+		b.Metrics = recordMetric(b.Metrics, "idle_rss_mb", rss, *backend)
 	}
 
-	// 5. Informational latency / throughput.
+	// 5. Informational bucket-op latency / throughput.
 	hbP50, hbP99 := measureLatency(client, bucket, 10_000)
-	b.Informational = recordMetric(b.Informational, "head_bucket_p50_ms", hbP50)
-	b.Informational = recordMetric(b.Informational, "head_bucket_p99_ms", hbP99)
+	b.Informational = recordMetric(b.Informational, "head_bucket_p50_ms", hbP50, *backend)
+	b.Informational = recordMetric(b.Informational, "head_bucket_p99_ms", hbP99, *backend)
 
 	_, lbP99 := measureListBucketsLatency(client, 1000)
-	b.Informational = recordMetric(b.Informational, "list_buckets_p99_ms", lbP99)
+	b.Informational = recordMetric(b.Informational, "list_buckets_p99_ms", lbP99, *backend)
 
 	rps := measureHeadBucketThroughput(client, bucket, 4, 5*time.Second)
-	b.Informational = recordMetric(b.Informational, "head_bucket_throughput_rps", rps)
+	b.Informational = recordMetric(b.Informational, "head_bucket_throughput_rps", rps, *backend)
 
-	// 6. Wipe-restart — kill the live process, respawn 5x on the same port.
+	// 5b. Object-op latency + throughput against a 1 KiB payload (PRD §12
+	//     uses this size for the budget).
+	body := bytes.Repeat([]byte{'x'}, 1024)
+	poP50, poP99 := measurePutObjectLatency(client, bucket, body, 10_000)
+	b.Metrics = recordMetric(b.Metrics, "put_object_p50_ms", poP50, *backend)
+	b.Metrics = recordMetric(b.Metrics, "put_object_p99_ms", poP99, *backend)
+
+	goP99 := measureGetObjectLatency(client, bucket, body, 10_000)
+	b.Metrics = recordMetric(b.Metrics, "get_object_p99_ms", goP99, *backend)
+
+	// PRD §12 calibrates against `wrk`/`bombardier` levels of concurrency,
+	// not the four-worker pattern we use for HeadBucket. We push to 32
+	// goroutines so the throughput number reflects "what an open-loop
+	// load tester sees", which is what the budget is measuring.
+	poRps := measurePutObjectThroughput(client, bucket, body, 32, 5*time.Second)
+	b.Metrics = recordMetric(b.Metrics, "put_object_throughput_rps", poRps, *backend)
+
+	// 6. Wipe-restart — kill the live process, respawn 5x on the same
+	//    port + backend. fs has to scan the directory tree to rebuild
+	//    the key index, so this metric exercises both code paths.
 	killProcessGroup(live)
 	live = nil
-	if wr, finalCmd, err := measureWipeRestart(*binPath, *port, 5); err != nil {
+	if wr, finalCmd, err := measureWipeRestart(*binPath, *port, 5, extraArgs); err != nil {
 		die("wipe-restart: %v", err)
 	} else {
-		b.Metrics = recordMetric(b.Metrics, "wipe_restart_ms", wr)
+		b.Metrics = recordMetric(b.Metrics, "wipe_restart_ms", wr, *backend)
 		killProcessGroup(finalCmd)
 	}
 

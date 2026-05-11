@@ -19,11 +19,11 @@ This file is updated as part of every release. The source of truth for the v1 cu
 | DeleteBucket | supported | M1 |
 | HeadBucket | supported | M1 |
 | ListBuckets | supported | M1 |
-| PutObject | stub | M3 |
-| GetObject | stub | M3 |
-| HeadObject | stub | M3 |
-| DeleteObject | stub | M3 |
-| DeleteObjects | stub | M3 |
+| PutObject | supported | M3 |
+| GetObject | supported (incl. range requests) | M3 |
+| HeadObject | supported | M3 |
+| DeleteObject | supported (idempotent) | M3 |
+| DeleteObjects | supported (incl. Quiet mode) | M3 |
 | CopyObject | stub | M5 |
 | ListObjects (v1) | stub | M4 |
 | ListObjectsV2 | stub | M4 |
@@ -43,7 +43,13 @@ This file is updated as part of every release. The source of truth for the v1 cu
 | SigV4 — presigned URLs (incl. custom headers) | supported | M2 |
 | `--no-auth` opt-out (dev convenience) | supported | M2 |
 | Configurable clock-skew tolerance (`--skew-seconds`) | supported | M2 |
-| Streaming payload hashes (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) | planned | M3 |
+| `x-amz-content-sha256` hex body verification | supported | M3 |
+| Range requests with `Accept-Ranges: bytes` header | supported (single-range) | M3 |
+| Content-Type passthrough | supported | M3 |
+| `x-amz-meta-*` user metadata passthrough | supported | M3 |
+| ETag (MD5 of body, double-quoted) | supported (non-multipart) | M3 |
+| Streaming payload hashes (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) | not supported | known limitation; defer |
+| Multi-range responses (`multipart/byteranges`) | not supported | polish milestone |
 | Path-style addressing | supported | M1 |
 | Virtual-hosted-style addressing | supported | M1 |
 | AWS-strict bucket-name validation | supported | M1 |

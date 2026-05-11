@@ -75,12 +75,12 @@ func TestBadSignatureIsRejected(t *testing.T) {
 	}
 }
 
-// Object operations are still unrouted in M2 — but auth still must pass.
-// A presigned HEAD on /bucket/key resolves to 501 NotImplemented (proving
-// SigV4 succeeded; failure would be 403 AccessDenied / SignatureDoesNotMatch).
+// A presigned HEAD against a bucket+key that doesn't exist should
+// surface 404 NoSuchBucket — not 403. Reaching the service layer (not
+// stopping at SigV4) is what proves auth succeeded.
 func TestPresignedHappyPath(t *testing.T) {
 	signer := v4.NewSigner()
-	req, _ := http.NewRequest(http.MethodHead, endpoint()+"/test-bucket/test-key?X-Amz-Expires=3600", nil)
+	req, _ := http.NewRequest(http.MethodHead, endpoint()+"/no-such-bucket-presign/k?X-Amz-Expires=3600", nil)
 	req.Host = endpointHost()
 	signedURL, _, err := signer.PresignHTTP(context.Background(), testCreds(), req, "UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Now())
 	if err != nil {
@@ -91,8 +91,8 @@ func TestPresignedHappyPath(t *testing.T) {
 		t.Fatalf("head: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 501 {
-		t.Fatalf("expected 501 (auth passed, op unrouted in M2), got %d", resp.StatusCode)
+	if resp.StatusCode != 404 {
+		t.Fatalf("expected 404 (auth passed, bucket missing), got %d", resp.StatusCode)
 	}
 }
 

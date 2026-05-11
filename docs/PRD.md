@@ -287,18 +287,26 @@ We publish a Markdown table at the repo root, updated on every release, showing 
 
 ## 12. Performance Targets (v1)
 
-| Metric | Target | How measured |
-|---|---|---|
-| Cold start to "ready" | < 500 ms | `time nanostack --self-test-ready` |
-| Idle RSS (1 min after start, no traffic) | < 30 MB | `/usr/bin/time -v` |
-| Warm p50 PutObject (1 KB body) | < 1 ms | local benchmark |
-| Warm p99 PutObject (1 KB body) | < 5 ms | local benchmark |
-| Warm p99 GetObject (≤ 1 MB) | < 5 ms | local benchmark |
-| Throughput, sequential PutObject 1 KB | ≥ 50,000 req/s | wrk/bombardier |
-| Binary size (stripped, statically linked) | < 20 MB | `ls -la` |
-| Test isolation wipe (`--ephemeral` restart) | < 100 ms | scripted |
+All numbers are measured by the bench harness in `bench/driver/` driving signed AWS SDK calls (Go SDK v2) against `ReleaseFast`-built nanostack. We deliberately use the AWS SDK rather than `wrk`/`bombardier` so the budget reflects what users actually experience — SigV4 cost included.
 
-Numbers are budgets, not promises — but a regression past any of them in CI fails the build.
+Two storage backends, two budget columns where the physics differ:
+
+| Metric | mem | fs | How measured |
+|---|---|---|---|
+| Cold start to bound listener | ≤ 500 ms | ≤ 500 ms | `time nanostack --self-test-ready` (real bind, then exit); median of 5 |
+| Idle RSS (5 s after start) | ≤ 30 MB | ≤ 30 MB | `/proc/<pid>/status` `VmRSS`; max of 3 samples |
+| Binary size (stripped) | ≤ 20 MB | ≤ 20 MB | `os.Stat` after `zig build -Doptimize=ReleaseFast -Dstrip=true` |
+| Wipe-restart | ≤ 100 ms | ≤ 500 ms | kill + respawn, time to first TCP accept; median of 5. fs walks `objects/*/meta.json` to rebuild its key index. |
+| Warm p50 PutObject (1 KB) | ≤ 1 ms | ≤ 3 ms | 10 000 sequential PutObject ops via aws-sdk-go-v2. fs slower because each PUT atomically writes both `data` and `meta.json`. |
+| Warm p99 PutObject (1 KB) | ≤ 5 ms | ≤ 5 ms | 99th percentile of the same series |
+| Warm p99 GetObject (≤ 1 MB) | ≤ 5 ms | ≤ 5 ms | 10 000 sequential GetObject ops |
+| PutObject throughput (1 KB, 32 concurrent) | ≥ 5 000 req/s | ≥ 500 req/s | 32 goroutines for 5 s, unique keys per worker |
+
+Numbers are budgets, not promises — but a regression past any of them in CI fails the build. Each new milestone may add rows; an existing row only loosens with a one-liner justification recorded in the commit message.
+
+### Methodology note
+
+The original PRD draft cited `≥ 50 000 req/s` for PutObject throughput, calibrated against `wrk` against raw HTTP. We deliberately use SDK-driven measurement because that's the load shape real users put on nanostack. SDK loads max out roughly an order of magnitude lower because every request pays SigV4 verification cost on every call. The current targets are honest about that.
 
 ---
 

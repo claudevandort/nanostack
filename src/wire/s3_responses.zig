@@ -66,6 +66,38 @@ pub fn renderListAllMyBucketsResult(
     return xml.renderToOwnedSlice(allocator, &root);
 }
 
+/// Format unix seconds as an RFC 7231 / IMF-fixdate HTTP-date suitable for
+/// HTTP headers like `Last-Modified` and `Date`:
+///   `Mon, 02 Jan 2006 15:04:05 GMT`
+///
+/// AWS SDKs reject ISO 8601 in those headers — they're expected to be
+/// HTTP-date per RFC 9110 §5.6.7. The `CreationDate` XML element in the
+/// ListBuckets body is *different* and uses `formatIso8601`.
+pub fn formatHttpDate(allocator: Allocator, unix_seconds: i64) ![]u8 {
+    const es: std.time.epoch.EpochSeconds = .{ .secs = @intCast(unix_seconds) };
+    const ed = es.getEpochDay();
+    const yd = ed.calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const day_secs = es.getDaySeconds();
+
+    // 1970-01-01 was a Thursday → day_of_week = (day + 4) mod 7 with 0=Sun.
+    const dow_index: usize = @intCast((@as(u64, ed.day) + 4) % 7);
+    const month_index: usize = @intFromEnum(md.month) - 1;
+
+    const day_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    return std.fmt.allocPrint(allocator, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+        day_names[dow_index],
+        @as(u32, md.day_index) + 1,
+        month_names[month_index],
+        @as(u32, yd.year),
+        @as(u32, day_secs.getHoursIntoDay()),
+        @as(u32, day_secs.getMinutesIntoHour()),
+        @as(u32, day_secs.getSecondsIntoMinute()),
+    });
+}
+
 /// Format unix seconds as `YYYY-MM-DDTHH:MM:SS.000Z` (AWS uses millisecond
 /// precision; we always write `.000`).
 pub fn formatIso8601(allocator: Allocator, unix_seconds: i64) ![]u8 {
@@ -94,6 +126,18 @@ test "formatIso8601: known epoch" {
     const got = try formatIso8601(testing.allocator, 1778850000);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("2026-05-15T13:00:00.000Z", got);
+}
+
+test "formatHttpDate: epoch (Thursday 1 Jan 1970)" {
+    const got = try formatHttpDate(testing.allocator, 0);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", got);
+}
+
+test "formatHttpDate: 2026-05-15T13:00:00Z (Friday)" {
+    const got = try formatHttpDate(testing.allocator, 1778850000);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("Fri, 15 May 2026 13:00:00 GMT", got);
 }
 
 test "formatIso8601: unix epoch" {

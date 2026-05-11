@@ -25,6 +25,8 @@ pub const Code = enum {
     request_time_too_skewed,
     missing_content_length,
     bad_request,
+    bad_digest,
+    invalid_range,
     internal_error,
 
     pub fn awsCode(self: Code) []const u8 {
@@ -45,6 +47,8 @@ pub const Code = enum {
             .request_time_too_skewed => "RequestTimeTooSkewed",
             .missing_content_length => "MissingContentLength",
             .bad_request => "BadRequest",
+            .bad_digest => "BadDigest",
+            .invalid_range => "InvalidRange",
             .internal_error => "InternalError",
         };
     }
@@ -67,6 +71,8 @@ pub const Code = enum {
             .request_time_too_skewed => "The difference between the request time and the current time is too large.",
             .missing_content_length => "You must provide the Content-Length HTTP header.",
             .bad_request => "Bad Request",
+            .bad_digest => "The Content-MD5 you specified did not match what we received.",
+            .invalid_range => "The requested range is not satisfiable.",
             .internal_error => "We encountered an internal error. Please try again.",
         };
     }
@@ -77,7 +83,8 @@ pub const Code = enum {
             .no_such_bucket, .no_such_key => 404,
             .bucket_already_exists, .bucket_already_owned_by_you, .bucket_not_empty => 409,
             .access_denied, .signature_does_not_match, .invalid_access_key_id, .request_time_too_skewed => 403,
-            .invalid_request, .invalid_argument, .invalid_bucket_name, .missing_content_length, .bad_request => 400,
+            .invalid_request, .invalid_argument, .invalid_bucket_name, .missing_content_length, .bad_request, .bad_digest => 400,
+            .invalid_range => 416,
             .method_not_allowed => 405,
             .internal_error => 500,
         };
