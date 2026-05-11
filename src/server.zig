@@ -184,9 +184,24 @@ pub fn run(
     init: std.process.Init,
     backend: storage.Backend,
 ) !void {
-    var app: App = .{ .config = config, .io = init.io, .backend = backend };
-
     const address = try std.Io.net.IpAddress.parse(config.bind, config.port);
+
+    // --self-test-ready: prove the binary loads, parses args, and binds
+    // the configured port, then exit. Used as a cold-start smoke check
+    // (PRD §12). We deliberately skip httpz setup so the wall time
+    // reflects "can we even bind?", not "did the HTTP framework warm up?";
+    // the bench harness measures the latter via TCP-poll.
+    if (config.self_test_ready) {
+        var probe = std.Io.net.IpAddress.listen(&address, init.io, .{}) catch |err| {
+            std.log.err("self-test-ready: bind failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        probe.deinit(init.io);
+        std.log.info("self-test-ready: bound :{d}, exiting", .{config.port});
+        return;
+    }
+
+    var app: App = .{ .config = config, .io = init.io, .backend = backend };
     var server = try httpz.Server(*App).init(init.io, allocator, .{
         .address = .{ .ip = address },
     }, &app);
@@ -206,11 +221,6 @@ pub fn run(
     });
     if (config.no_auth) {
         std.log.warn("--no-auth is set: SigV4 verification disabled. Do not use this mode for accuracy testing.", .{});
-    }
-
-    if (config.self_test_ready) {
-        std.log.info("self-test-ready: skeleton initialised, exiting", .{});
-        return;
     }
 
     try server.listen();

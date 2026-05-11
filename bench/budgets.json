@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "source": "docs/PRD.md §12 (v1 performance targets)",
+  "notes": [
+    "`gate=true` means CI fails if the measured value exceeds `target`.",
+    "`gate=false` means the metric is measured + reported but not enforced yet.",
+    "Comparison is `<=` for every entry (lower is better).",
+    "M2.5 gates the four metrics measurable today; object-op metrics flip to gate=true in M3 when PutObject/GetObject land."
+  ],
+  "metrics": [
+    {
+      "key": "cold_start_ms",
+      "label": "Cold start to bound listener",
+      "unit": "ms",
+      "target": 500,
+      "gate": true,
+      "how": "process spawn -> `--self-test-ready` exits cleanly; median of 5 runs"
+    },
+    {
+      "key": "idle_rss_mb",
+      "label": "Idle RSS (5 s after start, no traffic)",
+      "unit": "MB",
+      "target": 30,
+      "gate": true,
+      "how": "max of 3 samples 1 s apart, read from `/proc/<pid>/status` VmRSS"
+    },
+    {
+      "key": "binary_size_mb",
+      "label": "Stripped statically-linked binary size",
+      "unit": "MB",
+      "target": 20,
+      "gate": true,
+      "how": "`os.Stat(zig-out/bin/nanostack).Size()` after `zig build -Doptimize=ReleaseFast --release=fast` + strip"
+    },
+    {
+      "key": "wipe_restart_ms",
+      "label": "Wipe-restart (kill --ephemeral then back up)",
+      "unit": "ms",
+      "target": 100,
+      "gate": true,
+      "how": "kill running --ephemeral instance, respawn, time to first TCP accept; median of 5 runs"
+    },
+    {
+      "key": "put_object_p50_ms",
+      "label": "Warm p50 PutObject (1 KB body)",
+      "unit": "ms",
+      "target": 1,
+      "gate": false,
+      "how": "M3 activates: 10k sequential PutObject ops via aws-sdk-go-v2, 50th percentile"
+    },
+    {
+      "key": "put_object_p99_ms",
+      "label": "Warm p99 PutObject (1 KB body)",
+      "unit": "ms",
+      "target": 5,
+      "gate": false,
+      "how": "M3 activates"
+    },
+    {
+      "key": "get_object_p99_ms",
+      "label": "Warm p99 GetObject (≤ 1 MB)",
+      "unit": "ms",
+      "target": 5,
+      "gate": false,
+      "how": "M3 activates"
+    },
+    {
+      "key": "put_object_throughput_rps",
+      "label": "Sequential PutObject 1 KB throughput",
+      "unit": "req/s",
+      "target_min": 50000,
+      "comparison": "ge",
+      "gate": false,
+      "how": "M3 activates"
+    }
+  ],
+  "informational_metrics": [
+    {
+      "key": "head_bucket_p50_ms",
+      "label": "Warm p50 HeadBucket",
+      "unit": "ms",
+      "gate": false,
+      "how": "10k sequential HeadBucket ops via aws-sdk-go-v2, 50th percentile"
+    },
+    {
+      "key": "head_bucket_p99_ms",
+      "label": "Warm p99 HeadBucket",
+      "unit": "ms",
+      "gate": false
+    },
+    {
+      "key": "list_buckets_p99_ms",
+      "label": "Warm p99 ListBuckets",
+      "unit": "ms",
+      "gate": false
+    },
+    {
+      "key": "head_bucket_throughput_rps",
+      "label": "HeadBucket throughput (4 concurrent, 5 s)",
+      "unit": "req/s",
+      "gate": false
+    }
+  ]
+}
