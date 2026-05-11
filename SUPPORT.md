@@ -15,10 +15,10 @@ This file is updated as part of every release. The source of truth for the v1 cu
 
 | Operation | Status | Milestone |
 |---|---|---|
-| CreateBucket | stub | M1 |
-| DeleteBucket | stub | M1 |
-| HeadBucket | stub | M1 |
-| ListBuckets | stub | M1 |
+| CreateBucket | supported | M1 |
+| DeleteBucket | supported | M1 |
+| HeadBucket | supported | M1 |
+| ListBuckets | supported | M1 |
 | PutObject | stub | M3 |
 | GetObject | stub | M3 |
 | HeadObject | stub | M3 |
@@ -41,11 +41,13 @@ This file is updated as part of every release. The source of truth for the v1 cu
 |---|---|---|
 | SigV4 — header authentication | stub (accept any) | M2 |
 | SigV4 — presigned URLs (incl. custom headers) | stub (accept any) | M2 |
-| Path-style addressing | planned | M1 |
-| Virtual-hosted-style addressing | planned | M1 |
+| Path-style addressing | supported | M1 |
+| Virtual-hosted-style addressing | supported | M1 |
+| AWS-strict bucket-name validation | supported | M1 |
+| Filesystem + in-memory (`--ephemeral`) backends | supported | M1 |
 | Conditional headers (If-Match / If-None-Match / If-Modified-Since / If-Unmodified-Since) | planned | M5 |
 | Range requests with `Accept-Ranges: bytes` | planned | M3 |
-| Correct AWS error wire format | partial (NotImplemented works in M0) | M0–M3 |
+| Correct AWS error wire format | partial (M1 codes wired) | M0–M3 |
 
 ### Deferred (post-v1)
 

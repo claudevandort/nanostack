@@ -9,5 +9,11 @@ zig-pkg/
 .idea/
 .vscode/
 
+# Local Claude state
+.claude/
+
 # Go conformance test artefacts
 tests/conformance/go/go.sum.local
+
+# JS conformance test artefacts
+tests/conformance/js/node_modules/
