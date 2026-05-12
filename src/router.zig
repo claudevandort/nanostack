@@ -16,6 +16,8 @@ pub const Operation = enum {
     head_object,
     delete_object,
     delete_objects,
+    list_objects,
+    list_objects_v2,
     unknown,
 };
 
@@ -74,11 +76,27 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
     if (eql(method, "POST") and has_bucket and hasQueryParam(query, "delete")) return .delete_objects;
 
     if (eql(method, "GET") and !has_bucket) return .list_buckets;
+    if (eql(method, "GET") and has_bucket) {
+        // ListObjectsV2 is `?list-type=2`; v1 is the bare GET.
+        if (queryParamEquals(query, "list-type", "2")) return .list_objects_v2;
+        return .list_objects;
+    }
     if (eql(method, "PUT") and has_bucket) return .create_bucket;
     if (eql(method, "DELETE") and has_bucket) return .delete_bucket;
     if (eql(method, "HEAD") and has_bucket) return .head_bucket;
 
     return .unknown;
+}
+
+/// Does the raw query string contain `name=value`? Case-sensitive.
+fn queryParamEquals(query: []const u8, name: []const u8, value: []const u8) bool {
+    if (query.len == 0) return false;
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name) and std.mem.eql(u8, pair[eq + 1 ..], value)) return true;
+    }
+    return false;
 }
 
 /// Does the raw query string contain a parameter named `name`? Matches
@@ -187,10 +205,26 @@ test "path-style: POST / → unknown" {
     try testing.expectEqual(Operation.unknown, p.op);
 }
 
-test "virtual-hosted: GET / on bucket host → unknown (ListObjects is M4)" {
+test "virtual-hosted: GET / on bucket host → list_objects (v1)" {
     const p = parse("GET", "mybucket.s3.us-east-1.amazonaws.com", "/", "");
     try testing.expectEqualStrings("mybucket", p.bucket.?);
-    try testing.expectEqual(Operation.unknown, p.op);
+    try testing.expectEqual(Operation.list_objects, p.op);
+}
+
+test "path-style: GET /bucket → list_objects (v1)" {
+    const p = parse("GET", "localhost", "/mybucket", "");
+    try testing.expectEqual(Operation.list_objects, p.op);
+    try testing.expectEqualStrings("mybucket", p.bucket.?);
+}
+
+test "path-style: GET /bucket?list-type=2 → list_objects_v2" {
+    const p = parse("GET", "localhost", "/mybucket", "list-type=2");
+    try testing.expectEqual(Operation.list_objects_v2, p.op);
+}
+
+test "path-style: GET /bucket?list-type=2&prefix=foo/ → list_objects_v2" {
+    const p = parse("GET", "localhost", "/mybucket", "list-type=2&prefix=foo%2F");
+    try testing.expectEqual(Operation.list_objects_v2, p.op);
 }
 
 test "virtual-hosted: PUT / on bucket host → create_bucket" {

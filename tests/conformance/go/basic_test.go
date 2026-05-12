@@ -2,8 +2,9 @@
 // official aws-sdk-go-v2 client.
 //
 // This file keeps the basic NotImplemented contract for un-mapped
-// operations. M3 routed all object operations; the remaining unrouted
-// path in M3 is ListObjects(V2), which is M4's territory.
+// operations. M3 routed all object operations; M4 routed ListObjects(V2).
+// CreateMultipartUpload (POST /bucket/key?uploads) lands in M6 and is the
+// current sentinel for the unrouted path.
 package conformance
 
 import (
@@ -25,10 +26,11 @@ func TestUnroutedOperationReturnsNotImplemented(t *testing.T) {
 	}
 	defer cleanupBucket(t, c, bucket)
 
-	// ListObjectsV2 lands in M4 — `GET /bucket?list-type=2` is currently
-	// unrouted and should surface as 501 NotImplemented.
-	_, err := c.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+	// CreateMultipartUpload lands in M6 — `POST /bucket/key?uploads` is
+	// currently unrouted and should surface as 501 NotImplemented.
+	_, err := c.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(bucket),
+		Key:    aws.String("mp-key"),
 	})
 	if err == nil {
 		t.Fatalf("expected NotImplemented error, got nil")

@@ -100,6 +100,7 @@ pub const App = struct {
                 .headers = svc_headers,
                 .body = req.body() orelse "",
                 .range = range_header,
+                .query = req.url.query,
             },
         }, parsed);
 

@@ -96,6 +96,7 @@ const vtable: storage.Backend.VTable = .{
     .getObject = vtGetObject,
     .headObject = vtHeadObject,
     .deleteObject = vtDeleteObject,
+    .listObjects = vtListObjects,
 };
 
 fn vtCreateBucket(ctx: *anyopaque, name: []const u8) storage.Error!void {
@@ -121,6 +122,9 @@ fn vtHeadObject(ctx: *anyopaque, allocator: Allocator, bucket: []const u8, key: 
 }
 fn vtDeleteObject(ctx: *anyopaque, bucket: []const u8, key: []const u8) storage.Error!void {
     return deleteObject(@ptrCast(@alignCast(ctx)), bucket, key);
+}
+fn vtListObjects(ctx: *anyopaque, allocator: Allocator, in: storage.ListObjectsInput) storage.Error!storage.ListObjectsOutput {
+    return listObjects(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +283,93 @@ pub fn headObject(self: *Fs, allocator: Allocator, bucket: []const u8, key: []co
         error.FileNotFound => storage.Error.NoSuchKey,
         else => storage.Error.Io,
     };
+}
+
+pub fn listObjects(self: *Fs, allocator: Allocator, in: storage.ListObjectsInput) storage.Error!storage.ListObjectsOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, in.bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    var contents: std.ArrayList(storage.Object) = .empty;
+    errdefer {
+        for (contents.items) |o| freeObjectMetaOwned(allocator, o);
+        contents.deinit(allocator);
+    }
+    var prefixes: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (prefixes.items) |p| allocator.free(p);
+        prefixes.deinit(allocator);
+    }
+
+    var i: usize = 0;
+    var last_key: []const u8 = "";
+    var truncated = false;
+    const limit: usize = if (in.max_keys > 1000) 1000 else in.max_keys;
+
+    while (i < slot.key_index.items.len) : (i += 1) {
+        const k = slot.key_index.items[i];
+        if (in.start_after.len > 0 and (std.mem.lessThan(u8, k, in.start_after) or std.mem.eql(u8, k, in.start_after))) continue;
+        if (in.prefix.len > 0 and !std.mem.startsWith(u8, k, in.prefix)) continue;
+
+        if (in.delimiter.len > 0) {
+            const after = k[in.prefix.len..];
+            if (std.mem.indexOf(u8, after, in.delimiter)) |off| {
+                const cp_end = in.prefix.len + off + in.delimiter.len;
+                const cp = k[0..cp_end];
+                if (contents.items.len + prefixes.items.len >= limit) {
+                    truncated = true;
+                    break;
+                }
+                const owned = allocator.dupe(u8, cp) catch return storage.Error.OutOfMemory;
+                prefixes.append(allocator, owned) catch {
+                    allocator.free(owned);
+                    return storage.Error.OutOfMemory;
+                };
+                last_key = k;
+                while (i + 1 < slot.key_index.items.len and std.mem.startsWith(u8, slot.key_index.items[i + 1], cp)) : (i += 1) {
+                    last_key = slot.key_index.items[i + 1];
+                }
+                continue;
+            }
+        }
+
+        if (contents.items.len + prefixes.items.len >= limit) {
+            truncated = true;
+            break;
+        }
+        // Lazy-load per-key metadata from disk. Skip missing files silently
+        // (the index is the source of truth for "key exists"; missing meta
+        // is a stale-index bug that we'd rather not crash on).
+        const obj = readMeta(self, allocator, in.bucket, k) catch continue;
+        contents.append(allocator, obj) catch {
+            freeObjectMetaOwned(allocator, obj);
+            return storage.Error.OutOfMemory;
+        };
+        last_key = k;
+    }
+
+    const next_key_owned: []const u8 = if (truncated) blk: {
+        break :blk allocator.dupe(u8, last_key) catch return storage.Error.OutOfMemory;
+    } else "";
+
+    return .{
+        .contents = contents.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory,
+        .common_prefixes = prefixes.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory,
+        .is_truncated = truncated,
+        .next_key = next_key_owned,
+    };
+}
+
+fn freeObjectMetaOwned(gpa: Allocator, o: storage.Object) void {
+    gpa.free(o.key);
+    gpa.free(o.etag);
+    gpa.free(o.content_type);
+    for (o.user_metadata) |h| {
+        gpa.free(h.name);
+        gpa.free(h.value);
+    }
+    gpa.free(o.user_metadata);
 }
 
 pub fn deleteObject(self: *Fs, bucket: []const u8, key: []const u8) storage.Error!void {

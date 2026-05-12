@@ -12,6 +12,7 @@ const storage = @import("../../storage/mod.zig");
 const s3_responses = @import("../../wire/s3_responses.zig");
 const object_responses = @import("../../wire/object_responses.zig");
 const delete_parser = @import("../../wire/delete_objects_parser.zig");
+const list_objects_wire = @import("../../wire/list_objects.zig");
 const http_range = @import("../../http/range.zig");
 const fs_backend = @import("../../storage/fs.zig");
 
@@ -40,6 +41,9 @@ pub const RequestData = struct {
     headers: []const storage.Header = &.{},
     body: []const u8 = "",
     range: ?[]const u8 = null,
+    /// Raw query string (no leading `?`). Used by listing ops to pull
+    /// prefix/delimiter/max-keys/continuation-token/etc.
+    query: []const u8 = "",
 };
 
 pub const Context = struct {
@@ -82,8 +86,66 @@ pub fn handle(ctx: Context, parsed: router.Parsed) Result {
             ctx,
             parsed.bucket orelse return .{ .err = .invalid_request },
         ),
+        .list_objects => listObjects(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .list_objects_v2 => listObjectsV2(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
         .unknown => .{ .err = .not_implemented },
     };
+}
+
+// ---------------------------------------------------------------------------
+// Query helpers
+
+/// Find a query parameter by name. Returns the *percent-decoded* value or
+/// null if absent. Caller's arena owns the returned slice when a decode
+/// happened; otherwise it's a slice into the raw query string.
+fn queryValue(arena: Allocator, query: []const u8, name: []const u8) !?[]const u8 {
+    if (query.len == 0) return null;
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, pair[0..eq], name)) continue;
+        const raw = pair[eq + 1 ..];
+        return try percentDecode(arena, raw);
+    }
+    return null;
+}
+
+fn percentDecode(arena: Allocator, in: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(arena, in.len);
+    var i: usize = 0;
+    while (i < in.len) : (i += 1) {
+        if (in[i] == '%' and i + 2 < in.len) {
+            const hi = hexDigit(in[i + 1]) orelse {
+                try out.append(arena, in[i]);
+                continue;
+            };
+            const lo = hexDigit(in[i + 2]) orelse {
+                try out.append(arena, in[i]);
+                continue;
+            };
+            try out.append(arena, (hi << 4) | lo);
+            i += 2;
+        } else if (in[i] == '+') {
+            try out.append(arena, ' ');
+        } else {
+            try out.append(arena, in[i]);
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn hexDigit(c: u8) ?u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return null;
 }
 
 fn mapStorageErr(e: storage.Error) errors.Code {
@@ -309,3 +371,102 @@ fn buildHeadHeaders(ctx: Context, meta: storage.Object) ![]Header {
 // Avoid the "unused" warning on fs_backend; we may want it later for
 // timing helpers.
 const _unused_fs_backend = fs_backend;
+
+// ---------------------------------------------------------------------------
+// Listing
+
+fn listObjects(ctx: Context, bucket: []const u8) Result {
+    const echo = parseListEcho(ctx, .v1) catch |err| return mapListParseErr(err);
+    return runListing(ctx, bucket, echo, false);
+}
+
+fn listObjectsV2(ctx: Context, bucket: []const u8) Result {
+    const echo = parseListEcho(ctx, .v2) catch |err| return mapListParseErr(err);
+    return runListing(ctx, bucket, echo, true);
+}
+
+const ListVariant = enum { v1, v2 };
+
+const ListParseError = error{ InvalidArgument, OutOfMemory };
+
+fn mapListParseErr(e: ListParseError) Result {
+    return switch (e) {
+        ListParseError.InvalidArgument => .{ .err = .invalid_argument },
+        ListParseError.OutOfMemory => .{ .err = .internal_error },
+    };
+}
+
+fn parseListEcho(ctx: Context, variant: ListVariant) ListParseError!list_objects_wire.RequestEcho {
+    var echo: list_objects_wire.RequestEcho = .{};
+    const q = ctx.request.query;
+
+    if (try queryValueOpt(ctx.allocator, q, "prefix")) |v| echo.prefix = v;
+    if (try queryValueOpt(ctx.allocator, q, "delimiter")) |v| echo.delimiter = v;
+    if (try queryValueOpt(ctx.allocator, q, "encoding-type")) |v| {
+        if (!std.mem.eql(u8, v, "url")) return ListParseError.InvalidArgument;
+        echo.encoding_type = v;
+    }
+
+    if (try queryValueOpt(ctx.allocator, q, "max-keys")) |v| {
+        const parsed = std.fmt.parseInt(u32, v, 10) catch return ListParseError.InvalidArgument;
+        echo.max_keys = if (parsed > 1000) 1000 else parsed;
+    }
+
+    switch (variant) {
+        .v1 => {
+            if (try queryValueOpt(ctx.allocator, q, "marker")) |v| echo.marker = v;
+        },
+        .v2 => {
+            if (try queryValueOpt(ctx.allocator, q, "continuation-token")) |v| echo.continuation_token = v;
+            if (try queryValueOpt(ctx.allocator, q, "start-after")) |v| echo.start_after = v;
+            if (try queryValueOpt(ctx.allocator, q, "fetch-owner")) |v| {
+                echo.fetch_owner = std.mem.eql(u8, v, "true");
+            }
+        },
+    }
+    return echo;
+}
+
+fn queryValueOpt(arena: Allocator, query: []const u8, name: []const u8) ListParseError!?[]const u8 {
+    return queryValue(arena, query, name) catch return ListParseError.OutOfMemory;
+}
+
+fn runListing(ctx: Context, bucket: []const u8, echo: list_objects_wire.RequestEcho, v2: bool) Result {
+    var start_after: []const u8 = "";
+    if (v2) {
+        if (echo.continuation_token) |t| {
+            start_after = list_objects_wire.decodeContinuationToken(ctx.allocator, t) catch
+                return .{ .err = .invalid_argument };
+        } else if (echo.start_after) |sa| {
+            start_after = sa;
+        }
+    } else {
+        start_after = echo.marker;
+    }
+
+    const result = ctx.backend.listObjects(ctx.allocator, .{
+        .bucket = bucket,
+        .prefix = echo.prefix,
+        .start_after = start_after,
+        .delimiter = echo.delimiter,
+        .max_keys = echo.max_keys,
+    }) catch |err| return .{ .err = mapStorageErr(err) };
+
+    const body = if (v2)
+        list_objects_wire.renderListObjectsV2(
+            ctx.allocator,
+            bucket,
+            echo,
+            result,
+            .{ .id = ctx.owner_id, .display_name = ctx.owner_display_name },
+        ) catch return .{ .err = .internal_error }
+    else
+        list_objects_wire.renderListObjectsV1(
+            ctx.allocator,
+            bucket,
+            echo,
+            result,
+        ) catch return .{ .err = .internal_error };
+
+    return .{ .ok = .{ .status = 200, .body = body } };
+}

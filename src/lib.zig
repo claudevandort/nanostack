@@ -5,6 +5,7 @@ pub const xml = @import("wire/xml.zig");
 pub const errors = @import("wire/errors.zig");
 pub const s3_responses = @import("wire/s3_responses.zig");
 pub const object_responses = @import("wire/object_responses.zig");
+pub const list_objects = @import("wire/list_objects.zig");
 pub const delete_objects_parser = @import("wire/delete_objects_parser.zig");
 pub const router = @import("router.zig");
 pub const http_range = @import("http/range.zig");
@@ -24,6 +25,7 @@ test {
     _ = errors;
     _ = s3_responses;
     _ = object_responses;
+    _ = list_objects;
     _ = delete_objects_parser;
     _ = router;
     _ = http_range;

@@ -92,6 +92,7 @@ const vtable: storage.Backend.VTable = .{
     .getObject = vtGetObject,
     .headObject = vtHeadObject,
     .deleteObject = vtDeleteObject,
+    .listObjects = vtListObjects,
 };
 
 fn vtCreateBucket(ctx: *anyopaque, name: []const u8) storage.Error!void {
@@ -117,6 +118,9 @@ fn vtHeadObject(ctx: *anyopaque, allocator: Allocator, bucket: []const u8, key: 
 }
 fn vtDeleteObject(ctx: *anyopaque, bucket: []const u8, key: []const u8) storage.Error!void {
     return deleteObject(@ptrCast(@alignCast(ctx)), bucket, key);
+}
+fn vtListObjects(ctx: *anyopaque, allocator: Allocator, in: storage.ListObjectsInput) storage.Error!storage.ListObjectsOutput {
+    return listObjects(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +253,94 @@ pub fn headObject(self: *Mem, allocator: Allocator, bucket: []const u8, key: []c
     const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
     const obj = self.buckets.items[idx].objects.get(key) orelse return storage.Error.NoSuchKey;
     return cloneObjectMeta(allocator, key, obj);
+}
+
+pub fn listObjects(self: *Mem, allocator: Allocator, in: storage.ListObjectsInput) storage.Error!storage.ListObjectsOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, in.bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    var contents: std.ArrayList(storage.Object) = .empty;
+    errdefer {
+        for (contents.items) |o| freeObjectMeta(allocator, o);
+        contents.deinit(allocator);
+    }
+    var prefixes: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (prefixes.items) |p| allocator.free(p);
+        prefixes.deinit(allocator);
+    }
+
+    var i: usize = 0;
+    var last_key: []const u8 = "";
+    var truncated = false;
+    const limit: usize = if (in.max_keys > 1000) 1000 else in.max_keys;
+
+    while (i < slot.key_index.items.len) : (i += 1) {
+        const k = slot.key_index.items[i];
+        if (in.start_after.len > 0 and std.mem.lessThan(u8, k, in.start_after) or (in.start_after.len > 0 and std.mem.eql(u8, k, in.start_after))) {
+            continue;
+        }
+        if (in.prefix.len > 0 and !std.mem.startsWith(u8, k, in.prefix)) continue;
+
+        if (in.delimiter.len > 0) {
+            const after = k[in.prefix.len..];
+            if (std.mem.indexOf(u8, after, in.delimiter)) |off| {
+                const cp_end = in.prefix.len + off + in.delimiter.len;
+                const cp = k[0..cp_end];
+                if (contents.items.len + prefixes.items.len >= limit) {
+                    truncated = true;
+                    break;
+                }
+                const owned = allocator.dupe(u8, cp) catch return storage.Error.OutOfMemory;
+                prefixes.append(allocator, owned) catch {
+                    allocator.free(owned);
+                    return storage.Error.OutOfMemory;
+                };
+                last_key = k;
+                // Skip all subsequent keys sharing this common prefix.
+                while (i + 1 < slot.key_index.items.len and std.mem.startsWith(u8, slot.key_index.items[i + 1], cp)) : (i += 1) {
+                    last_key = slot.key_index.items[i + 1];
+                }
+                continue;
+            }
+        }
+
+        if (contents.items.len + prefixes.items.len >= limit) {
+            truncated = true;
+            break;
+        }
+        const obj = slot.objects.get(k) orelse continue;
+        const cloned = cloneObjectMeta(allocator, k, obj) catch return storage.Error.OutOfMemory;
+        contents.append(allocator, cloned) catch {
+            freeObjectMeta(allocator, cloned);
+            return storage.Error.OutOfMemory;
+        };
+        last_key = k;
+    }
+
+    const next_key_owned: []const u8 = if (truncated) blk: {
+        break :blk allocator.dupe(u8, last_key) catch return storage.Error.OutOfMemory;
+    } else "";
+
+    return .{
+        .contents = contents.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory,
+        .common_prefixes = prefixes.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory,
+        .is_truncated = truncated,
+        .next_key = next_key_owned,
+    };
+}
+
+fn freeObjectMeta(gpa: Allocator, o: storage.Object) void {
+    gpa.free(o.key);
+    gpa.free(o.etag);
+    gpa.free(o.content_type);
+    for (o.user_metadata) |h| {
+        gpa.free(h.name);
+        gpa.free(h.value);
+    }
+    gpa.free(o.user_metadata);
 }
 
 pub fn deleteObject(self: *Mem, bucket: []const u8, key: []const u8) storage.Error!void {

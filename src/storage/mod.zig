@@ -86,6 +86,31 @@ pub const DeleteResult = struct {
     quiet: bool = false,
 };
 
+pub const ListObjectsInput = struct {
+    bucket: []const u8,
+    prefix: []const u8 = "",
+    /// Filter keys to strictly greater than this string. V1 callers pass
+    /// `marker`; V2 callers pass either `start-after` or the key decoded
+    /// from `continuation-token`.
+    start_after: []const u8 = "",
+    delimiter: []const u8 = "",
+    /// Caller is responsible for clamping to AWS's 1000 ceiling.
+    max_keys: u32 = 1000,
+};
+
+pub const ListObjectsOutput = struct {
+    /// Owned by the caller-supplied allocator; full Object metadata for
+    /// every key that contributes to this page.
+    contents: []Object,
+    /// Owned the same way. Each entry is the key prefix up to and
+    /// including the first occurrence of `delimiter` after `prefix`.
+    common_prefixes: [][]const u8,
+    is_truncated: bool,
+    /// Set when truncated. V1 surfaces this as `NextMarker`; V2 base64s
+    /// it into the `NextContinuationToken`. Empty otherwise.
+    next_key: []const u8,
+};
+
 pub const Backend = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -101,6 +126,8 @@ pub const Backend = struct {
         getObject: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8, key: []const u8) Error!GetObjectOutput,
         headObject: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8, key: []const u8) Error!Object,
         deleteObject: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8) Error!void,
+        // Listing (M4).
+        listObjects: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListObjectsInput) Error!ListObjectsOutput,
     };
 
     // Pass-through helpers so call sites don't dereference the vtable.
@@ -131,6 +158,12 @@ pub const Backend = struct {
     }
     pub fn deleteObject(self: Backend, bucket: []const u8, key: []const u8) Error!void {
         return self.vtable.deleteObject(self.ctx, bucket, key);
+    }
+
+    /// Caller owns the returned slice plus every nested string. Use the
+    /// same allocator passed in to free.
+    pub fn listObjects(self: Backend, allocator: Allocator, in: ListObjectsInput) Error!ListObjectsOutput {
+        return self.vtable.listObjects(self.ctx, allocator, in);
     }
 };
 

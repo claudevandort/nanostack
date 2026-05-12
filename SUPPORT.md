@@ -25,8 +25,8 @@ This file is updated as part of every release. The source of truth for the v1 cu
 | DeleteObject | supported (idempotent) | M3 |
 | DeleteObjects | supported (incl. Quiet mode) | M3 |
 | CopyObject | stub | M5 |
-| ListObjects (v1) | stub | M4 |
-| ListObjectsV2 | stub | M4 |
+| ListObjects (v1) | supported (prefix, delimiter, marker, max-keys, encoding-type=url) | M4 |
+| ListObjectsV2 | supported (prefix, delimiter, start-after, continuation-token, max-keys, fetch-owner, encoding-type=url) | M4 |
 | CreateMultipartUpload | stub | M6 |
 | UploadPart | stub | M6 |
 | UploadPartCopy | stub | M6 |
@@ -48,6 +48,8 @@ This file is updated as part of every release. The source of truth for the v1 cu
 | Content-Type passthrough | supported | M3 |
 | `x-amz-meta-*` user metadata passthrough | supported | M3 |
 | ETag (MD5 of body, double-quoted) | supported (non-multipart) | M3 |
+| Object listing — `encoding-type=url` (URL-encode keys + prefixes in response) | supported | M4 |
+| Object listing — `max-keys` cap (1000, request silently clamped) | supported | M4 |
 | Streaming payload hashes (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) | not supported | known limitation; defer |
 | Multi-range responses (`multipart/byteranges`) | not supported | polish milestone |
 | Path-style addressing | supported | M1 |
