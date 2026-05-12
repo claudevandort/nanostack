@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const xml = @import("xml.zig");
 const storage = @import("../storage/mod.zig");
+const s3_responses = @import("s3_responses.zig");
 
 /// Render the `<DeleteResult>` body for a `DeleteObjects` response.
 /// Caller owns the returned slice.
@@ -63,6 +64,30 @@ pub fn renderDeleteResult(allocator: Allocator, result: storage.DeleteResult) ![
     return xml.renderToOwnedSlice(allocator, &root);
 }
 
+/// Render `<CopyObjectResult>` for a successful CopyObject. `etag` must
+/// include the surrounding double quotes (the stored form). `LastModified`
+/// uses ISO 8601 (the AWS XML body convention) — distinct from the HTTP
+/// `Last-Modified` header which is RFC 7231.
+pub fn renderCopyObjectResult(allocator: Allocator, etag: []const u8, last_modified_unix: i64) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const lm = try s3_responses.formatIso8601(arena, last_modified_unix);
+    var lm_el: xml.Element = .{ .name = "LastModified", .text = lm };
+    var etag_el: xml.Element = .{ .name = "ETag", .text = etag };
+
+    const root: xml.Element = .{
+        .name = "CopyObjectResult",
+        .attrs = &.{.{ .name = "xmlns", .value = "http://s3.amazonaws.com/doc/2006-03-01/" }},
+        .children = &.{
+            .{ .element = &lm_el },
+            .{ .element = &etag_el },
+        },
+    };
+    return xml.renderToOwnedSlice(allocator, &root);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 
@@ -87,6 +112,20 @@ test "renderDeleteResult: two deleted, one error" {
             "<Deleted><Key>b</Key></Deleted>" ++
             "<Error><Key>c</Key><Code>AccessDenied</Code><Message>nope</Message></Error>" ++
             "</DeleteResult>",
+        body,
+    );
+}
+
+test "renderCopyObjectResult: fixed epoch" {
+    // 2026-05-15T13:00:00Z = 1778850000
+    const body = try renderCopyObjectResult(testing.allocator, "\"deadbeef\"", 1778850000);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+            "<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" ++
+            "<LastModified>2026-05-15T13:00:00.000Z</LastModified>" ++
+            "<ETag>\"deadbeef\"</ETag>" ++
+            "</CopyObjectResult>",
         body,
     );
 }

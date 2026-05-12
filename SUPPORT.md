@@ -24,7 +24,7 @@ This file is updated as part of every release. The source of truth for the v1 cu
 | HeadObject | supported | M3 |
 | DeleteObject | supported (idempotent) | M3 |
 | DeleteObjects | supported (incl. Quiet mode) | M3 |
-| CopyObject | stub | M5 |
+| CopyObject | supported (incl. `x-amz-metadata-directive=COPY\|REPLACE`, `x-amz-copy-source-if-*`) | M5 |
 | ListObjects (v1) | supported (prefix, delimiter, marker, max-keys, encoding-type=url) | M4 |
 | ListObjectsV2 | supported (prefix, delimiter, start-after, continuation-token, max-keys, fetch-owner, encoding-type=url) | M4 |
 | CreateMultipartUpload | stub | M6 |
@@ -56,7 +56,11 @@ This file is updated as part of every release. The source of truth for the v1 cu
 | Virtual-hosted-style addressing | supported | M1 |
 | AWS-strict bucket-name validation | supported | M1 |
 | Filesystem + in-memory (`--ephemeral`) backends | supported | M1 |
-| Conditional headers (If-Match / If-None-Match / If-Modified-Since / If-Unmodified-Since) | planned | M5 |
+| Conditional headers — GET/HEAD (all four: If-Match / If-None-Match / If-Modified-Since / If-Unmodified-Since) | supported | M5 |
+| Conditional headers — PUT (If-Match / If-None-Match, AWS-exact; If-*-Since accepted and ignored) | supported | M5 |
+| Conditional headers — CopyObject (`x-amz-copy-source-if-{match,none-match,modified-since,unmodified-since}`) | supported | M5 |
+| Conditional headers — DELETE | not enforced (matches AWS) | M5 |
+| CopyObject 5 GB source-size cap | not enforced (known divergence) | post-v1 |
 | Range requests with `Accept-Ranges: bytes` | planned | M3 |
 | Correct AWS error wire format | partial (M1 codes wired) | M0–M3 |
 

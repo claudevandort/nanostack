@@ -182,7 +182,7 @@ Layers above the service impl are **service-agnostic** so adding SQS, DynamoDB, 
 - **Objects:** PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects (batch), CopyObject.
 - **Listing:** ListObjects (v1), ListObjectsV2.
 - **Multipart upload:** CreateMultipartUpload, UploadPart, UploadPartCopy, CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads, ListParts.
-- **Conditional requests:** If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since on GET/HEAD/PUT/COPY/DELETE. CompleteMultipartUpload conditional writes.
+- **Conditional requests (AWS-exact split):** all four (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`) on `GET`/`HEAD`; `If-Match` and `If-None-Match` (incl. `*`) on `PUT`; `x-amz-copy-source-if-{match,none-match,modified-since,unmodified-since}` on `CopyObject`. `DELETE` accepts the headers but does not enforce them, matching AWS. CompleteMultipartUpload conditional writes land with multipart.
 - **Range requests** with **correct `Accept-Ranges: bytes` header** (the spot LocalStack gets wrong).
 - **Authentication:** SigV4 verification on every authenticated request. Anonymous access for public-acl objects.
 - **Presigned URLs:** SigV4 query-string signing verified end-to-end, **including with custom headers and query params** (the spot LocalStack gets wrong).

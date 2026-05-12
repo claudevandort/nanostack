@@ -15,6 +15,7 @@ const delete_parser = @import("../../wire/delete_objects_parser.zig");
 const list_objects_wire = @import("../../wire/list_objects.zig");
 const http_range = @import("../../http/range.zig");
 const fs_backend = @import("../../storage/fs.zig");
+const preconditions = @import("preconditions.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -207,6 +208,32 @@ fn listBuckets(ctx: Context) Result {
 // Object ops
 
 fn putObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
+    // CopyObject is a PUT with `x-amz-copy-source`. The router can't tell
+    // the two apart (both are `PUT /bucket/key`); we discriminate here.
+    if (findHeader(ctx.request.headers, "x-amz-copy-source")) |_| {
+        return copyObject(ctx, bucket, key);
+    }
+
+    // Conditional-write preconditions (If-Match, If-None-Match).
+    if (findHeader(ctx.request.headers, "if-match") != null or
+        findHeader(ctx.request.headers, "if-none-match") != null)
+    {
+        var subj: preconditions.Subject = .{};
+        if (ctx.backend.headObject(ctx.allocator, bucket, key)) |meta| {
+            subj = .{ .etag = meta.etag, .last_modified_unix = meta.last_modified_unix, .exists = true };
+        } else |err| switch (err) {
+            storage.Error.NoSuchKey => {},
+            storage.Error.NoSuchBucket => return .{ .err = .no_such_bucket },
+            else => return .{ .err = mapStorageErr(err) },
+        }
+        switch (preconditions.forWrite(ctx.request.headers, subj)) {
+            .ok => {},
+            .precondition_failed => return .{ .err = .precondition_failed },
+            .not_modified => unreachable, // forWrite never returns this
+            .invalid => return .{ .err = .invalid_argument },
+        }
+    }
+
     const content_type = findHeader(ctx.request.headers, "content-type") orelse "application/octet-stream";
     var meta_list: std.ArrayList(storage.Header) = .empty;
     defer meta_list.deinit(ctx.allocator);
@@ -234,9 +261,105 @@ fn putObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
     return .{ .ok = .{ .status = 200, .body = "", .extra_headers = headers } };
 }
 
+fn copyObject(ctx: Context, dest_bucket: []const u8, dest_key: []const u8) Result {
+    // ---------- Parse copy-source ----------
+    const raw_source = findHeader(ctx.request.headers, "x-amz-copy-source") orelse
+        return .{ .err = .invalid_request };
+    const decoded_source = percentDecode(ctx.allocator, raw_source) catch
+        return .{ .err = .internal_error };
+    // AWS allows the source to begin with `/` (path style) — strip it.
+    const stripped = if (decoded_source.len > 0 and decoded_source[0] == '/') decoded_source[1..] else decoded_source;
+    const slash = std.mem.indexOfScalar(u8, stripped, '/') orelse
+        return .{ .err = .invalid_request };
+    const source_bucket = stripped[0..slash];
+    const source_key = stripped[slash + 1 ..];
+    if (source_bucket.len == 0 or source_key.len == 0) return .{ .err = .invalid_request };
+
+    // ---------- Metadata directive ----------
+    const directive_raw = findHeader(ctx.request.headers, "x-amz-metadata-directive") orelse "COPY";
+    const directive: MetadataDirective = if (std.mem.eql(u8, directive_raw, "COPY"))
+        .copy
+    else if (std.mem.eql(u8, directive_raw, "REPLACE"))
+        .replace
+    else
+        return .{ .err = .invalid_argument };
+
+    // ---------- Read source ----------
+    const source_obj = ctx.backend.getObject(ctx.allocator, source_bucket, source_key) catch |err|
+        return .{ .err = mapStorageErr(err) };
+
+    // ---------- Conditional copy-source preconditions ----------
+    switch (preconditions.forCopySource(ctx.request.headers, .{
+        .etag = source_obj.meta.etag,
+        .last_modified_unix = source_obj.meta.last_modified_unix,
+        .exists = true,
+    })) {
+        .ok => {},
+        .precondition_failed => return .{ .err = .precondition_failed },
+        .not_modified => return .{ .err = .precondition_failed }, // CopyObject can't 304; AWS surfaces 412
+        .invalid => return .{ .err = .invalid_argument },
+    }
+
+    // ---------- Compose destination input ----------
+    var dest_content_type: []const u8 = source_obj.meta.content_type;
+    var dest_metadata: []const storage.Header = source_obj.meta.user_metadata;
+
+    if (directive == .replace) {
+        dest_content_type = findHeader(ctx.request.headers, "content-type") orelse "application/octet-stream";
+        var meta_list: std.ArrayList(storage.Header) = .empty;
+        defer meta_list.deinit(ctx.allocator);
+        for (ctx.request.headers) |h| {
+            var lower_buf: [256]u8 = undefined;
+            const lower = std.ascii.lowerString(lower_buf[0..@min(lower_buf.len, h.name.len)], h.name);
+            if (std.mem.startsWith(u8, lower, "x-amz-meta-")) {
+                const owned_name = ctx.allocator.dupe(u8, lower) catch return .{ .err = .internal_error };
+                const owned_value = ctx.allocator.dupe(u8, h.value) catch return .{ .err = .internal_error };
+                meta_list.append(ctx.allocator, .{ .name = owned_name, .value = owned_value }) catch return .{ .err = .internal_error };
+            }
+        }
+        dest_metadata = meta_list.toOwnedSlice(ctx.allocator) catch return .{ .err = .internal_error };
+    }
+
+    // ---------- Write destination ----------
+    const put_out = ctx.backend.putObject(.{
+        .bucket = dest_bucket,
+        .key = dest_key,
+        .body = source_obj.body,
+        .content_type = dest_content_type,
+        .user_metadata = dest_metadata,
+    }) catch |err| return .{ .err = mapStorageErr(err) };
+
+    // ---------- Render response ----------
+    // Fetch the destination's stored last_modified_unix for the response.
+    const dest_meta = ctx.backend.headObject(ctx.allocator, dest_bucket, dest_key) catch |err|
+        return .{ .err = mapStorageErr(err) };
+    const body = object_responses.renderCopyObjectResult(ctx.allocator, put_out.etag, dest_meta.last_modified_unix) catch
+        return .{ .err = .internal_error };
+    return .{ .ok = .{ .status = 200, .body = body } };
+}
+
+const MetadataDirective = enum { copy, replace };
+
+
 fn getObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
     const got = ctx.backend.getObject(ctx.allocator, bucket, key) catch |err|
         return .{ .err = mapStorageErr(err) };
+
+    switch (preconditions.forRead(ctx.request.headers, .{
+        .etag = got.meta.etag,
+        .last_modified_unix = got.meta.last_modified_unix,
+        .exists = true,
+    })) {
+        .ok => {},
+        .precondition_failed => return .{ .err = .precondition_failed },
+        .not_modified => {
+            // RFC 9110 §15.4.5: 304 carries no body but SHOULD include
+            // ETag + Last-Modified so cache validators stay coherent.
+            const hs = buildObjectHeaders(ctx, got.meta, null) catch return .{ .err = .internal_error };
+            return .{ .ok = .{ .status = 304, .body = "", .extra_headers = hs } };
+        },
+        .invalid => return .{ .err = .invalid_argument },
+    }
 
     var status: u16 = 200;
     var body: []const u8 = got.body;
@@ -268,6 +391,21 @@ fn getObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
 fn headObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
     const meta = ctx.backend.headObject(ctx.allocator, bucket, key) catch |err|
         return .{ .err = mapStorageErr(err) };
+
+    switch (preconditions.forRead(ctx.request.headers, .{
+        .etag = meta.etag,
+        .last_modified_unix = meta.last_modified_unix,
+        .exists = true,
+    })) {
+        .ok => {},
+        .precondition_failed => return .{ .err = .precondition_failed },
+        .not_modified => {
+            const hs = buildObjectHeaders(ctx, meta, null) catch return .{ .err = .internal_error };
+            return .{ .ok = .{ .status = 304, .body = "", .extra_headers = hs } };
+        },
+        .invalid => return .{ .err = .invalid_argument },
+    }
+
     const headers = buildHeadHeaders(ctx, meta) catch return .{ .err = .internal_error };
     return .{
         .ok = .{

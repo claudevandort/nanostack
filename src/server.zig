@@ -152,6 +152,14 @@ fn respondOk(
     res.header("x-amz-id-2", host_id);
     for (out.extra_headers) |h| res.header(h.name, h.value);
 
+    // 304 must not carry a Content-Type (RFC 9110 §15.4.5); httpz would
+    // otherwise default to text/plain on an empty body.
+    if (out.status == 304) {
+        res.content_type = null;
+        res.body = "";
+        return;
+    }
+
     // Object responses surface the stored content type; bucket-op success
     // bodies are AWS XML. Empty bodies (PutObject, DeleteBucket, HeadObject)
     // get no Content-Type — let httpz decide.
@@ -172,6 +180,17 @@ fn respondError(
     code: errors.Code,
     resource: ?[]const u8,
 ) void {
+    // RFC 9110 §15.4.5: 304 responses MUST NOT carry a body and the server
+    // SHOULD suppress entity headers like Content-Type. AWS S3 follows
+    // this; SDK clients expect it.
+    if (code == .not_modified) {
+        res.status = 304;
+        res.header("x-amz-request-id", request_id);
+        res.header("x-amz-id-2", host_id);
+        res.content_type = null;
+        res.body = "";
+        return;
+    }
     const body = errors.renderBody(res.arena, .{
         .code = code,
         .request_id = request_id,

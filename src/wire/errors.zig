@@ -27,6 +27,8 @@ pub const Code = enum {
     bad_request,
     bad_digest,
     invalid_range,
+    precondition_failed,
+    not_modified,
     internal_error,
 
     pub fn awsCode(self: Code) []const u8 {
@@ -49,6 +51,8 @@ pub const Code = enum {
             .bad_request => "BadRequest",
             .bad_digest => "BadDigest",
             .invalid_range => "InvalidRange",
+            .precondition_failed => "PreconditionFailed",
+            .not_modified => "NotModified",
             .internal_error => "InternalError",
         };
     }
@@ -73,6 +77,8 @@ pub const Code = enum {
             .bad_request => "Bad Request",
             .bad_digest => "The Content-MD5 you specified did not match what we received.",
             .invalid_range => "The requested range is not satisfiable.",
+            .precondition_failed => "At least one of the preconditions you specified did not hold.",
+            .not_modified => "Not Modified",
             .internal_error => "We encountered an internal error. Please try again.",
         };
     }
@@ -85,6 +91,8 @@ pub const Code = enum {
             .access_denied, .signature_does_not_match, .invalid_access_key_id, .request_time_too_skewed => 403,
             .invalid_request, .invalid_argument, .invalid_bucket_name, .missing_content_length, .bad_request, .bad_digest => 400,
             .invalid_range => 416,
+            .precondition_failed => 412,
+            .not_modified => 304,
             .method_not_allowed => 405,
             .internal_error => 500,
         };
