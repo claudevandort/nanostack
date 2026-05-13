@@ -29,6 +29,10 @@ pub const Code = enum {
     invalid_range,
     precondition_failed,
     not_modified,
+    entity_too_small,
+    no_such_upload,
+    invalid_part,
+    invalid_part_order,
     internal_error,
 
     pub fn awsCode(self: Code) []const u8 {
@@ -53,6 +57,10 @@ pub const Code = enum {
             .invalid_range => "InvalidRange",
             .precondition_failed => "PreconditionFailed",
             .not_modified => "NotModified",
+            .entity_too_small => "EntityTooSmall",
+            .no_such_upload => "NoSuchUpload",
+            .invalid_part => "InvalidPart",
+            .invalid_part_order => "InvalidPartOrder",
             .internal_error => "InternalError",
         };
     }
@@ -79,6 +87,10 @@ pub const Code = enum {
             .invalid_range => "The requested range is not satisfiable.",
             .precondition_failed => "At least one of the preconditions you specified did not hold.",
             .not_modified => "Not Modified",
+            .entity_too_small => "Your proposed upload is smaller than the minimum allowed object size.",
+            .no_such_upload => "The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
+            .invalid_part => "One or more of the specified parts could not be found. The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.",
+            .invalid_part_order => "The list of parts was not in ascending order. Parts must be ordered by part number.",
             .internal_error => "We encountered an internal error. Please try again.",
         };
     }
@@ -93,6 +105,9 @@ pub const Code = enum {
             .invalid_range => 416,
             .precondition_failed => 412,
             .not_modified => 304,
+            .entity_too_small => 400,
+            .no_such_upload => 404,
+            .invalid_part, .invalid_part_order => 400,
             .method_not_allowed => 405,
             .internal_error => 500,
         };

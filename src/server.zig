@@ -247,8 +247,14 @@ pub fn run(
     }
 
     var app: App = .{ .config = config, .io = init.io, .backend = backend };
+    // Allow up to 64 MiB request bodies. AWS S3 caps single-PUT and
+    // per-part uploads at 5 GiB, but httpz preallocates a per-worker pool
+    // sized by `max_body_size` — anything close to AWS's ceiling OOMs the
+    // process. 64 MiB covers SDK defaults (5-16 MiB parts) with headroom
+    // and is documented as a known divergence in SUPPORT.md.
     var server = try httpz.Server(*App).init(init.io, allocator, .{
         .address = .{ .ip = address },
+        .request = .{ .max_body_size = 64 * 1024 * 1024 },
     }, &app);
     defer {
         server.stop();

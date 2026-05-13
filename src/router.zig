@@ -18,6 +18,12 @@ pub const Operation = enum {
     delete_objects,
     list_objects,
     list_objects_v2,
+    create_multipart_upload,
+    upload_part,
+    complete_multipart_upload,
+    abort_multipart_upload,
+    list_parts,
+    list_multipart_uploads,
     unknown,
 };
 
@@ -66,6 +72,15 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
     const has_key = key != null;
 
     if (has_key) {
+        // Multipart routes on a keyed path. Their query toggles take
+        // priority over the plain put/get/head/delete fall-throughs.
+        if (eql(method, "POST") and hasQueryParam(query, "uploads")) return .create_multipart_upload;
+        if (hasQueryParam(query, "uploadId")) {
+            if (eql(method, "POST")) return .complete_multipart_upload;
+            if (eql(method, "PUT")) return .upload_part;
+            if (eql(method, "DELETE")) return .abort_multipart_upload;
+            if (eql(method, "GET")) return .list_parts;
+        }
         if (eql(method, "PUT")) return .put_object;
         if (eql(method, "GET")) return .get_object;
         if (eql(method, "HEAD")) return .head_object;
@@ -77,7 +92,7 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
 
     if (eql(method, "GET") and !has_bucket) return .list_buckets;
     if (eql(method, "GET") and has_bucket) {
-        // ListObjectsV2 is `?list-type=2`; v1 is the bare GET.
+        if (hasQueryParam(query, "uploads")) return .list_multipart_uploads;
         if (queryParamEquals(query, "list-type", "2")) return .list_objects_v2;
         return .list_objects;
     }
@@ -244,4 +259,34 @@ test "virtual-hosted: GET /obj on bucket host → get_object" {
     try testing.expectEqualStrings("mybucket", p.bucket.?);
     try testing.expectEqualStrings("foo", p.key.?);
     try testing.expectEqual(Operation.get_object, p.op);
+}
+
+test "multipart: POST /b/k?uploads → create_multipart_upload" {
+    const p = parse("POST", "localhost", "/buk/k", "uploads");
+    try testing.expectEqual(Operation.create_multipart_upload, p.op);
+}
+
+test "multipart: PUT /b/k?uploadId=X&partNumber=1 → upload_part" {
+    const p = parse("PUT", "localhost", "/buk/k", "uploadId=abc&partNumber=1");
+    try testing.expectEqual(Operation.upload_part, p.op);
+}
+
+test "multipart: POST /b/k?uploadId=X → complete_multipart_upload" {
+    const p = parse("POST", "localhost", "/buk/k", "uploadId=abc");
+    try testing.expectEqual(Operation.complete_multipart_upload, p.op);
+}
+
+test "multipart: DELETE /b/k?uploadId=X → abort_multipart_upload" {
+    const p = parse("DELETE", "localhost", "/buk/k", "uploadId=abc");
+    try testing.expectEqual(Operation.abort_multipart_upload, p.op);
+}
+
+test "multipart: GET /b/k?uploadId=X → list_parts" {
+    const p = parse("GET", "localhost", "/buk/k", "uploadId=abc");
+    try testing.expectEqual(Operation.list_parts, p.op);
+}
+
+test "multipart: GET /b?uploads → list_multipart_uploads" {
+    const p = parse("GET", "localhost", "/buk", "uploads");
+    try testing.expectEqual(Operation.list_multipart_uploads, p.op);
 }

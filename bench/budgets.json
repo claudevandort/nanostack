@@ -73,6 +73,14 @@
       "comparison": "ge",
       "gate": true,
       "how": "32 concurrent goroutines over 5 s via aws-sdk-go-v2; unique keys per worker. PRD's original 50k req/s target assumed wrk/bombardier against raw HTTP (no per-request SigV4); SDK-driven measurement reflects what users actually see."
+    },
+    {
+      "key": "multipart_5x5mib_p99_ms",
+      "label": "Multipart upload p99 (5 parts × 5 MiB, concurrent)",
+      "unit": "ms",
+      "targets": { "mem": 250, "fs": 500 },
+      "gate": true,
+      "how": "20 iterations of {InitiateMPU → 5 concurrent UploadParts of 5 MiB each → CompleteMPU}, p99 of total wall time per iteration. Budgets are ~2× the locally-measured baseline rounded to a clean number; CI runners typically have slower disks than dev machines so fs gets the wider margin."
     }
   ],
   "informational_metrics": [
@@ -99,6 +107,12 @@
       "key": "head_bucket_throughput_rps",
       "label": "HeadBucket throughput (4 concurrent, 5 s)",
       "unit": "req/s",
+      "gate": false
+    },
+    {
+      "key": "multipart_5x5mib_p50_ms",
+      "label": "Multipart upload p50 (5 parts × 5 MiB, concurrent)",
+      "unit": "ms",
       "gate": false
     }
   ]

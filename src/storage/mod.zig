@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 pub const Error = error{
     NoSuchBucket,
     NoSuchKey,
+    NoSuchUpload,
     BucketAlreadyExists,
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
@@ -111,6 +112,107 @@ pub const ListObjectsOutput = struct {
     next_key: []const u8,
 };
 
+// ---------------------------------------------------------------------------
+// Multipart upload (M6)
+
+pub const InitiateMultipartUploadInput = struct {
+    bucket: []const u8,
+    key: []const u8,
+    content_type: []const u8,
+    user_metadata: []const Header = &.{},
+};
+
+pub const InitiateMultipartUploadOutput = struct {
+    /// Opaque token. We pick the format; clients must treat it as a blob.
+    upload_id: []const u8,
+};
+
+pub const UploadPartInput = struct {
+    bucket: []const u8,
+    key: []const u8,
+    upload_id: []const u8,
+    /// 1..=10000 per AWS. Service validates the range; backends can assume
+    /// they receive a valid number.
+    part_number: u32,
+    body: []const u8,
+};
+
+pub const UploadPartOutput = struct {
+    /// Single-part MD5, quoted.
+    etag: []const u8,
+};
+
+/// One client-provided part entry in a CompleteMultipartUpload body.
+pub const CompletePart = struct {
+    part_number: u32,
+    etag: []const u8, // quoted, as received
+};
+
+pub const CompleteMultipartUploadInput = struct {
+    bucket: []const u8,
+    key: []const u8,
+    upload_id: []const u8,
+    /// Ordered ascending by part_number; service validates this.
+    parts: []const CompletePart,
+};
+
+pub const CompleteMultipartUploadOutput = struct {
+    /// AWS-style multipart etag: `"<hex>-N"`. Quoted, includes the suffix.
+    etag: []const u8,
+};
+
+/// Metadata for one in-progress multipart upload (returned by
+/// ListMultipartUploads).
+pub const MultipartUploadInfo = struct {
+    key: []const u8,
+    upload_id: []const u8,
+    initiated_unix: i64,
+};
+
+/// Metadata for one uploaded part (returned by ListParts).
+pub const PartInfo = struct {
+    part_number: u32,
+    size: u64,
+    etag: []const u8, // quoted
+    last_modified_unix: i64,
+};
+
+pub const ListMultipartUploadsInput = struct {
+    bucket: []const u8,
+    prefix: []const u8 = "",
+    delimiter: []const u8 = "",
+    /// Pagination cursor — return uploads strictly after (key_marker,
+    /// upload_id_marker) in the sort order (key asc, upload_id asc).
+    key_marker: []const u8 = "",
+    upload_id_marker: []const u8 = "",
+    max_uploads: u32 = 1000,
+};
+
+pub const ListMultipartUploadsOutput = struct {
+    uploads: []MultipartUploadInfo,
+    common_prefixes: [][]const u8,
+    is_truncated: bool,
+    /// When truncated, these are the values to send as the next page's
+    /// `key-marker` / `upload-id-marker`.
+    next_key_marker: []const u8,
+    next_upload_id_marker: []const u8,
+};
+
+pub const ListPartsInput = struct {
+    bucket: []const u8,
+    key: []const u8,
+    upload_id: []const u8,
+    /// Return parts with part_number strictly greater than this.
+    part_number_marker: u32 = 0,
+    max_parts: u32 = 1000,
+};
+
+pub const ListPartsOutput = struct {
+    parts: []PartInfo,
+    is_truncated: bool,
+    next_part_number_marker: u32,
+};
+
 pub const Backend = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -128,6 +230,13 @@ pub const Backend = struct {
         deleteObject: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8) Error!void,
         // Listing (M4).
         listObjects: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListObjectsInput) Error!ListObjectsOutput,
+        // Multipart upload (M6).
+        initiateMultipartUpload: *const fn (ctx: *anyopaque, allocator: Allocator, in: InitiateMultipartUploadInput) Error!InitiateMultipartUploadOutput,
+        uploadPart: *const fn (ctx: *anyopaque, in: UploadPartInput) Error!UploadPartOutput,
+        completeMultipartUpload: *const fn (ctx: *anyopaque, allocator: Allocator, in: CompleteMultipartUploadInput) Error!CompleteMultipartUploadOutput,
+        abortMultipartUpload: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, upload_id: []const u8) Error!void,
+        listMultipartUploads: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListMultipartUploadsInput) Error!ListMultipartUploadsOutput,
+        listParts: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListPartsInput) Error!ListPartsOutput,
     };
 
     // Pass-through helpers so call sites don't dereference the vtable.
@@ -164,6 +273,25 @@ pub const Backend = struct {
     /// same allocator passed in to free.
     pub fn listObjects(self: Backend, allocator: Allocator, in: ListObjectsInput) Error!ListObjectsOutput {
         return self.vtable.listObjects(self.ctx, allocator, in);
+    }
+
+    pub fn initiateMultipartUpload(self: Backend, allocator: Allocator, in: InitiateMultipartUploadInput) Error!InitiateMultipartUploadOutput {
+        return self.vtable.initiateMultipartUpload(self.ctx, allocator, in);
+    }
+    pub fn uploadPart(self: Backend, in: UploadPartInput) Error!UploadPartOutput {
+        return self.vtable.uploadPart(self.ctx, in);
+    }
+    pub fn completeMultipartUpload(self: Backend, allocator: Allocator, in: CompleteMultipartUploadInput) Error!CompleteMultipartUploadOutput {
+        return self.vtable.completeMultipartUpload(self.ctx, allocator, in);
+    }
+    pub fn abortMultipartUpload(self: Backend, bucket: []const u8, key: []const u8, upload_id: []const u8) Error!void {
+        return self.vtable.abortMultipartUpload(self.ctx, bucket, key, upload_id);
+    }
+    pub fn listMultipartUploads(self: Backend, allocator: Allocator, in: ListMultipartUploadsInput) Error!ListMultipartUploadsOutput {
+        return self.vtable.listMultipartUploads(self.ctx, allocator, in);
+    }
+    pub fn listParts(self: Backend, allocator: Allocator, in: ListPartsInput) Error!ListPartsOutput {
+        return self.vtable.listParts(self.ctx, allocator, in);
     }
 };
 

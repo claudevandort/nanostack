@@ -16,6 +16,7 @@ const list_objects_wire = @import("../../wire/list_objects.zig");
 const http_range = @import("../../http/range.zig");
 const fs_backend = @import("../../storage/fs.zig");
 const preconditions = @import("preconditions.zig");
+const multipart = @import("multipart.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -95,6 +96,35 @@ pub fn handle(ctx: Context, parsed: router.Parsed) Result {
             ctx,
             parsed.bucket orelse return .{ .err = .invalid_request },
         ),
+        .create_multipart_upload => multipart.createMultipartUpload(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .upload_part => multipart.uploadPart(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .complete_multipart_upload => multipart.completeMultipartUpload(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .abort_multipart_upload => multipart.abortMultipartUpload(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .list_parts => multipart.listParts(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .list_multipart_uploads => multipart.listMultipartUploads(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
         .unknown => .{ .err = .not_implemented },
     };
 }
@@ -105,7 +135,7 @@ pub fn handle(ctx: Context, parsed: router.Parsed) Result {
 /// Find a query parameter by name. Returns the *percent-decoded* value or
 /// null if absent. Caller's arena owns the returned slice when a decode
 /// happened; otherwise it's a slice into the raw query string.
-fn queryValue(arena: Allocator, query: []const u8, name: []const u8) !?[]const u8 {
+pub fn queryValue(arena: Allocator, query: []const u8, name: []const u8) !?[]const u8 {
     if (query.len == 0) return null;
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
@@ -117,7 +147,7 @@ fn queryValue(arena: Allocator, query: []const u8, name: []const u8) !?[]const u
     return null;
 }
 
-fn percentDecode(arena: Allocator, in: []const u8) ![]const u8 {
+pub fn percentDecode(arena: Allocator, in: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.ensureTotalCapacity(arena, in.len);
     var i: usize = 0;
@@ -149,10 +179,11 @@ fn hexDigit(c: u8) ?u8 {
     return null;
 }
 
-fn mapStorageErr(e: storage.Error) errors.Code {
+pub fn mapStorageErr(e: storage.Error) errors.Code {
     return switch (e) {
         storage.Error.NoSuchBucket => .no_such_bucket,
         storage.Error.NoSuchKey => .no_such_key,
+        storage.Error.NoSuchUpload => .no_such_upload,
         storage.Error.BucketAlreadyExists => .bucket_already_exists,
         storage.Error.BucketAlreadyOwnedByYou => .bucket_already_owned_by_you,
         storage.Error.BucketNotEmpty => .bucket_not_empty,
@@ -460,7 +491,7 @@ fn deleteObjects(ctx: Context, bucket: []const u8) Result {
 // ---------------------------------------------------------------------------
 // Helpers
 
-fn findHeader(headers: []const storage.Header, lower_name: []const u8) ?[]const u8 {
+pub fn findHeader(headers: []const storage.Header, lower_name: []const u8) ?[]const u8 {
     for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, lower_name)) return h.value;
     }

@@ -27,13 +27,13 @@ This file is updated as part of every release. The source of truth for the v1 cu
 | CopyObject | supported (incl. `x-amz-metadata-directive=COPY\|REPLACE`, `x-amz-copy-source-if-*`) | M5 |
 | ListObjects (v1) | supported (prefix, delimiter, marker, max-keys, encoding-type=url) | M4 |
 | ListObjectsV2 | supported (prefix, delimiter, start-after, continuation-token, max-keys, fetch-owner, encoding-type=url) | M4 |
-| CreateMultipartUpload | stub | M6 |
-| UploadPart | stub | M6 |
-| UploadPartCopy | stub | M6 |
-| CompleteMultipartUpload | stub | M6 |
-| AbortMultipartUpload | stub | M6 |
-| ListMultipartUploads | stub | M6 |
-| ListParts | stub | M6 |
+| CreateMultipartUpload | supported (content-type + user-metadata captured at init) | M6 |
+| UploadPart | supported (1–10000 part numbers, per-part MD5 ETag) | M6 |
+| UploadPartCopy | supported (whole-part copy + `x-amz-copy-source-if-*`) | M6 |
+| CompleteMultipartUpload | supported (incl. 5 MiB min on non-final parts, conditional `If-Match`/`If-None-Match`) | M6 |
+| AbortMultipartUpload | supported (204) | M6 |
+| ListMultipartUploads | supported (prefix, delimiter, key-marker, upload-id-marker, max-uploads, encoding-type=url) | M6 |
+| ListParts | supported (part-number-marker, max-parts) | M6 |
 
 ### v1 cross-cutting
 
@@ -48,6 +48,11 @@ This file is updated as part of every release. The source of truth for the v1 cu
 | Content-Type passthrough | supported | M3 |
 | `x-amz-meta-*` user metadata passthrough | supported | M3 |
 | ETag (MD5 of body, double-quoted) | supported (non-multipart) | M3 |
+| ETag — multipart objects (`<md5-of-concatenated-part-md5s>-<part-count>`) | supported | M6 |
+| Multipart: `x-amz-copy-source-range` on UploadPartCopy | not supported (deferred to post-v1) | post-v1 |
+| Multipart: `x-amz-tagging`/`x-amz-tagging-directive` on CreateMultipartUpload | accepted and ignored | post-v1 |
+| Multipart: SSE headers on CreateMultipartUpload | accepted and ignored | post-v1 |
+| Multipart: lifecycle-based incomplete-upload cleanup | not supported (manual AbortMultipartUpload required) | post-v1 |
 | Object listing — `encoding-type=url` (URL-encode keys + prefixes in response) | supported | M4 |
 | Object listing — `max-keys` cap (1000, request silently clamped) | supported | M4 |
 | Streaming payload hashes (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) | not supported | known limitation; defer |

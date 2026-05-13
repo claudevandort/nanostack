@@ -34,6 +34,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // -----------------------------------------------------------------------------
@@ -403,6 +404,84 @@ func measureGetObjectLatency(c *s3.Client, bucket string, body []byte, n int) fl
 	return percentile(durs, 99)
 }
 
+// measureMultipartConcurrent drives one multipart-upload iteration:
+// Initiate → fire `parts` goroutines uploading `partSize` bytes in
+// parallel → Complete. We record total wall time per iteration over `n`
+// iterations and return the (p50, p99). Each iteration uses a fresh key
+// so we exercise the cold path. Every part is exactly `partSize` bytes
+// (≥ 5 MiB) to satisfy the AWS minimum-part-size rule on non-final parts.
+func measureMultipartConcurrent(c *s3.Client, bucket string, parts int, partSize int, n int) (p50, p99 float64) {
+	body := bytes.Repeat([]byte{'A'}, partSize)
+	durs := make([]float64, 0, n)
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("mp/%d", i)
+		start := time.Now()
+
+		init, err := c.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			continue
+		}
+		uploadId := aws.ToString(init.UploadId)
+
+		etags := make([]string, parts)
+		errs := make([]error, parts)
+		var wg sync.WaitGroup
+		for j := 0; j < parts; j++ {
+			wg.Add(1)
+			go func(pn int) {
+				defer wg.Done()
+				out, err := c.UploadPart(context.Background(), &s3.UploadPartInput{
+					Bucket:     aws.String(bucket),
+					Key:        aws.String(key),
+					UploadId:   aws.String(uploadId),
+					PartNumber: aws.Int32(int32(pn + 1)),
+					Body:       bytes.NewReader(body),
+				})
+				if err != nil {
+					errs[pn] = err
+					return
+				}
+				etags[pn] = aws.ToString(out.ETag)
+			}(j)
+		}
+		wg.Wait()
+
+		// Bail on any part error — leaves a stray upload, but the bench
+		// harness wipes the data dir between runs.
+		failed := false
+		for _, e := range errs {
+			if e != nil {
+				failed = true
+				break
+			}
+		}
+		if failed {
+			continue
+		}
+
+		completed := make([]types.CompletedPart, parts)
+		for j := 0; j < parts; j++ {
+			completed[j] = types.CompletedPart{
+				ETag:       aws.String(etags[j]),
+				PartNumber: aws.Int32(int32(j + 1)),
+			}
+		}
+		if _, err := c.CompleteMultipartUpload(context.Background(), &s3.CompleteMultipartUploadInput{
+			Bucket:          aws.String(bucket),
+			Key:             aws.String(key),
+			UploadId:        aws.String(uploadId),
+			MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
+		}); err != nil {
+			continue
+		}
+		durs = append(durs, ms(time.Since(start)))
+	}
+	return percentile(durs, 50), percentile(durs, 99)
+}
+
 // measurePutObjectThroughput uses `workers` goroutines for `dur`, each
 // PUTting unique keys so we measure write throughput (not overwrite).
 func measurePutObjectThroughput(c *s3.Client, bucket string, body []byte, workers int, dur time.Duration) float64 {
@@ -598,6 +677,13 @@ func main() {
 	// load tester sees", which is what the budget is measuring.
 	poRps := measurePutObjectThroughput(client, bucket, body, 32, 5*time.Second)
 	b.Metrics = recordMetric(b.Metrics, "put_object_throughput_rps", poRps, *backend)
+
+	// 5c. Multipart upload — 5 parts × 5 MiB each uploaded concurrently,
+	//     then CompleteMultipartUpload. PRD M6 exit criterion. 20 iterations
+	//     gives a stable enough p99 to gate on.
+	mpP50, mpP99 := measureMultipartConcurrent(client, bucket, 5, 5*1024*1024, 20)
+	b.Informational = recordMetric(b.Informational, "multipart_5x5mib_p50_ms", mpP50, *backend)
+	b.Metrics = recordMetric(b.Metrics, "multipart_5x5mib_p99_ms", mpP99, *backend)
 
 	// 6. Wipe-restart — kill the live process, respawn 5x on the same
 	//    port + backend. fs has to scan the directory tree to rebuild
