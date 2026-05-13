@@ -5,7 +5,6 @@ const cli = @import("cli.zig");
 const server = @import("server.zig");
 const storage = @import("storage/mod.zig");
 const FsBackend = @import("storage/fs.zig");
-const MemBackend = @import("storage/mem.zig");
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -18,13 +17,6 @@ pub fn main(init: std.process.Init) !void {
 
     const data_dir = try resolveDataDir(arena, init.environ_map, config.data_dir);
     config.data_dir = data_dir;
-
-    if (config.ephemeral) {
-        const mem = try MemBackend.init(arena, init.io);
-        defer mem.deinit();
-        try server.run(arena, &config, init, mem.backend());
-        return;
-    }
 
     const profile_root = try std.fmt.allocPrint(arena, "{s}/profiles/{s}", .{ data_dir, config.profile });
     const fs = try FsBackend.init(arena, init.io, profile_root);

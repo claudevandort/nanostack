@@ -9,7 +9,6 @@ pub const Config = struct {
     port: u16 = 4566,
     data_dir: ?[]const u8 = null,
     profile: []const u8 = "default",
-    ephemeral: bool = false,
     services: []const u8 = "s3",
     log_level: []const u8 = "info",
     access_key: []const u8 = "test",
@@ -37,9 +36,7 @@ pub fn parse(args: []const [:0]const u8) ParseError!Config {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--ephemeral")) {
-            c.ephemeral = true;
-        } else if (std.mem.eql(u8, arg, "--self-test-ready")) {
+        if (std.mem.eql(u8, arg, "--self-test-ready")) {
             c.self_test_ready = true;
         } else if (std.mem.eql(u8, arg, "--no-auth")) {
             c.no_auth = true;
@@ -99,15 +96,13 @@ test "defaults" {
     const c = try parse(&.{"nanostack"});
     try testing.expectEqualStrings("127.0.0.1", c.bind);
     try testing.expectEqual(@as(u16, 4566), c.port);
-    try testing.expect(!c.ephemeral);
     try testing.expectEqualStrings("default", c.profile);
 }
 
 test "overrides" {
-    const c = try parse(&.{ "nanostack", "--port", "9999", "--bind", "0.0.0.0", "--ephemeral", "--region", "eu-west-1" });
+    const c = try parse(&.{ "nanostack", "--port", "9999", "--bind", "0.0.0.0", "--region", "eu-west-1" });
     try testing.expectEqual(@as(u16, 9999), c.port);
     try testing.expectEqualStrings("0.0.0.0", c.bind);
-    try testing.expect(c.ephemeral);
     try testing.expectEqualStrings("eu-west-1", c.region);
 }
 

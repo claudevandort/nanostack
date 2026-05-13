@@ -60,7 +60,7 @@ This file is updated as part of every release. The source of truth for the v1 cu
 | Path-style addressing | supported | M1 |
 | Virtual-hosted-style addressing | supported | M1 |
 | AWS-strict bucket-name validation | supported | M1 |
-| Filesystem + in-memory (`--ephemeral`) backends | supported | M1 |
+| Filesystem backend (`--data-dir`; pass a tmpdir for wipe-clean runs) | supported | M1 |
 | Conditional headers — GET/HEAD (all four: If-Match / If-None-Match / If-Modified-Since / If-Unmodified-Since) | supported | M5 |
 | Conditional headers — PUT (If-Match / If-None-Match, AWS-exact; If-*-Since accepted and ignored) | supported | M5 |
 | Conditional headers — CopyObject (`x-amz-copy-source-if-{match,none-match,modified-since,unmodified-since}`) | supported | M5 |

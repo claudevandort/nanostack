@@ -19,7 +19,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const storage = @import("mod.zig");
 const util = @import("util.zig");
-const mem_backend = @import("mem.zig");
+const etag_mod = @import("etag.zig");
 
 const Fs = @This();
 
@@ -276,7 +276,7 @@ pub fn putObject(self: *Fs, in: storage.PutObjectInput) storage.Error!storage.Pu
     const idx = findBucket(self, in.bucket) orelse return storage.Error.NoSuchBucket;
     var slot = &self.buckets.items[idx];
 
-    const etag = mem_backend.computeEtag(self.allocator, in.body) catch return storage.Error.OutOfMemory;
+    const etag = etag_mod.computeEtag(self.allocator, in.body) catch return storage.Error.OutOfMemory;
     errdefer self.allocator.free(etag);
 
     // Ensure the per-key dir exists.
@@ -716,7 +716,7 @@ pub fn uploadPart(self: *Fs, in: storage.UploadPartInput) storage.Error!storage.
     var slot = &self.buckets.items[idx];
     var state = slot.uploads.getPtr(in.upload_id) orelse return storage.Error.NoSuchUpload;
 
-    const etag = mem_backend.computeEtag(self.allocator, in.body) catch return storage.Error.OutOfMemory;
+    const etag = etag_mod.computeEtag(self.allocator, in.body) catch return storage.Error.OutOfMemory;
     errdefer self.allocator.free(etag);
 
     // Atomically write the part file.
@@ -773,7 +773,7 @@ pub fn completeMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Comp
         Md5.hash(part_bytes, &digests[i], .{});
     }
 
-    const final_etag = mem_backend.computeMultipartEtag(self.allocator, digests, @intCast(in.parts.len)) catch return storage.Error.OutOfMemory;
+    const final_etag = etag_mod.computeMultipartEtag(self.allocator, digests, @intCast(in.parts.len)) catch return storage.Error.OutOfMemory;
     errdefer self.allocator.free(final_etag);
 
     // Write the final object (data + meta.json) atomically.

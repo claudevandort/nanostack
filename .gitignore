@@ -17,3 +17,6 @@ tests/conformance/go/go.sum.local
 
 # JS conformance test artefacts
 tests/conformance/js/node_modules/
+
+# Bench driver compiled binary (built ad-hoc during IDE checks; bench harness compiles fresh)
+bench/driver/bench

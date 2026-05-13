@@ -127,7 +127,7 @@ A **single-binary, sub-second-startup, Apache-2.0, accurate-on-the-core-surface*
 - **Filesystem-backed by default.** Object data lives under `<data-dir>/<profile>/s3/<bucket>/<key-hash>/data` per the on-disk layout in §9.
 - **Per-object JSON metadata** in a sidecar (`meta.json`) next to each object body. Chosen for inspectability (`cat meta.json` answers debugging questions in one command), zero external dependencies, and atomic per-object writes. The convenience win matters for a dev/test emulator; we accept the linear listing cost and offset it with…
 - **In-memory sorted listing index** built by scanning bucket directories at startup. `ListObjects` / `ListObjectsV2` resolve against this index instead of walking the filesystem. Mutations on PUT/DELETE update the index incrementally. Promote to SQLite later if profiling ever shows listing is the bottleneck — unlikely for local dev workloads.
-- **`--ephemeral` flag** runs entirely in a tmpfs-style memory backend; the process owns its lifetime.
+- **Wipe-clean runs** pass `--data-dir <tmp>` and let the OS reap the directory on exit. (The pre-M7 `--ephemeral` in-memory backend was dropped — see §17.)
 - **`io_uring` on Linux** via `Cloudef/zig-aio` for hot read/write paths; standard POSIX file I/O on macOS via kqueue.
 
 ---
@@ -167,7 +167,7 @@ A **single-binary, sub-second-startup, Apache-2.0, accurate-on-the-core-surface*
                                       │
                      ┌────────────────▼────────────────────┐
                      │            Storage backend          │
-                     │     fs (default) | mem (--ephemeral) │
+                     │                fs                    │
                      └─────────────────────────────────────┘
 ```
 
@@ -228,7 +228,7 @@ We will ship a `SUPPORT.md` that lists *every* S3 operation and one of: **suppor
 - **Object keys** are stored as raw bytes; the on-disk filename is `sha256(key)` to sidestep filesystem path constraints (S3 allows characters that `ext4`/`apfs` reject and supports keys up to 1024 bytes).
 - **ETag** is computed lazily on the first read and cached in `meta.json`. For multipart, ETag is `<md5-of-concatenated-part-md5s>-<part-count>` to match AWS.
 - **Atomic writes** via `O_TMPFILE` + `linkat` on Linux, `rename(2)` on macOS.
-- **`--ephemeral`** swaps the backend out entirely for an in-memory `HashMap(Key, Object)` keyed structure with the same interface.
+- **Wipe-clean runs**: pass `--data-dir <tmp>` (e.g. `mktemp -d`). The OS reaps the directory on exit; no in-memory backend.
 
 ---
 
@@ -238,16 +238,15 @@ We will ship a `SUPPORT.md` that lists *every* S3 operation and one of: **suppor
 ```
 $ nanostack
 listening on http://127.0.0.1:4566
-profile: default  | data: ~/.nanostack/profiles/default  | ephemeral: false
+profile: default  | data: ~/.nanostack/profiles/default
 ```
 
 ### Flags (v1)
 ```
 --port <n>            default 4566 (LocalStack-compatible)
 --bind <addr>         default 127.0.0.1
---data-dir <path>     default ~/.nanostack
+--data-dir <path>     default ~/.nanostack — pass a tmpdir for a wipe-clean run
 --profile <name>      default "default"
---ephemeral           wipe-clean in-memory mode
 --services <list>     default "s3" (only one for v1, future-proofs the flag)
 --log-level <lvl>     trace|debug|info|warn|error
 --access-key <key>    accepted SigV4 access key id (default: "test")
@@ -289,18 +288,17 @@ We publish a Markdown table at the repo root, updated on every release, showing 
 
 All numbers are measured by the bench harness in `bench/driver/` driving signed AWS SDK calls (Go SDK v2) against `ReleaseFast`-built nanostack. We deliberately use the AWS SDK rather than `wrk`/`bombardier` so the budget reflects what users actually experience — SigV4 cost included.
 
-Two storage backends, two budget columns where the physics differ:
-
-| Metric | mem | fs | How measured |
-|---|---|---|---|
-| Cold start to bound listener | ≤ 500 ms | ≤ 500 ms | `time nanostack --self-test-ready` (real bind, then exit); median of 5 |
-| Idle RSS (5 s after start) | ≤ 30 MB | ≤ 30 MB | `/proc/<pid>/status` `VmRSS`; max of 3 samples |
-| Binary size (stripped) | ≤ 20 MB | ≤ 20 MB | `os.Stat` after `zig build -Doptimize=ReleaseFast -Dstrip=true` |
-| Wipe-restart | ≤ 100 ms | ≤ 500 ms | kill + respawn, time to first TCP accept; median of 5. fs walks `objects/*/meta.json` to rebuild its key index. |
-| Warm p50 PutObject (1 KB) | ≤ 1 ms | ≤ 3 ms | 10 000 sequential PutObject ops via aws-sdk-go-v2. fs slower because each PUT atomically writes both `data` and `meta.json`. |
-| Warm p99 PutObject (1 KB) | ≤ 5 ms | ≤ 5 ms | 99th percentile of the same series |
-| Warm p99 GetObject (≤ 1 MB) | ≤ 5 ms | ≤ 5 ms | 10 000 sequential GetObject ops |
-| PutObject throughput (1 KB, 32 concurrent) | ≥ 5 000 req/s | ≥ 500 req/s | 32 goroutines for 5 s, unique keys per worker |
+| Metric | Budget | How measured |
+|---|---|---|
+| Cold start to bound listener | ≤ 500 ms | `time nanostack --self-test-ready` (real bind, then exit); median of 5 |
+| Idle RSS (5 s after start) | ≤ 30 MB | `/proc/<pid>/status` `VmRSS`; max of 3 samples |
+| Binary size (stripped) | ≤ 20 MB | `os.Stat` after `zig build -Doptimize=ReleaseFast -Dstrip=true` |
+| Wipe-restart | ≤ 500 ms | kill + respawn, time to first TCP accept; median of 5. fs walks `objects/*/meta.json` to rebuild its key index. |
+| Warm p50 PutObject (1 KB) | ≤ 3 ms | 10 000 sequential PutObject ops via aws-sdk-go-v2. Cost reflects two atomic writes (`data` + `meta.json`) per PUT. |
+| Warm p99 PutObject (1 KB) | ≤ 5 ms | 99th percentile of the same series |
+| Warm p99 GetObject (≤ 1 MB) | ≤ 5 ms | 10 000 sequential GetObject ops |
+| PutObject throughput (1 KB, 32 concurrent) | ≥ 500 req/s | 32 goroutines for 5 s, unique keys per worker |
+| Multipart upload p99 (5 × 5 MiB concurrent) | ≤ 500 ms | 20 iterations of {InitiateMPU → 5 concurrent UploadParts of 5 MiB → CompleteMPU} |
 
 Numbers are budgets, not promises — but a regression past any of them in CI fails the build. Each new milestone may add rows; an existing row only loosens with a one-liner justification recorded in the commit message.
 
@@ -332,8 +330,7 @@ We will work in tight, verifiable cuts. Each milestone ends with a green CI run 
 | **M4 — Listing** | ListObjects (v1), ListObjectsV2, pagination, prefix/delimiter | Conformance green; large-bucket listing benchmarked |
 | **M5 — Copy + conditional** | CopyObject, all conditional headers on GET/HEAD/PUT/COPY/DELETE | Conformance green |
 | **M6 — Multipart** | All 7 multipart operations, conditional writes on CompleteMultipartUpload | Conformance green; concurrent-part upload bench |
-| **M7 — Ephemeral mode** | `--ephemeral` backend, full conformance green against both backends | Same suite passes against both backends |
-| **M8 — v1.0** | Polish, docs, `SUPPORT.md`, scorecard, brew/release tarballs | Public release; LocalStack-comparable conformance posted |
+| **M7 — v1.0** | Polish, docs, `SUPPORT.md`, scorecard, brew/release tarballs | Public release; LocalStack-comparable conformance posted |
 
 Time estimate end-to-end: **~6 weeks** with focused effort, assuming the foundation work in M0–M2 lands clean.
 
@@ -376,6 +373,7 @@ Anything beyond that (SNS, EventBridge, Kinesis, IAM) is reconsidered after v1.4
 
 - **Metadata format (2026-05-12):** per-object JSON sidecar (`meta.json`) + in-memory sorted listing index built at startup. Resolves the §9 / §17 open question. Chosen for inspectability and zero deps; offsets listing cost with the index. See §6 / §9.
 - **Multi-profile state isolation (2026-05-12):** deferred to v1.1. v1 ships single-profile-only. The `--profile` flag still exists and is honoured for the data-dir path so that v1.1 can layer multi-profile in without breaking existing users.
+- **In-memory backend dropped (2026-05-13):** the pre-M7 `--ephemeral` mode is removed. Reasons: every new storage operation had to be implemented twice (M6 alone added a 200+ LOC `MultipartState` mirror); the mem-resident part buffers crashed dev environments under realistic multipart load; the fs backend already covers the "wipe-clean" use case via `--data-dir <tmp>`. Old M7 ("Ephemeral mode") vacated from §14; old M8 becomes the new M7.
 
 ---
 

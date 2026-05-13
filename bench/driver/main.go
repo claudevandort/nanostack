@@ -41,39 +41,28 @@ import (
 // Budget schema (matches bench/budgets.json)
 
 type Metric struct {
-	Key        string             `json:"key"`
-	Label      string             `json:"label"`
-	Unit       string             `json:"unit"`
-	Target     float64            `json:"target,omitempty"`
-	Targets    map[string]float64 `json:"targets,omitempty"`     // per-backend `le` budgets
-	TargetMin  float64            `json:"target_min,omitempty"`
-	TargetsMin map[string]float64 `json:"targets_min,omitempty"` // per-backend `ge` budgets
-	Comparison string             `json:"comparison,omitempty"`  // "le" (default) or "ge"
-	Gate       bool               `json:"gate"`
-	How        string             `json:"how,omitempty"`
+	Key        string  `json:"key"`
+	Label      string  `json:"label"`
+	Unit       string  `json:"unit"`
+	Target     float64 `json:"target,omitempty"`
+	TargetMin  float64 `json:"target_min,omitempty"`
+	Comparison string  `json:"comparison,omitempty"` // "le" (default) or "ge"
+	Gate       bool    `json:"gate"`
+	How        string  `json:"how,omitempty"`
 
 	Measured *float64 `json:"measured,omitempty"`
 	Pass     *bool    `json:"pass,omitempty"`
 }
 
-// effectiveTarget returns the budget to compare against for the active
-// backend. Per-backend maps win over the single-value fields when present.
-func (m *Metric) effectiveTarget(backend string) (target float64, comparison string, ok bool) {
+// effectiveTarget returns the budget to compare against. Single-backend
+// nanostack only has one storage path; per-backend maps were dropped
+// when the in-memory backend was removed.
+func (m *Metric) effectiveTarget() (target float64, comparison string, ok bool) {
 	if m.Comparison == "ge" {
-		if m.TargetsMin != nil {
-			if v, present := m.TargetsMin[backend]; present {
-				return v, "ge", true
-			}
-		}
 		if m.TargetMin > 0 {
 			return m.TargetMin, "ge", true
 		}
 		return 0, "ge", false
-	}
-	if m.Targets != nil {
-		if v, present := m.Targets[backend]; present {
-			return v, "le", true
-		}
 	}
 	if m.Target > 0 {
 		return m.Target, "le", true
@@ -102,7 +91,7 @@ func loadBudgets(path string) (*Budgets, error) {
 	return &b, nil
 }
 
-func recordMetric(metrics []Metric, key string, measured float64, backend string) []Metric {
+func recordMetric(metrics []Metric, key string, measured float64) []Metric {
 	for i := range metrics {
 		if metrics[i].Key != key {
 			continue
@@ -110,7 +99,7 @@ func recordMetric(metrics []Metric, key string, measured float64, backend string
 		v := measured
 		metrics[i].Measured = &v
 		pass := true
-		target, comparison, ok := metrics[i].effectiveTarget(backend)
+		target, comparison, ok := metrics[i].effectiveTarget()
 		if ok {
 			if comparison == "ge" {
 				pass = v >= target
@@ -151,20 +140,19 @@ func spawnNanostack(binPath string, port int, extra ...string) (*exec.Cmd, error
 	return cmd, nil
 }
 
-// backendArgs returns the flags to spawn the requested backend variant.
-// fs: --data-dir under a temp dir. mem: --ephemeral.
+// backendArgs returns the flags to spawn the fs backend with a fresh
+// data dir. Mode is retained for forward compatibility with future
+// backends; today only "fs" is accepted.
 func backendArgs(mode string, tempBase string) ([]string, error) {
 	switch mode {
-	case "mem", "":
-		return []string{"--ephemeral"}, nil
-	case "fs":
+	case "fs", "":
 		dir, err := os.MkdirTemp(tempBase, "ns-bench-fs-")
 		if err != nil {
 			return nil, err
 		}
 		return []string{"--data-dir", dir}, nil
 	default:
-		return nil, fmt.Errorf("unknown --backend %q (mem|fs)", mode)
+		return nil, fmt.Errorf("unknown --backend %q (only fs is supported)", mode)
 	}
 }
 
@@ -191,10 +179,16 @@ func killProcessGroup(cmd *exec.Cmd) {
 
 // measureColdStart spawns nanostack with `--self-test-ready` `samples` times.
 // Returns median wall time in ms (process spawn → clean exit after binding).
-func measureColdStart(binPath string, port int, samples int) (float64, error) {
+// `tempBase` is used to pick a fresh `--data-dir` per probe so we measure
+// the cold path consistently.
+func measureColdStart(binPath string, port int, samples int, tempBase string) (float64, error) {
 	durs := make([]float64, 0, samples)
 	for i := 0; i < samples; i++ {
-		cmd := exec.Command(binPath, "--port", strconv.Itoa(port+i), "--self-test-ready", "--ephemeral")
+		dir, err := os.MkdirTemp(tempBase, "ns-coldstart-")
+		if err != nil {
+			return 0, err
+		}
+		cmd := exec.Command(binPath, "--port", strconv.Itoa(port+i), "--self-test-ready", "--data-dir", dir)
 		cmd.Stdout = nil
 		cmd.Stderr = nil
 		start := time.Now()
@@ -544,25 +538,25 @@ func printTable(b *Budgets) {
 	fmt.Fprintf(os.Stderr, "%-30s %12s %14s %10s %s\n", "metric", "measured", "target", "gate", "result")
 	fmt.Fprintln(os.Stderr, strings.Repeat("-", 92))
 	for _, m := range b.Metrics {
-		printRow(m, b.Backend)
+		printRow(m)
 	}
 	if len(b.Informational) > 0 {
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintln(os.Stderr, "informational (no gate)")
 		fmt.Fprintln(os.Stderr, strings.Repeat("-", 92))
 		for _, m := range b.Informational {
-			printRow(m, b.Backend)
+			printRow(m)
 		}
 	}
 }
 
-func printRow(m Metric, backend string) {
+func printRow(m Metric) {
 	measured := "-"
 	if m.Measured != nil {
 		measured = fmt.Sprintf("%.3f %s", *m.Measured, m.Unit)
 	}
 	target := "-"
-	if t, comp, ok := m.effectiveTarget(backend); ok {
+	if t, comp, ok := m.effectiveTarget(); ok {
 		if comp == "ge" {
 			target = fmt.Sprintf("≥ %.0f %s", t, m.Unit)
 		} else {
@@ -592,7 +586,7 @@ func main() {
 	budgetsPath := flag.String("budgets", "bench/budgets.json", "path to budgets JSON")
 	outPath := flag.String("out", "", "if set, write JSON to this path (default stdout)")
 	port := flag.Int("port", 14990, "base port for the bench")
-	backend := flag.String("backend", "mem", "storage backend (mem|fs)")
+	backend := flag.String("backend", "fs", "storage backend (only fs is supported)")
 	flag.Parse()
 
 	b, err := loadBudgets(*budgetsPath)
@@ -615,15 +609,15 @@ func main() {
 	if size, err := measureBinarySize(*binPath); err != nil {
 		die("binary size: %v", err)
 	} else {
-		b.Metrics = recordMetric(b.Metrics, "binary_size_mb", size, *backend)
+		b.Metrics = recordMetric(b.Metrics, "binary_size_mb", size)
 	}
 
-	// 2. Cold start — `--self-test-ready` binds + exits, no backend state
-	//    involved, so we keep it on `--ephemeral` regardless of mode.
-	if cs, err := measureColdStart(*binPath, *port+10, 5); err != nil {
+	// 2. Cold start — `--self-test-ready` binds + exits. Uses a fresh
+	//    per-probe `--data-dir` so cold-path costs are realistic.
+	if cs, err := measureColdStart(*binPath, *port+10, 5, tempBase); err != nil {
 		die("cold start: %v", err)
 	} else {
-		b.Metrics = recordMetric(b.Metrics, "cold_start_ms", cs, *backend)
+		b.Metrics = recordMetric(b.Metrics, "cold_start_ms", cs)
 	}
 
 	// 3. Spawn a long-lived nanostack for idle-RSS + latency + throughput
@@ -647,43 +641,43 @@ func main() {
 	if rss, err := measureIdleRSS(live.Process.Pid, 3); err != nil {
 		die("idle rss: %v", err)
 	} else {
-		b.Metrics = recordMetric(b.Metrics, "idle_rss_mb", rss, *backend)
+		b.Metrics = recordMetric(b.Metrics, "idle_rss_mb", rss)
 	}
 
 	// 5. Informational bucket-op latency / throughput.
 	hbP50, hbP99 := measureLatency(client, bucket, 10_000)
-	b.Informational = recordMetric(b.Informational, "head_bucket_p50_ms", hbP50, *backend)
-	b.Informational = recordMetric(b.Informational, "head_bucket_p99_ms", hbP99, *backend)
+	b.Informational = recordMetric(b.Informational, "head_bucket_p50_ms", hbP50)
+	b.Informational = recordMetric(b.Informational, "head_bucket_p99_ms", hbP99)
 
 	_, lbP99 := measureListBucketsLatency(client, 1000)
-	b.Informational = recordMetric(b.Informational, "list_buckets_p99_ms", lbP99, *backend)
+	b.Informational = recordMetric(b.Informational, "list_buckets_p99_ms", lbP99)
 
 	rps := measureHeadBucketThroughput(client, bucket, 4, 5*time.Second)
-	b.Informational = recordMetric(b.Informational, "head_bucket_throughput_rps", rps, *backend)
+	b.Informational = recordMetric(b.Informational, "head_bucket_throughput_rps", rps)
 
 	// 5b. Object-op latency + throughput against a 1 KiB payload (PRD §12
 	//     uses this size for the budget).
 	body := bytes.Repeat([]byte{'x'}, 1024)
 	poP50, poP99 := measurePutObjectLatency(client, bucket, body, 10_000)
-	b.Metrics = recordMetric(b.Metrics, "put_object_p50_ms", poP50, *backend)
-	b.Metrics = recordMetric(b.Metrics, "put_object_p99_ms", poP99, *backend)
+	b.Metrics = recordMetric(b.Metrics, "put_object_p50_ms", poP50)
+	b.Metrics = recordMetric(b.Metrics, "put_object_p99_ms", poP99)
 
 	goP99 := measureGetObjectLatency(client, bucket, body, 10_000)
-	b.Metrics = recordMetric(b.Metrics, "get_object_p99_ms", goP99, *backend)
+	b.Metrics = recordMetric(b.Metrics, "get_object_p99_ms", goP99)
 
 	// PRD §12 calibrates against `wrk`/`bombardier` levels of concurrency,
 	// not the four-worker pattern we use for HeadBucket. We push to 32
 	// goroutines so the throughput number reflects "what an open-loop
 	// load tester sees", which is what the budget is measuring.
 	poRps := measurePutObjectThroughput(client, bucket, body, 32, 5*time.Second)
-	b.Metrics = recordMetric(b.Metrics, "put_object_throughput_rps", poRps, *backend)
+	b.Metrics = recordMetric(b.Metrics, "put_object_throughput_rps", poRps)
 
 	// 5c. Multipart upload — 5 parts × 5 MiB each uploaded concurrently,
 	//     then CompleteMultipartUpload. PRD M6 exit criterion. 20 iterations
 	//     gives a stable enough p99 to gate on.
 	mpP50, mpP99 := measureMultipartConcurrent(client, bucket, 5, 5*1024*1024, 20)
-	b.Informational = recordMetric(b.Informational, "multipart_5x5mib_p50_ms", mpP50, *backend)
-	b.Metrics = recordMetric(b.Metrics, "multipart_5x5mib_p99_ms", mpP99, *backend)
+	b.Informational = recordMetric(b.Informational, "multipart_5x5mib_p50_ms", mpP50)
+	b.Metrics = recordMetric(b.Metrics, "multipart_5x5mib_p99_ms", mpP99)
 
 	// 6. Wipe-restart — kill the live process, respawn 5x on the same
 	//    port + backend. fs has to scan the directory tree to rebuild
@@ -693,7 +687,7 @@ func main() {
 	if wr, finalCmd, err := measureWipeRestart(*binPath, *port, 5, extraArgs); err != nil {
 		die("wipe-restart: %v", err)
 	} else {
-		b.Metrics = recordMetric(b.Metrics, "wipe_restart_ms", wr, *backend)
+		b.Metrics = recordMetric(b.Metrics, "wipe_restart_ms", wr)
 		killProcessGroup(finalCmd)
 	}
 

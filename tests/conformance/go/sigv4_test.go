@@ -174,7 +174,8 @@ func TestNoAuthFlagAcceptsAnonymous(t *testing.T) {
 		t.Skip("NANOSTACK_BIN not set; skipping --no-auth subprocess test")
 	}
 	port := "14999"
-	cmd := exec.Command(binPath, "--port", port, "--ephemeral", "--no-auth")
+	dataDir := t.TempDir()
+	cmd := exec.Command(binPath, "--port", port, "--data-dir", dataDir, "--no-auth")
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {

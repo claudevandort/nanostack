@@ -263,11 +263,10 @@ pub fn run(
 
     _ = try server.router(.{});
 
-    std.log.info("nanostack listening on http://{s}:{d}  profile={s}  ephemeral={}  auth={s}", .{
+    std.log.info("nanostack listening on http://{s}:{d}  profile={s}  auth={s}", .{
         config.bind,
         config.port,
         config.profile,
-        config.ephemeral,
         if (config.no_auth) "OFF (--no-auth)" else "SigV4",
     });
     if (config.no_auth) {

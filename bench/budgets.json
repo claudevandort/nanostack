@@ -3,10 +3,8 @@
   "source": "docs/PRD.md §12 (v1 performance targets)",
   "notes": [
     "`gate=true` means CI fails if the measured value exceeds the matching target.",
-    "Targets can be a single `target` (both backends) or a per-backend `targets` map.",
-    "Per-backend split is used where the physics genuinely differ: fs has fsync on every write, mem doesn't.",
-    "Comparison defaults to `le` (lower is better). `comparison=ge` flips to lower-bound.",
-    "Active gates land in M3 along with the object operations they cover."
+    "Each metric has a single `target` (or `target_min` when `comparison=ge`). Per-backend maps were dropped when the in-memory backend was removed.",
+    "Comparison defaults to `le` (lower is better). `comparison=ge` flips to lower-bound."
   ],
   "metrics": [
     {
@@ -37,17 +35,17 @@
       "key": "wipe_restart_ms",
       "label": "Wipe-restart (kill nanostack, then back up)",
       "unit": "ms",
-      "targets": { "mem": 100, "fs": 500 },
+      "target": 500,
       "gate": true,
-      "how": "kill running instance, respawn with same args, time to first TCP accept; median of 5. fs is slower because init walks objects/* to rebuild the key index."
+      "how": "kill running instance, respawn with same args, time to first TCP accept; median of 5. fs has to walk objects/* to rebuild the key index on each spawn."
     },
     {
       "key": "put_object_p50_ms",
       "label": "Warm p50 PutObject (1 KB body)",
       "unit": "ms",
-      "targets": { "mem": 1, "fs": 3 },
+      "target": 3,
       "gate": true,
-      "how": "10k sequential PutObject ops via aws-sdk-go-v2. fs target reflects the cost of two atomic writes (data + meta.json) with fsync."
+      "how": "10k sequential PutObject ops via aws-sdk-go-v2. Target reflects the cost of two atomic writes (data + meta.json) with fsync."
     },
     {
       "key": "put_object_p99_ms",
@@ -69,7 +67,7 @@
       "key": "put_object_throughput_rps",
       "label": "Concurrent PutObject 1 KB throughput",
       "unit": "req/s",
-      "targets_min": { "mem": 5000, "fs": 500 },
+      "target_min": 500,
       "comparison": "ge",
       "gate": true,
       "how": "32 concurrent goroutines over 5 s via aws-sdk-go-v2; unique keys per worker. PRD's original 50k req/s target assumed wrk/bombardier against raw HTTP (no per-request SigV4); SDK-driven measurement reflects what users actually see."
@@ -78,9 +76,9 @@
       "key": "multipart_5x5mib_p99_ms",
       "label": "Multipart upload p99 (5 parts × 5 MiB, concurrent)",
       "unit": "ms",
-      "targets": { "mem": 250, "fs": 500 },
+      "target": 500,
       "gate": true,
-      "how": "20 iterations of {InitiateMPU → 5 concurrent UploadParts of 5 MiB each → CompleteMPU}, p99 of total wall time per iteration. Budgets are ~2× the locally-measured baseline rounded to a clean number; CI runners typically have slower disks than dev machines so fs gets the wider margin."
+      "how": "20 iterations of {InitiateMPU → 5 concurrent UploadParts of 5 MiB each → CompleteMPU}, p99 of total wall time per iteration. Target is ~3× the locally-measured baseline; CI runners typically have slower disks than dev machines."
     }
   ],
   "informational_metrics": [

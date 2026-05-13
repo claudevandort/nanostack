@@ -19,7 +19,7 @@ pub const canonical = @import("auth/canonical.zig");
 pub const storage = @import("storage/mod.zig");
 pub const storage_util = @import("storage/util.zig");
 pub const fs_backend = @import("storage/fs.zig");
-pub const mem_backend = @import("storage/mem.zig");
+pub const storage_etag = @import("storage/etag.zig");
 pub const s3 = @import("services/s3/mod.zig");
 pub const preconditions = @import("services/s3/preconditions.zig");
 pub const multipart_service = @import("services/s3/multipart.zig");
@@ -44,7 +44,7 @@ test {
     _ = storage;
     _ = storage_util;
     _ = fs_backend;
-    _ = mem_backend;
+    _ = storage_etag;
     _ = s3;
     _ = preconditions;
     _ = multipart_service;

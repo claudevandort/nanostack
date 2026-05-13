@@ -1,8 +1,9 @@
 //! Storage backend interface.
 //!
-//! M1 landed bucket ops; M3 adds object ops. Two implementations satisfy
-//! this vtable: `fs.zig` (default, filesystem-backed per PRD §9) and
-//! `mem.zig` (`--ephemeral`). The S3 service layer never knows which.
+//! `fs.zig` is the only implementation; the vtable is retained because
+//! it's a sound abstraction boundary for the future. Persistence is
+//! controlled by `--data-dir`; pass a temporary directory for a
+//! wipe-clean run.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

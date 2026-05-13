@@ -49,91 +49,47 @@ jobs:
         working-directory: tests/conformance/js
         run: npm ci
 
-      # ----- Filesystem backend -----
-      - name: Start nanostack (fs backend)
+      - name: Start nanostack
         env:
           NANOSTACK_PORT: '14566'
         run: |
           rm -rf "$RUNNER_TEMP/ns-fs"
-          ./zig-out/bin/nanostack --port "$NANOSTACK_PORT" --data-dir "$RUNNER_TEMP/ns-fs" > nanostack-fs.log 2>&1 &
+          ./zig-out/bin/nanostack --port "$NANOSTACK_PORT" --data-dir "$RUNNER_TEMP/ns-fs" > nanostack.log 2>&1 &
           echo $! > nanostack.pid
           for i in $(seq 1 50); do
             if curl -s -o /dev/null "http://127.0.0.1:${NANOSTACK_PORT}/"; then
-              echo "nanostack (fs) ready"
+              echo "nanostack ready"
               exit 0
             fi
             sleep 0.1
           done
-          echo "nanostack (fs) failed to start" >&2
-          cat nanostack-fs.log >&2
+          echo "nanostack failed to start" >&2
+          cat nanostack.log >&2
           exit 1
 
-      - name: Go conformance (fs)
+      - name: Go conformance
         working-directory: tests/conformance/go
         env:
           NANOSTACK_ENDPOINT: 'http://127.0.0.1:14566'
           NANOSTACK_BIN: ${{ github.workspace }}/zig-out/bin/nanostack
         run: go test -v -count=1 ./...
 
-      - name: JS conformance (fs)
+      - name: JS conformance
         working-directory: tests/conformance/js
         env:
           NANOSTACK_ENDPOINT: 'http://127.0.0.1:14566'
         run: npm test
 
-      - name: Stop nanostack (fs backend)
+      - name: Stop nanostack
         if: always()
         run: |
           if [ -f nanostack.pid ]; then
             kill "$(cat nanostack.pid)" 2>/dev/null || true
             rm -f nanostack.pid
           fi
-          if [ -f nanostack-fs.log ]; then
-            echo "::group::nanostack-fs.log"
-            cat nanostack-fs.log
-            echo "::endgroup::"
-          fi
-
-      # ----- Ephemeral (in-memory) backend -----
-      - name: Start nanostack (mem backend)
-        env:
-          NANOSTACK_PORT: '14566'
-        run: |
-          ./zig-out/bin/nanostack --port "$NANOSTACK_PORT" --ephemeral > nanostack-mem.log 2>&1 &
-          echo $! > nanostack.pid
-          for i in $(seq 1 50); do
-            if curl -s -o /dev/null "http://127.0.0.1:${NANOSTACK_PORT}/"; then
-              echo "nanostack (mem) ready"
-              exit 0
-            fi
-            sleep 0.1
-          done
-          echo "nanostack (mem) failed to start" >&2
-          cat nanostack-mem.log >&2
-          exit 1
-
-      - name: Go conformance (mem)
-        working-directory: tests/conformance/go
-        env:
-          NANOSTACK_ENDPOINT: 'http://127.0.0.1:14566'
-          NANOSTACK_BIN: ${{ github.workspace }}/zig-out/bin/nanostack
-        run: go test -v -count=1 ./...
-
-      - name: JS conformance (mem)
-        working-directory: tests/conformance/js
-        env:
-          NANOSTACK_ENDPOINT: 'http://127.0.0.1:14566'
-        run: npm test
-
-      - name: Stop nanostack (mem backend)
-        if: always()
-        run: |
-          if [ -f nanostack.pid ]; then
-            kill "$(cat nanostack.pid)" 2>/dev/null || true
-          fi
-          if [ -f nanostack-mem.log ]; then
-            echo "::group::nanostack-mem.log"
-            cat nanostack-mem.log
+          if [ -f nanostack.log ]; then
+            echo "::group::nanostack.log"
+            cat nanostack.log
             echo "::endgroup::"
           fi
 
@@ -155,28 +111,20 @@ jobs:
           go-version: '1.24'
           cache-dependency-path: bench/driver/go.sum
 
-      - name: Run perf gate (mem backend)
-        run: zig build bench -- --backend mem --out "$GITHUB_WORKSPACE/bench-result-mem.json"
-
-      - name: Run perf gate (fs backend)
-        run: zig build bench -- --backend fs --out "$GITHUB_WORKSPACE/bench-result-fs.json"
+      - name: Run perf gate
+        run: zig build bench -- --backend fs --out "$GITHUB_WORKSPACE/bench-result.json"
 
       - name: Post bench summary
         if: always()
         run: |
           {
             echo "## Perf gate result"
-            for backend in mem fs; do
-              path="$GITHUB_WORKSPACE/bench-result-$backend.json"
-              if [ -f "$path" ]; then
-                echo ""
-                echo "### Backend: $backend"
-                echo ""
-                echo '```json'
-                cat "$path"
-                echo '```'
-              fi
-            done
+            if [ -f "$GITHUB_WORKSPACE/bench-result.json" ]; then
+              echo ""
+              echo '```json'
+              cat "$GITHUB_WORKSPACE/bench-result.json"
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload bench JSON
@@ -184,5 +132,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bench-result
-          path: bench-result-*.json
+          path: bench-result.json
           if-no-files-found: warn
