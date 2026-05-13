@@ -1,6 +1,6 @@
 # nanostack Operation Support Matrix
 
-**Version:** v0.0.2-dev (M8 in progress — bucket versioning)
+**Version:** v0.0.2-dev (M9 in progress — S3 tagging)
 
 **How to read this matrix:** each row is one S3 operation or cross-cutting capability. Status is one of:
 
@@ -39,6 +39,12 @@ The "Milestone" column points at the release tag in which the capability landed.
 | PutBucketVersioning | supported (Enabled, Suspended) | M8 |
 | GetBucketVersioning | supported | M8 |
 | ListObjectVersions | supported (prefix, delimiter, key-marker, version-id-marker, max-keys, encoding-type=url) | M8 |
+| PutBucketTagging | supported (replaces existing tag set; max 10 tags) | M9 |
+| GetBucketTagging | supported (404 NoSuchTagSet on untagged bucket, AWS-exact) | M9 |
+| DeleteBucketTagging | supported (204; idempotent) | M9 |
+| PutObjectTagging | supported (per-version with `?versionId=X`) | M9 |
+| GetObjectTagging | supported (200 + empty TagSet on untagged object, AWS-exact) | M9 |
+| DeleteObjectTagging | supported (204; idempotent) | M9 |
 
 ### v1 cross-cutting
 
@@ -55,7 +61,7 @@ The "Milestone" column points at the release tag in which the capability landed.
 | ETag (MD5 of body, double-quoted) | supported (non-multipart) | M3 |
 | ETag — multipart objects (`<md5-of-concatenated-part-md5s>-<part-count>`) | supported | M6 |
 | Multipart: `x-amz-copy-source-range` on UploadPartCopy | not supported (deferred to post-v1) | post-v1 |
-| Multipart: `x-amz-tagging`/`x-amz-tagging-directive` on CreateMultipartUpload | accepted and ignored | post-v1 |
+| Multipart: `x-amz-tagging` on CreateMultipartUpload (applied to merged object on Complete) | supported | M9 |
 | Multipart: SSE headers on CreateMultipartUpload | accepted and ignored | post-v1 |
 | Multipart: lifecycle-based incomplete-upload cleanup | not supported (manual AbortMultipartUpload required) | post-v1 |
 | Object listing — `encoding-type=url` (URL-encode keys + prefixes in response) | supported | M4 |
@@ -85,6 +91,22 @@ The "Milestone" column points at the release tag in which the capability landed.
 | MFA Delete (`x-amz-mfa` header) | accepted-and-ignored (documented divergence) | post-v1.1 |
 | Object Lock (governance/compliance retention) | not supported | post-v1.1 |
 
+### Tagging-related (M9)
+
+| Capability | Status | Milestone |
+|---|---|---|
+| Inline `x-amz-tagging` header on PutObject (URL-encoded `k=v&k=v`) | supported | M9 |
+| Inline `x-amz-tagging` header on CreateMultipartUpload (applied on Complete) | supported | M9 |
+| `x-amz-tagging-directive: COPY \| REPLACE` on CopyObject | supported | M9 |
+| `x-amz-tagging-count: N` response header on GetObject / HeadObject | supported | M9 |
+| Per-version object tag sets (PutObjectTagging?versionId=X) | supported | M9 |
+| AWS-strict validation: max 10 tags, key 1–128 chars, value 0–256 chars, alphabet `[a-zA-Z0-9 +\-=._:/@]`, no duplicate keys, no `aws:` prefix → 400 `InvalidTag` | supported | M9 |
+| `NoSuchTagSet` (404) on GetBucketTagging when bucket has no tags | supported | M9 |
+| Empty `<TagSet/>` (200) on GetObjectTagging when object has no tags | supported | M9 |
+| PutBucketTagging replaces (not merges) existing tag set | supported (matches AWS) | M9 |
+| Tag-based IAM/policy condition keys | not supported (M10 accept-store-roundtrip only) | M10 |
+| Tag-based lifecycle rules | not supported | post-v1.1 |
+
 ### Deferred (post-v1)
 
 - Versioning, object lock, replication.
@@ -94,4 +116,3 @@ The "Milestone" column points at the release tag in which the capability landed.
 - Event notifications (S3 → SNS/SQS/Lambda). Requires those services to land first.
 - Select, inventory, analytics.
 - Server-side encryption (SSE-S3, SSE-KMS, SSE-C). Headers accepted, not enforced.
-- Object tagging (accepted and ignored in v1; full support in v1.1).

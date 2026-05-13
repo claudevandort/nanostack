@@ -13,11 +13,13 @@ const s3_responses = @import("../../wire/s3_responses.zig");
 const object_responses = @import("../../wire/object_responses.zig");
 const delete_parser = @import("../../wire/delete_objects_parser.zig");
 const list_objects_wire = @import("../../wire/list_objects.zig");
+const tagging_parser = @import("../../wire/tagging_parser.zig");
 const http_range = @import("../../http/range.zig");
 const fs_backend = @import("../../storage/fs.zig");
 const preconditions = @import("preconditions.zig");
 const multipart = @import("multipart.zig");
 const versioning = @import("versioning.zig");
+const tagging = @import("tagging.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -147,6 +149,33 @@ pub fn handle(ctx: Context, parsed: router.Parsed) Result {
             ctx,
             parsed.bucket orelse return .{ .err = .invalid_request },
         ),
+        .put_bucket_tagging => tagging.putBucketTagging(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .get_bucket_tagging => tagging.getBucketTagging(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .delete_bucket_tagging => tagging.deleteBucketTagging(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .put_object_tagging => tagging.putObjectTagging(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .get_object_tagging => tagging.getObjectTagging(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .delete_object_tagging => tagging.deleteObjectTagging(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
         .unknown => .{ .err = .not_implemented },
     };
 }
@@ -206,11 +235,13 @@ pub fn mapStorageErr(e: storage.Error) errors.Code {
         storage.Error.NoSuchBucket => .no_such_bucket,
         storage.Error.NoSuchKey => .no_such_key,
         storage.Error.NoSuchUpload => .no_such_upload,
+        storage.Error.NoSuchTagSet => .no_such_tag_set,
         storage.Error.BucketAlreadyExists => .bucket_already_exists,
         storage.Error.BucketAlreadyOwnedByYou => .bucket_already_owned_by_you,
         storage.Error.BucketNotEmpty => .bucket_not_empty,
         storage.Error.InvalidBucketName => .invalid_bucket_name,
         storage.Error.InvalidObjectKey => .invalid_argument,
+        storage.Error.InvalidTag => .invalid_tag,
         storage.Error.Io, storage.Error.OutOfMemory => .internal_error,
     };
 }
@@ -300,12 +331,23 @@ fn putObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
         }
     }
 
+    // M9 inline tagging via `x-amz-tagging` header.
+    const inline_tags: []storage.Tag = if (findHeader(ctx.request.headers, "x-amz-tagging")) |hv|
+        tagging_parser.parseHeader(ctx.allocator, hv) catch |err| switch (err) {
+            tagging_parser.ParseError.InvalidTag => return .{ .err = .invalid_tag },
+            tagging_parser.ParseError.OutOfMemory => return .{ .err = .internal_error },
+            tagging_parser.ParseError.InvalidBody => return .{ .err = .invalid_request },
+        }
+    else
+        &.{};
+
     const out = ctx.backend.putObject(.{
         .bucket = bucket,
         .key = key,
         .body = ctx.request.body,
         .content_type = content_type,
         .user_metadata = meta_list.items,
+        .tags = inline_tags,
     }) catch |err| return .{ .err = mapStorageErr(err) };
 
     var hs: std.ArrayList(Header) = .empty;
@@ -377,6 +419,28 @@ fn copyObject(ctx: Context, dest_bucket: []const u8, dest_key: []const u8) Resul
         dest_metadata = meta_list.toOwnedSlice(ctx.allocator) catch return .{ .err = .internal_error };
     }
 
+    // ---------- Tagging directive ----------
+    // x-amz-tagging-directive: COPY (default) | REPLACE. COPY: carry source
+    // tags. REPLACE: take tags from request `x-amz-tagging` header (or empty).
+    const tagging_directive_raw = findHeader(ctx.request.headers, "x-amz-tagging-directive") orelse "COPY";
+    const tagging_replace: bool = if (std.mem.eql(u8, tagging_directive_raw, "COPY"))
+        false
+    else if (std.mem.eql(u8, tagging_directive_raw, "REPLACE"))
+        true
+    else
+        return .{ .err = .invalid_argument };
+
+    const dest_tags: []const storage.Tag = if (tagging_replace) blk: {
+        if (findHeader(ctx.request.headers, "x-amz-tagging")) |hv| {
+            break :blk tagging_parser.parseHeader(ctx.allocator, hv) catch |err| switch (err) {
+                tagging_parser.ParseError.InvalidTag => return .{ .err = .invalid_tag },
+                tagging_parser.ParseError.OutOfMemory => return .{ .err = .internal_error },
+                tagging_parser.ParseError.InvalidBody => return .{ .err = .invalid_request },
+            };
+        }
+        break :blk &.{};
+    } else source_obj.meta.tags;
+
     // ---------- Write destination ----------
     const put_out = ctx.backend.putObject(.{
         .bucket = dest_bucket,
@@ -384,6 +448,7 @@ fn copyObject(ctx: Context, dest_bucket: []const u8, dest_key: []const u8) Resul
         .body = source_obj.body,
         .content_type = dest_content_type,
         .user_metadata = dest_metadata,
+        .tags = dest_tags,
     }) catch |err| return .{ .err = mapStorageErr(err) };
 
     // ---------- Render response ----------
@@ -608,23 +673,35 @@ fn buildHeadHeaders(ctx: Context, meta: storage.Object) ![]Header {
 
 fn buildObjectHeadersWithVersion(ctx: Context, meta: storage.Object, range_header: ?[]const u8) ![]Header {
     const base = try buildObjectHeaders(ctx, meta, range_header);
-    if (meta.version_id.len == 0) return base;
+    if (meta.version_id.len == 0 and meta.tags.len == 0) return base;
     var hs: std.ArrayList(Header) = .empty;
     errdefer hs.deinit(ctx.allocator);
     try hs.appendSlice(ctx.allocator, base);
     ctx.allocator.free(base);
-    try hs.append(ctx.allocator, .{ .name = "x-amz-version-id", .value = meta.version_id });
+    if (meta.version_id.len > 0) {
+        try hs.append(ctx.allocator, .{ .name = "x-amz-version-id", .value = meta.version_id });
+    }
+    if (meta.tags.len > 0) {
+        const count_str = try std.fmt.allocPrint(ctx.allocator, "{d}", .{meta.tags.len});
+        try hs.append(ctx.allocator, .{ .name = "x-amz-tagging-count", .value = count_str });
+    }
     return hs.toOwnedSlice(ctx.allocator);
 }
 
 fn buildHeadHeadersWithVersion(ctx: Context, meta: storage.Object) ![]Header {
     const base = try buildHeadHeaders(ctx, meta);
-    if (meta.version_id.len == 0) return base;
+    if (meta.version_id.len == 0 and meta.tags.len == 0) return base;
     var hs: std.ArrayList(Header) = .empty;
     errdefer hs.deinit(ctx.allocator);
     try hs.appendSlice(ctx.allocator, base);
     ctx.allocator.free(base);
-    try hs.append(ctx.allocator, .{ .name = "x-amz-version-id", .value = meta.version_id });
+    if (meta.version_id.len > 0) {
+        try hs.append(ctx.allocator, .{ .name = "x-amz-version-id", .value = meta.version_id });
+    }
+    if (meta.tags.len > 0) {
+        const count_str = try std.fmt.allocPrint(ctx.allocator, "{d}", .{meta.tags.len});
+        try hs.append(ctx.allocator, .{ .name = "x-amz-tagging-count", .value = count_str });
+    }
     return hs.toOwnedSlice(ctx.allocator);
 }
 

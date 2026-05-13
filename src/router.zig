@@ -27,6 +27,12 @@ pub const Operation = enum {
     put_bucket_versioning,
     get_bucket_versioning,
     list_object_versions,
+    put_bucket_tagging,
+    get_bucket_tagging,
+    delete_bucket_tagging,
+    put_object_tagging,
+    get_object_tagging,
+    delete_object_tagging,
     unknown,
 };
 
@@ -84,6 +90,11 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
             if (eql(method, "DELETE")) return .abort_multipart_upload;
             if (eql(method, "GET")) return .list_parts;
         }
+        if (hasQueryParam(query, "tagging")) {
+            if (eql(method, "PUT")) return .put_object_tagging;
+            if (eql(method, "GET")) return .get_object_tagging;
+            if (eql(method, "DELETE")) return .delete_object_tagging;
+        }
         if (eql(method, "PUT")) return .put_object;
         if (eql(method, "GET")) return .get_object;
         if (eql(method, "HEAD")) return .head_object;
@@ -97,15 +108,20 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
     if (eql(method, "GET") and has_bucket) {
         if (hasQueryParam(query, "versioning")) return .get_bucket_versioning;
         if (hasQueryParam(query, "versions")) return .list_object_versions;
+        if (hasQueryParam(query, "tagging")) return .get_bucket_tagging;
         if (hasQueryParam(query, "uploads")) return .list_multipart_uploads;
         if (queryParamEquals(query, "list-type", "2")) return .list_objects_v2;
         return .list_objects;
     }
     if (eql(method, "PUT") and has_bucket) {
         if (hasQueryParam(query, "versioning")) return .put_bucket_versioning;
+        if (hasQueryParam(query, "tagging")) return .put_bucket_tagging;
         return .create_bucket;
     }
-    if (eql(method, "DELETE") and has_bucket) return .delete_bucket;
+    if (eql(method, "DELETE") and has_bucket) {
+        if (hasQueryParam(query, "tagging")) return .delete_bucket_tagging;
+        return .delete_bucket;
+    }
     if (eql(method, "HEAD") and has_bucket) return .head_bucket;
 
     return .unknown;
@@ -312,4 +328,39 @@ test "versioning: GET /b?versions → list_object_versions" {
 test "multipart: GET /b?uploads → list_multipart_uploads" {
     const p = parse("GET", "localhost", "/buk", "uploads");
     try testing.expectEqual(Operation.list_multipart_uploads, p.op);
+}
+
+test "tagging: PUT /b?tagging → put_bucket_tagging" {
+    const p = parse("PUT", "localhost", "/buk", "tagging");
+    try testing.expectEqual(Operation.put_bucket_tagging, p.op);
+}
+
+test "tagging: GET /b?tagging → get_bucket_tagging" {
+    const p = parse("GET", "localhost", "/buk", "tagging");
+    try testing.expectEqual(Operation.get_bucket_tagging, p.op);
+}
+
+test "tagging: DELETE /b?tagging → delete_bucket_tagging" {
+    const p = parse("DELETE", "localhost", "/buk", "tagging");
+    try testing.expectEqual(Operation.delete_bucket_tagging, p.op);
+}
+
+test "tagging: PUT /b/k?tagging → put_object_tagging" {
+    const p = parse("PUT", "localhost", "/buk/k", "tagging");
+    try testing.expectEqual(Operation.put_object_tagging, p.op);
+}
+
+test "tagging: GET /b/k?tagging → get_object_tagging" {
+    const p = parse("GET", "localhost", "/buk/k", "tagging");
+    try testing.expectEqual(Operation.get_object_tagging, p.op);
+}
+
+test "tagging: DELETE /b/k?tagging → delete_object_tagging" {
+    const p = parse("DELETE", "localhost", "/buk/k", "tagging");
+    try testing.expectEqual(Operation.delete_object_tagging, p.op);
+}
+
+test "tagging: PUT /b/k?tagging&versionId=X → put_object_tagging (versionId is a sub-resource handled in service layer)" {
+    const p = parse("PUT", "localhost", "/buk/k", "tagging&versionId=abc");
+    try testing.expectEqual(Operation.put_object_tagging, p.op);
 }

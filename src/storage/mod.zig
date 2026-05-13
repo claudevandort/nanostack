@@ -12,11 +12,13 @@ pub const Error = error{
     NoSuchBucket,
     NoSuchKey,
     NoSuchUpload,
+    NoSuchTagSet,
     BucketAlreadyExists,
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
     InvalidBucketName,
     InvalidObjectKey,
+    InvalidTag,
     Io,
     OutOfMemory,
 };
@@ -25,6 +27,53 @@ pub const Header = struct {
     name: []const u8,
     value: []const u8,
 };
+
+/// One tag (M9). Key + value owned by the caller's allocator (or
+/// borrowed; the call site documents which).
+pub const Tag = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+const max_tags = 10;
+const max_tag_key_len = 128;
+const max_tag_value_len = 256;
+
+/// Validate a TagSet per the AWS S3 rules:
+///   - at most 10 tags
+///   - key length 1..=128, value length 0..=256
+///   - keys + values use the AWS character set: letters, digits, space,
+///     and `+`, `-`, `=`, `.`, `_`, `:`, `/`, `@`
+///   - no duplicate keys
+///   - no `aws:` prefix on keys (case-insensitive)
+pub fn validateTagSet(tags: []const Tag) Error!void {
+    if (tags.len > max_tags) return Error.InvalidTag;
+    for (tags, 0..) |t, i| {
+        if (t.key.len == 0 or t.key.len > max_tag_key_len) return Error.InvalidTag;
+        if (t.value.len > max_tag_value_len) return Error.InvalidTag;
+        if (!validTagChars(t.key)) return Error.InvalidTag;
+        if (!validTagChars(t.value)) return Error.InvalidTag;
+        if (hasAwsPrefix(t.key)) return Error.InvalidTag;
+        // Duplicate key check — quadratic but n ≤ 10.
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            if (std.mem.eql(u8, tags[j].key, t.key)) return Error.InvalidTag;
+        }
+    }
+}
+
+fn validTagChars(s: []const u8) bool {
+    for (s) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', ' ', '+', '-', '=', '.', '_', ':', '/', '@' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn hasAwsPrefix(s: []const u8) bool {
+    if (s.len < 4) return false;
+    return std.ascii.eqlIgnoreCase(s[0..4], "aws:");
+}
 
 /// One bucket's persisted metadata. Strings borrow from the backend's
 /// allocator; consumers must not retain past the backend lifetime unless
@@ -63,6 +112,8 @@ pub const Object = struct {
     /// content_type). Backends carry this through so the service layer can
     /// surface `x-amz-delete-marker: true` headers.
     is_delete_marker: bool = false,
+    /// M9. Per-object (per-version on versioned buckets) tag set.
+    tags: []const Tag = &.{},
 };
 
 pub const PutObjectInput = struct {
@@ -71,6 +122,8 @@ pub const PutObjectInput = struct {
     body: []const u8,
     content_type: []const u8,
     user_metadata: []const Header = &.{},
+    /// M9. Inline tagging from the `x-amz-tagging` header.
+    tags: []const Tag = &.{},
 };
 
 pub const PutObjectOutput = struct {
@@ -166,6 +219,8 @@ pub const InitiateMultipartUploadInput = struct {
     key: []const u8,
     content_type: []const u8,
     user_metadata: []const Header = &.{},
+    /// M9. Tags applied to the final merged object on CompleteMultipartUpload.
+    tags: []const Tag = &.{},
 };
 
 pub const InitiateMultipartUploadOutput = struct {
@@ -328,6 +383,14 @@ pub const Backend = struct {
         getBucketVersioning: *const fn (ctx: *anyopaque, bucket: []const u8) Error!VersioningStatus,
         putBucketVersioning: *const fn (ctx: *anyopaque, bucket: []const u8, status: VersioningStatus) Error!void,
         listObjectVersions: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListObjectVersionsInput) Error!ListObjectVersionsOutput,
+        // Tagging (M9). Object-tagging entries take optional version_id
+        // (null = current version).
+        putBucketTagging: *const fn (ctx: *anyopaque, bucket: []const u8, tags: []const Tag) Error!void,
+        getBucketTagging: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8) Error![]Tag,
+        deleteBucketTagging: *const fn (ctx: *anyopaque, bucket: []const u8) Error!void,
+        putObjectTagging: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, tags: []const Tag) Error!void,
+        getObjectTagging: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error![]Tag,
+        deleteObjectTagging: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!void,
     };
 
     // Pass-through helpers so call sites don't dereference the vtable.
@@ -394,6 +457,25 @@ pub const Backend = struct {
     pub fn listObjectVersions(self: Backend, allocator: Allocator, in: ListObjectVersionsInput) Error!ListObjectVersionsOutput {
         return self.vtable.listObjectVersions(self.ctx, allocator, in);
     }
+
+    pub fn putBucketTagging(self: Backend, bucket: []const u8, tags: []const Tag) Error!void {
+        return self.vtable.putBucketTagging(self.ctx, bucket, tags);
+    }
+    pub fn getBucketTagging(self: Backend, allocator: Allocator, bucket: []const u8) Error![]Tag {
+        return self.vtable.getBucketTagging(self.ctx, allocator, bucket);
+    }
+    pub fn deleteBucketTagging(self: Backend, bucket: []const u8) Error!void {
+        return self.vtable.deleteBucketTagging(self.ctx, bucket);
+    }
+    pub fn putObjectTagging(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8, tags: []const Tag) Error!void {
+        return self.vtable.putObjectTagging(self.ctx, bucket, key, version_id, tags);
+    }
+    pub fn getObjectTagging(self: Backend, allocator: Allocator, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error![]Tag {
+        return self.vtable.getObjectTagging(self.ctx, allocator, bucket, key, version_id);
+    }
+    pub fn deleteObjectTagging(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!void {
+        return self.vtable.deleteObjectTagging(self.ctx, bucket, key, version_id);
+    }
 };
 
 /// Validate an S3 object key. AWS permits virtually any UTF-8; the only
@@ -416,4 +498,69 @@ test "validateObjectKey: too long" {
 test "validateObjectKey: typical" {
     try validateObjectKey("foo/bar.txt");
     try validateObjectKey("emoji-🚀.bin");
+}
+
+test "validateTagSet: empty + typical" {
+    try validateTagSet(&.{});
+    try validateTagSet(&.{
+        .{ .key = "env", .value = "prod" },
+        .{ .key = "team", .value = "alpha" },
+    });
+}
+
+test "validateTagSet: too many tags" {
+    const testing = std.testing;
+    var many: [11]Tag = undefined;
+    var buf: [11][8]u8 = undefined;
+    for (0..11) |i| {
+        buf[i] = [_]u8{ 'k', '0' + @as(u8, @intCast(i)), 0, 0, 0, 0, 0, 0 };
+        many[i] = .{ .key = buf[i][0..2], .value = "v" };
+    }
+    try testing.expectError(Error.InvalidTag, validateTagSet(&many));
+}
+
+test "validateTagSet: duplicate key" {
+    const testing = std.testing;
+    try testing.expectError(Error.InvalidTag, validateTagSet(&.{
+        .{ .key = "env", .value = "prod" },
+        .{ .key = "env", .value = "stage" },
+    }));
+}
+
+test "validateTagSet: aws: prefix is reserved" {
+    const testing = std.testing;
+    try testing.expectError(Error.InvalidTag, validateTagSet(&.{
+        .{ .key = "aws:internal", .value = "x" },
+    }));
+    try testing.expectError(Error.InvalidTag, validateTagSet(&.{
+        .{ .key = "AWS:Internal", .value = "x" },
+    }));
+}
+
+test "validateTagSet: key length bounds" {
+    const testing = std.testing;
+    try testing.expectError(Error.InvalidTag, validateTagSet(&.{
+        .{ .key = "", .value = "v" },
+    }));
+    const long_key = "x" ** 129;
+    try testing.expectError(Error.InvalidTag, validateTagSet(&.{
+        .{ .key = long_key, .value = "v" },
+    }));
+}
+
+test "validateTagSet: value length bound" {
+    const testing = std.testing;
+    const long_value = "x" ** 257;
+    try testing.expectError(Error.InvalidTag, validateTagSet(&.{
+        .{ .key = "k", .value = long_value },
+    }));
+    // Empty value is OK.
+    try validateTagSet(&.{.{ .key = "k", .value = "" }});
+}
+
+test "validateTagSet: rejects invalid chars" {
+    const testing = std.testing;
+    try testing.expectError(Error.InvalidTag, validateTagSet(&.{
+        .{ .key = "k!", .value = "v" },
+    }));
 }

@@ -39,6 +39,8 @@ const MultipartState = struct {
     user_metadata: []storage.Header,
     initiated_unix: i64,
     parts: std.AutoHashMap(u32, PartMeta),
+    /// M9. Tags applied to the merged object on Complete.
+    tags: []storage.Tag = &.{},
 
     fn deinit(self: *MultipartState, gpa: Allocator) void {
         gpa.free(self.key);
@@ -51,11 +53,12 @@ const MultipartState = struct {
         var it = self.parts.iterator();
         while (it.next()) |entry| gpa.free(entry.value_ptr.etag);
         self.parts.deinit();
+        freeTagsOwned(gpa, self.tags);
         self.* = undefined;
     }
 };
 
-/// One entry in a versioned key's chain. M8.
+/// One entry in a versioned key's chain. M8 + M9 tags.
 const VersionEntry = struct {
     version_id: []u8, // owned by backend allocator
     is_delete_marker: bool,
@@ -64,6 +67,8 @@ const VersionEntry = struct {
     content_type: []u8, // empty for delete markers
     last_modified_unix: i64,
     user_metadata: []storage.Header,
+    /// M9. Per-version tag set.
+    tags: []storage.Tag = &.{},
 
     fn deinit(self: *VersionEntry, gpa: Allocator) void {
         gpa.free(self.version_id);
@@ -74,6 +79,7 @@ const VersionEntry = struct {
             gpa.free(h.value);
         }
         gpa.free(self.user_metadata);
+        freeTagsOwned(gpa, self.tags);
         self.* = undefined;
     }
 };
@@ -96,6 +102,9 @@ const BucketSlot = struct {
     /// caller's key on first insert. Only populated when versioning has
     /// ever been enabled on this bucket.
     versions: std.StringHashMap(VersionChain),
+    /// Bucket-level tag set (M9). Empty means "no TagSet"; GetBucketTagging
+    /// returns 404 NoSuchTagSet in that case.
+    tags: []storage.Tag = &.{},
 
     fn deinit(self: *BucketSlot, gpa: Allocator) void {
         gpa.free(self.meta.name);
@@ -117,9 +126,38 @@ const BucketSlot = struct {
             chain.deinit(gpa);
         }
         self.versions.deinit();
+        freeTagsOwned(gpa, self.tags);
         self.* = undefined;
     }
 };
+
+/// Free a tag set whose keys and values were duped with the given allocator.
+fn freeTagsOwned(gpa: Allocator, tags: []storage.Tag) void {
+    for (tags) |t| {
+        gpa.free(t.key);
+        gpa.free(t.value);
+    }
+    gpa.free(tags);
+}
+
+/// Dupe an arbitrary tag set into `gpa`-owned strings + slice.
+fn dupeTagsOwned(gpa: Allocator, src: []const storage.Tag) ![]storage.Tag {
+    const out = try gpa.alloc(storage.Tag, src.len);
+    errdefer gpa.free(out);
+    var made: usize = 0;
+    errdefer for (out[0..made]) |t| {
+        gpa.free(t.key);
+        gpa.free(t.value);
+    };
+    for (src) |t| {
+        out[made] = .{
+            .key = try gpa.dupe(u8, t.key),
+            .value = try gpa.dupe(u8, t.value),
+        };
+        made += 1;
+    }
+    return out;
+}
 
 allocator: Allocator,
 io: Io,
@@ -185,6 +223,12 @@ const vtable: storage.Backend.VTable = .{
     .getBucketVersioning = vtGetBucketVersioning,
     .putBucketVersioning = vtPutBucketVersioning,
     .listObjectVersions = vtListObjectVersions,
+    .putBucketTagging = vtPutBucketTagging,
+    .getBucketTagging = vtGetBucketTagging,
+    .deleteBucketTagging = vtDeleteBucketTagging,
+    .putObjectTagging = vtPutObjectTagging,
+    .getObjectTagging = vtGetObjectTagging,
+    .deleteObjectTagging = vtDeleteObjectTagging,
 };
 
 fn vtCreateBucket(ctx: *anyopaque, name: []const u8) storage.Error!void {
@@ -241,6 +285,24 @@ fn vtPutBucketVersioning(ctx: *anyopaque, bucket: []const u8, status: storage.Ve
 fn vtListObjectVersions(ctx: *anyopaque, allocator: Allocator, in: storage.ListObjectVersionsInput) storage.Error!storage.ListObjectVersionsOutput {
     return listObjectVersions(@ptrCast(@alignCast(ctx)), allocator, in);
 }
+fn vtPutBucketTagging(ctx: *anyopaque, bucket: []const u8, tags: []const storage.Tag) storage.Error!void {
+    return putBucketTagging(@ptrCast(@alignCast(ctx)), bucket, tags);
+}
+fn vtGetBucketTagging(ctx: *anyopaque, allocator: Allocator, bucket: []const u8) storage.Error![]storage.Tag {
+    return getBucketTagging(@ptrCast(@alignCast(ctx)), allocator, bucket);
+}
+fn vtDeleteBucketTagging(ctx: *anyopaque, bucket: []const u8) storage.Error!void {
+    return deleteBucketTagging(@ptrCast(@alignCast(ctx)), bucket);
+}
+fn vtPutObjectTagging(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, tags: []const storage.Tag) storage.Error!void {
+    return putObjectTagging(@ptrCast(@alignCast(ctx)), bucket, key, version_id, tags);
+}
+fn vtGetObjectTagging(ctx: *anyopaque, allocator: Allocator, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error![]storage.Tag {
+    return getObjectTagging(@ptrCast(@alignCast(ctx)), allocator, bucket, key, version_id);
+}
+fn vtDeleteObjectTagging(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error!void {
+    return deleteObjectTagging(@ptrCast(@alignCast(ctx)), bucket, key, version_id);
+}
 
 // ---------------------------------------------------------------------------
 // Bucket ops
@@ -272,6 +334,7 @@ pub fn createBucket(self: *Fs, name: []const u8) storage.Error!void {
         .key_index = .empty,
         .uploads = std.StringHashMap(MultipartState).init(self.allocator),
         .versions = std.StringHashMap(VersionChain).init(self.allocator),
+        .tags = &.{},
     }) catch return storage.Error.OutOfMemory;
 
     saveRegistry(self) catch return storage.Error.Io;
@@ -357,6 +420,7 @@ fn putObjectFlat(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput) stora
         .content_type = in.content_type,
         .last_modified_unix = nowUnixSeconds(self.io),
         .user_metadata = in.user_metadata,
+        .tags = in.tags,
     };
     var meta_buf: [4096]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{key_dir}) catch return storage.Error.Io;
@@ -406,6 +470,7 @@ fn putObjectVersioned(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput, 
         .last_modified_unix = now,
         .user_metadata = in.user_metadata,
         .is_delete_marker = false,
+        .tags = in.tags,
     };
     var meta_buf: [4096]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{versions_dir}) catch return storage.Error.Io;
@@ -430,6 +495,7 @@ fn putObjectVersioned(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput, 
         .content_type = self.allocator.dupe(u8, in.content_type) catch return storage.Error.OutOfMemory,
         .last_modified_unix = now,
         .user_metadata = try dupeHeadersStorage(self.allocator, in.user_metadata),
+        .tags = try dupeTagsOwned(self.allocator, in.tags),
     };
 
     if (slot.versions.getPtr(in.key)) |chain| {
@@ -567,6 +633,7 @@ fn cloneVersionedMeta(allocator: Allocator, key: []const u8, v: VersionEntry) st
         .user_metadata = try dupeHeadersStorage(allocator, v.user_metadata),
         .version_id = allocator.dupe(u8, v.version_id) catch return storage.Error.OutOfMemory,
         .is_delete_marker = v.is_delete_marker,
+        .tags = try cloneTagsTo(allocator, v.tags),
     };
 }
 
@@ -655,6 +722,12 @@ fn freeObjectMetaOwned(gpa: Allocator, o: storage.Object) void {
         gpa.free(h.value);
     }
     gpa.free(o.user_metadata);
+    for (o.tags) |t| {
+        gpa.free(t.key);
+        gpa.free(t.value);
+    }
+    gpa.free(o.tags);
+    if (o.version_id.len > 0) gpa.free(o.version_id);
 }
 
 pub fn deleteObject(self: *Fs, in: storage.DeleteObjectInput) storage.Error!storage.DeleteObjectOutput {
@@ -940,6 +1013,7 @@ fn migrateNoneToEnabled(self: *Fs, slot: *BucketSlot) !void {
             .content_type = try self.allocator.dupe(u8, md.content_type),
             .last_modified_unix = md.last_modified_unix,
             .user_metadata = try dupeHeadersStorage(self.allocator, md.user_metadata),
+            .tags = try dupeTagsOwned(self.allocator, md.tags),
         };
         try chain.append(self.allocator, v);
         const key_owned = try self.allocator.dupe(u8, md.key);
@@ -1002,6 +1076,7 @@ fn rebuildVersionIndex(self: *Fs, slot: *BucketSlot) !void {
                 .content_type = try self.allocator.dupe(u8, md.content_type),
                 .last_modified_unix = md.last_modified_unix,
                 .user_metadata = try dupeHeadersStorage(self.allocator, md.user_metadata),
+                .tags = try dupeTagsOwned(self.allocator, md.tags),
             };
             try chain.append(self.allocator, v);
         }
@@ -1031,7 +1106,192 @@ const VersionedMetaDoc = struct {
     last_modified_unix: i64,
     user_metadata: []const storage.Header,
     is_delete_marker: bool = false,
+    /// M9. Defaults to empty for older records.
+    tags: []const storage.Tag = &.{},
 };
+
+// ---------------------------------------------------------------------------
+// Tagging (M9). Bucket-level tags live in the registry. Object tags live
+// inside the per-object/per-version meta.json (`tags` field). For versioned
+// buckets we also keep an in-memory copy on each VersionEntry.
+
+pub fn putBucketTagging(self: *Fs, bucket: []const u8, tags: []const storage.Tag) storage.Error!void {
+    try storage.validateTagSet(tags);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+
+    const new_tags = try dupeTagsOwned(self.allocator, tags);
+    freeTagsOwned(self.allocator, slot.tags);
+    slot.tags = new_tags;
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+pub fn getBucketTagging(self: *Fs, allocator: Allocator, bucket: []const u8) storage.Error![]storage.Tag {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    if (slot.tags.len == 0) return storage.Error.NoSuchTagSet;
+    return cloneTagsTo(allocator, slot.tags);
+}
+
+pub fn deleteBucketTagging(self: *Fs, bucket: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    freeTagsOwned(self.allocator, slot.tags);
+    slot.tags = &.{};
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+pub fn putObjectTagging(self: *Fs, bucket: []const u8, key: []const u8, version_id: ?[]const u8, tags: []const storage.Tag) storage.Error!void {
+    try storage.validateTagSet(tags);
+    try storage.validateObjectKey(key);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    if (slot.versioning_status == .none) {
+        if (version_id) |_| return storage.Error.NoSuchKey;
+        return writeFlatObjectTags(self, bucket, key, tags);
+    }
+
+    // Versioned bucket. Resolve target version, update in-memory chain +
+    // persist to that version's meta.json.
+    const chain = slot.versions.getPtr(key) orelse return storage.Error.NoSuchKey;
+    if (chain.items.len == 0) return storage.Error.NoSuchKey;
+    var target_idx: usize = 0;
+    if (version_id) |vid| {
+        var found: ?usize = null;
+        for (chain.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.version_id, vid)) {
+                found = i;
+                break;
+            }
+        }
+        target_idx = found orelse return storage.Error.NoSuchKey;
+    }
+    if (chain.items[target_idx].is_delete_marker) return storage.Error.NoSuchKey;
+
+    const new_tags = try dupeTagsOwned(self.allocator, tags);
+    // Free old in-memory tags + swap.
+    freeTagsOwned(self.allocator, chain.items[target_idx].tags);
+    chain.items[target_idx].tags = new_tags;
+
+    // Re-serialise the meta.json for that version.
+    try rewriteVersionMeta(self, bucket, key, &chain.items[target_idx]);
+}
+
+pub fn getObjectTagging(self: *Fs, allocator: Allocator, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error![]storage.Tag {
+    try storage.validateObjectKey(key);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    if (slot.versioning_status == .none) {
+        if (version_id) |_| return storage.Error.NoSuchKey;
+        const meta = readMeta(self, allocator, bucket, key) catch |err| switch (err) {
+            error.FileNotFound => return storage.Error.NoSuchKey,
+            else => return storage.Error.Io,
+        };
+        defer freeObjectMetaOwned(allocator, meta);
+        return cloneTagsTo(allocator, meta.tags);
+    }
+
+    const chain = slot.versions.get(key) orelse return storage.Error.NoSuchKey;
+    if (chain.items.len == 0) return storage.Error.NoSuchKey;
+    var target: VersionEntry = chain.items[0];
+    if (version_id) |vid| {
+        var found = false;
+        for (chain.items) |entry| {
+            if (std.mem.eql(u8, entry.version_id, vid)) {
+                target = entry;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return storage.Error.NoSuchKey;
+    }
+    if (target.is_delete_marker) return storage.Error.NoSuchKey;
+    return cloneTagsTo(allocator, target.tags);
+}
+
+pub fn deleteObjectTagging(self: *Fs, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error!void {
+    return putObjectTagging(self, bucket, key, version_id, &.{});
+}
+
+fn writeFlatObjectTags(self: *Fs, bucket: []const u8, key: []const u8, tags: []const storage.Tag) storage.Error!void {
+    // Read existing meta, splice tags in, write back atomically.
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const meta = readMeta(self, arena, bucket, key) catch |err| switch (err) {
+        error.FileNotFound => return storage.Error.NoSuchKey,
+        else => return storage.Error.Io,
+    };
+    const meta_doc = MetaDoc{
+        .key = meta.key,
+        .size = meta.size,
+        .etag = meta.etag,
+        .content_type = meta.content_type,
+        .last_modified_unix = meta.last_modified_unix,
+        .user_metadata = meta.user_metadata,
+        .tags = tags,
+    };
+    const hash = keyHash(key);
+    var path_buf: [4096]u8 = undefined;
+    const meta_path = std.fmt.bufPrint(&path_buf, "{s}/s3/{s}/objects/{s}/meta.json", .{ self.base_dir, bucket, &hash }) catch return storage.Error.Io;
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    std.json.fmt(meta_doc, .{}).format(&aw.writer) catch return storage.Error.Io;
+    writeAtomic(self.io, meta_path, aw.written()) catch return storage.Error.Io;
+}
+
+fn rewriteVersionMeta(self: *Fs, bucket: []const u8, key: []const u8, v: *const VersionEntry) storage.Error!void {
+    const meta_doc = VersionedMetaDoc{
+        .key = key,
+        .size = v.size,
+        .etag = v.etag,
+        .content_type = v.content_type,
+        .last_modified_unix = v.last_modified_unix,
+        .user_metadata = v.user_metadata,
+        .is_delete_marker = v.is_delete_marker,
+        .tags = v.tags,
+    };
+    const hash = keyHash(key);
+    var path_buf: [4096]u8 = undefined;
+    const meta_path = std.fmt.bufPrint(&path_buf, "{s}/s3/{s}/objects/{s}/versions/{s}/meta.json", .{ self.base_dir, bucket, &hash, v.version_id }) catch return storage.Error.Io;
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    std.json.fmt(meta_doc, .{}).format(&aw.writer) catch return storage.Error.Io;
+    writeAtomic(self.io, meta_path, aw.written()) catch return storage.Error.Io;
+}
+
+/// Clone a tag set into caller-provided allocator (used to surface tags
+/// out of the backend without leaking the backend's allocator).
+fn cloneTagsTo(allocator: Allocator, src: []const storage.Tag) storage.Error![]storage.Tag {
+    const out = allocator.alloc(storage.Tag, src.len) catch return storage.Error.OutOfMemory;
+    errdefer allocator.free(out);
+    var made: usize = 0;
+    errdefer for (out[0..made]) |t| {
+        allocator.free(t.key);
+        allocator.free(t.value);
+    };
+    for (src) |t| {
+        out[made] = .{
+            .key = allocator.dupe(u8, t.key) catch return storage.Error.OutOfMemory,
+            .value = allocator.dupe(u8, t.value) catch return storage.Error.OutOfMemory,
+        };
+        made += 1;
+    }
+    return out;
+}
 
 pub fn listObjectVersions(self: *Fs, allocator: Allocator, in: storage.ListObjectVersionsInput) storage.Error!storage.ListObjectVersionsOutput {
     self.mutex.lockUncancelable(self.io);
@@ -1230,6 +1490,9 @@ const BucketRecord = struct {
     /// M8. Missing/null on records from earlier versions is treated as
     /// `.none` (default for unversioned buckets).
     versioning: ?[]const u8 = null,
+    /// M9. Bucket-level tag set. Missing/null on older records is treated
+    /// as "no TagSet" (404 NoSuchTagSet on GetBucketTagging).
+    tags: ?[]const storage.Tag = null,
 };
 
 const MetaDoc = struct {
@@ -1239,6 +1502,8 @@ const MetaDoc = struct {
     content_type: []const u8,
     last_modified_unix: i64,
     user_metadata: []const storage.Header,
+    /// M9. Defaults to empty for older records.
+    tags: []const storage.Tag = &.{},
 };
 
 fn loadRegistry(self: *Fs) !void {
@@ -1263,6 +1528,10 @@ fn loadRegistry(self: *Fs) !void {
             (if (std.mem.eql(u8, v, "enabled")) .enabled else if (std.mem.eql(u8, v, "suspended")) .suspended else .none)
         else
             .none;
+        const tags_owned: []storage.Tag = if (rec.tags) |t|
+            try dupeTagsOwned(self.allocator, t)
+        else
+            &.{};
         var slot: BucketSlot = .{
             .meta = .{
                 .name = name_owned,
@@ -1273,6 +1542,7 @@ fn loadRegistry(self: *Fs) !void {
             .uploads = std.StringHashMap(MultipartState).init(self.allocator),
             .versioning_status = versioning,
             .versions = std.StringHashMap(VersionChain).init(self.allocator),
+            .tags = tags_owned,
         };
         // Walk objects/ to rebuild the in-memory key index from meta.json files.
         try rebuildKeyIndex(self, &slot);
@@ -1334,6 +1604,8 @@ fn readMeta(self: *Fs, allocator: Allocator, bucket: []const u8, key: []const u8
         };
     }
 
+    const tags = try cloneTagsTo(allocator, value.tags);
+
     return .{
         .key = try allocator.dupe(u8, value.key),
         .size = @intCast(value.size),
@@ -1341,6 +1613,7 @@ fn readMeta(self: *Fs, allocator: Allocator, bucket: []const u8, key: []const u8
         .content_type = try allocator.dupe(u8, value.content_type),
         .last_modified_unix = value.last_modified_unix,
         .user_metadata = headers,
+        .tags = tags,
     };
 }
 
@@ -1356,11 +1629,13 @@ fn saveRegistry(self: *Fs) !void {
             .enabled => "enabled",
             .suspended => "suspended",
         };
+        const tags_field: ?[]const storage.Tag = if (b.tags.len == 0) null else b.tags;
         records[i] = .{
             .name = b.meta.name,
             .region = b.meta.region,
             .created_unix = b.meta.created_unix,
             .versioning = versioning_str,
+            .tags = tags_field,
         };
     }
     const doc: RegistryDoc = .{ .version = registry_version, .buckets = records };
@@ -1386,6 +1661,8 @@ const ManifestDoc = struct {
     user_metadata: []const storage.Header,
     initiated_unix: i64,
     parts: []const ManifestPart,
+    /// M9. Tags applied to the merged object on Complete.
+    tags: []const storage.Tag = &.{},
 };
 
 const ManifestPart = struct {
@@ -1418,6 +1695,8 @@ pub fn initiateMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Init
     errdefer self.allocator.free(ct_owned);
     const meta_owned = dupeHeadersStorage(self.allocator, in.user_metadata) catch return storage.Error.OutOfMemory;
     errdefer freeHeadersStorage(self.allocator, meta_owned);
+    const tags_owned = dupeTagsOwned(self.allocator, in.tags) catch return storage.Error.OutOfMemory;
+    errdefer freeTagsOwned(self.allocator, tags_owned);
 
     const state: MultipartState = .{
         .key = key_owned,
@@ -1425,6 +1704,7 @@ pub fn initiateMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Init
         .user_metadata = meta_owned,
         .initiated_unix = nowUnixSeconds(self.io),
         .parts = std.AutoHashMap(u32, PartMeta).init(self.allocator),
+        .tags = tags_owned,
     };
 
     const id_for_map = self.allocator.dupe(u8, upload_id) catch return storage.Error.OutOfMemory;
@@ -1522,6 +1802,7 @@ pub fn completeMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Comp
         .content_type = state.content_type,
         .last_modified_unix = nowUnixSeconds(self.io),
         .user_metadata = state.user_metadata,
+        .tags = state.tags,
     };
     var meta_buf: [4096]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{key_dir}) catch return storage.Error.Io;
@@ -1758,6 +2039,7 @@ fn writeManifest(self: *Fs, bucket: []const u8, upload_id: []const u8, state: *c
         .user_metadata = state.user_metadata,
         .initiated_unix = state.initiated_unix,
         .parts = parts,
+        .tags = state.tags,
     };
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
     defer aw.deinit();
@@ -1795,6 +2077,7 @@ fn rebuildUploadIndex(self: *Fs, slot: *BucketSlot) !void {
             .user_metadata = try dupeHeadersStorage(self.allocator, value.user_metadata),
             .initiated_unix = value.initiated_unix,
             .parts = std.AutoHashMap(u32, PartMeta).init(self.allocator),
+            .tags = try dupeTagsOwned(self.allocator, value.tags),
         };
         for (value.parts) |p| {
             const etag_owned = try self.allocator.dupe(u8, p.etag);

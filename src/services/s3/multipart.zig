@@ -12,6 +12,7 @@ const storage = @import("../../storage/mod.zig");
 const errors = @import("../../wire/errors.zig");
 const multipart_wire = @import("../../wire/multipart_responses.zig");
 const complete_parser = @import("../../wire/complete_multipart_parser.zig");
+const tagging_parser = @import("../../wire/tagging_parser.zig");
 const preconditions = @import("preconditions.zig");
 const mod = @import("mod.zig");
 
@@ -38,11 +39,22 @@ pub fn createMultipartUpload(ctx: Context, bucket: []const u8, key: []const u8) 
         }
     }
 
+    // M9 inline tagging on CreateMultipartUpload.
+    const inline_tags: []storage.Tag = if (mod.findHeader(ctx.request.headers, "x-amz-tagging")) |hv|
+        tagging_parser.parseHeader(ctx.allocator, hv) catch |err| switch (err) {
+            tagging_parser.ParseError.InvalidTag => return .{ .err = .invalid_tag },
+            tagging_parser.ParseError.OutOfMemory => return .{ .err = .internal_error },
+            tagging_parser.ParseError.InvalidBody => return .{ .err = .invalid_request },
+        }
+    else
+        &.{};
+
     const out = ctx.backend.initiateMultipartUpload(ctx.allocator, .{
         .bucket = bucket,
         .key = key,
         .content_type = content_type,
         .user_metadata = meta_list.items,
+        .tags = inline_tags,
     }) catch |err| return .{ .err = mod.mapStorageErr(err) };
 
     const body = multipart_wire.renderInitiateMultipartUploadResult(ctx.allocator, bucket, key, out.upload_id) catch

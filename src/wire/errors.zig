@@ -33,6 +33,8 @@ pub const Code = enum {
     no_such_upload,
     invalid_part,
     invalid_part_order,
+    invalid_tag,
+    no_such_tag_set,
     internal_error,
 
     pub fn awsCode(self: Code) []const u8 {
@@ -61,6 +63,8 @@ pub const Code = enum {
             .no_such_upload => "NoSuchUpload",
             .invalid_part => "InvalidPart",
             .invalid_part_order => "InvalidPartOrder",
+            .invalid_tag => "InvalidTag",
+            .no_such_tag_set => "NoSuchTagSet",
             .internal_error => "InternalError",
         };
     }
@@ -91,6 +95,8 @@ pub const Code = enum {
             .no_such_upload => "The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
             .invalid_part => "One or more of the specified parts could not be found. The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.",
             .invalid_part_order => "The list of parts was not in ascending order. Parts must be ordered by part number.",
+            .invalid_tag => "The tag provided was not a valid tag. This error can occur if the tag did not pass input validation.",
+            .no_such_tag_set => "The TagSet does not exist.",
             .internal_error => "We encountered an internal error. Please try again.",
         };
     }
@@ -108,6 +114,8 @@ pub const Code = enum {
             .entity_too_small => 400,
             .no_such_upload => 404,
             .invalid_part, .invalid_part_order => 400,
+            .invalid_tag => 400,
+            .no_such_tag_set => 404,
             .method_not_allowed => 405,
             .internal_error => 500,
         };

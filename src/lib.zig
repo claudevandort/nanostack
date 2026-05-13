@@ -12,6 +12,8 @@ pub const multipart_responses = @import("wire/multipart_responses.zig");
 pub const versioning_config_parser = @import("wire/versioning_config_parser.zig");
 pub const versioning_responses = @import("wire/versioning_responses.zig");
 pub const list_object_versions = @import("wire/list_object_versions.zig");
+pub const tagging_parser = @import("wire/tagging_parser.zig");
+pub const tagging_responses = @import("wire/tagging_responses.zig");
 pub const router = @import("router.zig");
 pub const http_range = @import("http/range.zig");
 pub const http_date = @import("http/date.zig");
@@ -27,6 +29,7 @@ pub const s3 = @import("services/s3/mod.zig");
 pub const preconditions = @import("services/s3/preconditions.zig");
 pub const multipart_service = @import("services/s3/multipart.zig");
 pub const versioning_service = @import("services/s3/versioning.zig");
+pub const tagging_service = @import("services/s3/tagging.zig");
 pub const cli = @import("cli.zig");
 pub const version = @import("version.zig");
 
@@ -42,6 +45,8 @@ test {
     _ = versioning_config_parser;
     _ = versioning_responses;
     _ = list_object_versions;
+    _ = tagging_parser;
+    _ = tagging_responses;
     _ = router;
     _ = http_range;
     _ = http_date;
@@ -57,6 +62,7 @@ test {
     _ = preconditions;
     _ = multipart_service;
     _ = versioning_service;
+    _ = tagging_service;
     _ = cli;
     _ = version;
 }
