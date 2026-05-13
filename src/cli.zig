@@ -22,6 +22,8 @@ pub const Config = struct {
     no_auth: bool = false,
     /// SigV4 clock-skew tolerance (seconds). AWS default is 900 (15 min).
     skew_seconds: i64 = 900,
+    /// `--version` flag: print version + exit before starting the server.
+    print_version: bool = false,
 };
 
 pub const ParseError = error{
@@ -36,7 +38,9 @@ pub fn parse(args: []const [:0]const u8) ParseError!Config {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--self-test-ready")) {
+        if (std.mem.eql(u8, arg, "--version")) {
+            c.print_version = true;
+        } else if (std.mem.eql(u8, arg, "--self-test-ready")) {
             c.self_test_ready = true;
         } else if (std.mem.eql(u8, arg, "--no-auth")) {
             c.no_auth = true;
@@ -110,6 +114,11 @@ test "no-auth + skew flags" {
     const c = try parse(&.{ "nanostack", "--no-auth", "--skew-seconds", "60" });
     try testing.expect(c.no_auth);
     try testing.expectEqual(@as(i64, 60), c.skew_seconds);
+}
+
+test "--version sets print_version" {
+    const c = try parse(&.{ "nanostack", "--version" });
+    try testing.expect(c.print_version);
 }
 
 test "unknown flag" {

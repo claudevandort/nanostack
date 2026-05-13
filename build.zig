@@ -67,4 +67,29 @@ pub fn build(b: *std.Build) void {
     bench_cmd.addFileArg(b.path("bench/run.sh"));
     if (b.args) |args| bench_cmd.addArgs(args);
     bench_step.dependOn(&bench_cmd.step);
+
+    // Release build: ReleaseFast + stripped exe, installed under
+    // `zig-out/release/<triple>/nanostack` so the release workflow can tar
+    // each cross-target output directly. Combine with -Dtarget=<triple>
+    // to produce one tarball per platform.
+    const release_target_triple = b.fmt("{s}", .{target.result.linuxTriple(b.allocator) catch "host"});
+    const release_exe = b.addExecutable(.{
+        .name = "nanostack",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .strip = true,
+            .imports = &.{
+                .{ .name = "nanostack", .module = lib_mod },
+                .{ .name = "httpz", .module = httpz_mod },
+                .{ .name = "xml", .module = xml_mod },
+            },
+        }),
+    });
+    const release_install = b.addInstallArtifact(release_exe, .{
+        .dest_dir = .{ .override = .{ .custom = b.fmt("release/{s}", .{release_target_triple}) } },
+    });
+    const release_step = b.step("release", "Cross-compile a stripped ReleaseFast binary (use with -Dtarget=…)");
+    release_step.dependOn(&release_install.step);
 }

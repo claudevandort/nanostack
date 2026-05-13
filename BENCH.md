@@ -1,6 +1,10 @@
 # nanostack — Performance Gate
 
+**Version:** v0.0.1 (2026-05-13)
+
 The PRD's "snappy" promise is enforced by a perf gate that runs in CI on every push. This document explains what we measure, the budgets we hold ourselves to, and the latest numbers from the most recent main-branch run.
+
+**Note on CI numbers:** GitHub-hosted runners typically come in ~2× slower than the dev-machine baseline below (slower disks, shared CPU). All budgets allow for this — the numbers below have ~3× headroom on every gated metric.
 
 ## How to run
 

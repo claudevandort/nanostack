@@ -5,6 +5,7 @@ const cli = @import("cli.zig");
 const server = @import("server.zig");
 const storage = @import("storage/mod.zig");
 const FsBackend = @import("storage/fs.zig");
+const version = @import("version.zig");
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -14,6 +15,15 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("cli parse failed: {s}", .{@errorName(err)});
         return err;
     };
+
+    if (config.print_version) {
+        const line = try std.fmt.allocPrint(arena, "nanostack v{s}\n", .{version.string});
+        var buf: [128]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(init.io, &buf);
+        try stdout.interface.writeAll(line);
+        try stdout.interface.flush();
+        return;
+    }
 
     const data_dir = try resolveDataDir(arena, init.environ_map, config.data_dir);
     config.data_dir = data_dir;

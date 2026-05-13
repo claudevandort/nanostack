@@ -1,0 +1,38 @@
+version: 2
+
+updates:
+  # Go conformance suite.
+  - package-ecosystem: gomod
+    directory: /tests/conformance/go
+    schedule:
+      interval: weekly
+    groups:
+      go-deps:
+        patterns: ["*"]
+
+  # Go bench driver.
+  - package-ecosystem: gomod
+    directory: /bench/driver
+    schedule:
+      interval: weekly
+    groups:
+      bench-deps:
+        patterns: ["*"]
+
+  # JS conformance suite.
+  - package-ecosystem: npm
+    directory: /tests/conformance/js
+    schedule:
+      interval: weekly
+    groups:
+      js-deps:
+        patterns: ["*"]
+
+  # GitHub Actions used by .github/workflows/*.yml.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

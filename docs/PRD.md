@@ -367,13 +367,14 @@ Anything beyond that (SNS, EventBridge, Kinesis, IAM) is reconsidered after v1.4
 ## 17. Open Questions
 
 - **TLS in v1 or v1.1?** Currently planned for post-v1. If early users need it for browser-driven presigned URL workflows, we accelerate.
-- **AWS error catalog overlay:** we extract from Smithy at build time, but some legacy/special errors aren't in the Smithy model. Decide between hard-coding the deltas vs maintaining a small `errors.zig` overlay file.
 
 ## 17a. Decisions Locked
 
 - **Metadata format (2026-05-12):** per-object JSON sidecar (`meta.json`) + in-memory sorted listing index built at startup. Resolves the §9 / §17 open question. Chosen for inspectability and zero deps; offsets listing cost with the index. See §6 / §9.
 - **Multi-profile state isolation (2026-05-12):** deferred to v1.1. v1 ships single-profile-only. The `--profile` flag still exists and is honoured for the data-dir path so that v1.1 can layer multi-profile in without breaking existing users.
 - **In-memory backend dropped (2026-05-13):** the pre-M7 `--ephemeral` mode is removed. Reasons: every new storage operation had to be implemented twice (M6 alone added a 200+ LOC `MultipartState` mirror); the mem-resident part buffers crashed dev environments under realistic multipart load; the fs backend already covers the "wipe-clean" use case via `--data-dir <tmp>`. Old M7 ("Ephemeral mode") vacated from §14; old M8 becomes the new M7.
+- **AWS error catalog: hand-maintained (2026-05-13):** errors live in `src/wire/errors.zig` as a small hand-written enum + table. The Smithy-overlay alternative is deferred indefinitely; the catalog is short enough (≈20 codes covering the v1 surface) that hand-maintained is fine, and the Smithy approach would add a build-time codegen step we don't currently need.
+- **Versioning scheme (2026-05-13):** project-specific, not strict SemVer. `1.x.x` is reserved for "the curated multi-service surface needed for real workflows is implemented". `x.1.x` ships when one AWS service is fully implemented against the real-AWS surface (not just the v1 subset in §8). `x.x.1` is bumped for each significant pinned cut. M7's first release tags as **`v0.0.1`**. The PRD §14 label "M7 — v1.0" refers to the first project surface scope (19 S3 ops), independent of the semver tag. Documented in `CHANGELOG.md`.
 
 ---
 
@@ -386,4 +387,4 @@ Anything beyond that (SNS, EventBridge, Kinesis, IAM) is reconsidered after v1.4
 
 ---
 
-*End of PRD v0.1.*
+*End of PRD v0.2 — last revised 2026-05-13.*

@@ -1,13 +1,15 @@
 # nanostack Operation Support Matrix
 
-Status legend:
+**Version:** v0.0.1 (2026-05-13)
 
-- **supported** — implemented, passing the conformance suite.
+**How to read this matrix:** each row is one S3 operation or cross-cutting capability. Status is one of:
+
+- **supported** — implemented and asserted by the Go + JS conformance suites on every CI run.
 - **stub** — recognised by the router; returns `NotImplemented` (HTTP 501) with the correct AWS XML body.
 - **deferred** — explicitly out of scope for v1; not yet routed.
 - **planned** — on the roadmap for the indicated milestone.
 
-This file is updated as part of every release. The source of truth for the v1 cut is [`docs/PRD.md`](docs/PRD.md) §8.
+The "Milestone" column points at the release tag in which the capability landed. If you need a behaviour that's not on this matrix, file an issue — we'd rather be honest about gaps than over-promise. The source of truth for the v1 scope (the surface we aim to cover by `v0.0.1`) is [`docs/PRD.md`](docs/PRD.md) §8.
 
 ## S3
 

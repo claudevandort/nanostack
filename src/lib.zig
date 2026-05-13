@@ -24,6 +24,7 @@ pub const s3 = @import("services/s3/mod.zig");
 pub const preconditions = @import("services/s3/preconditions.zig");
 pub const multipart_service = @import("services/s3/multipart.zig");
 pub const cli = @import("cli.zig");
+pub const version = @import("version.zig");
 
 test {
     _ = xml;
@@ -49,4 +50,5 @@ test {
     _ = preconditions;
     _ = multipart_service;
     _ = cli;
+    _ = version;
 }

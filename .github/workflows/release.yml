@@ -1,0 +1,185 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux-gnu
+            asset: linux-x86_64
+          - target: aarch64-linux-gnu
+            asset: linux-aarch64
+          - target: x86_64-macos-none
+            asset: macos-x86_64
+          - target: aarch64-macos-none
+            asset: macos-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Cross-compile
+        run: zig build release -Dtarget=${{ matrix.target }}
+
+      - name: Smoke test (linux-x86_64 only)
+        if: matrix.target == 'x86_64-linux-gnu'
+        run: |
+          out="$(./zig-out/release/${{ matrix.target }}/nanostack --version)"
+          echo "Output: $out"
+          test "$out" = "nanostack v${{ steps.ver.outputs.version }}"
+
+      - name: Package tarball
+        run: |
+          mkdir -p dist
+          stage="$(mktemp -d)/nanostack-${{ steps.ver.outputs.tag }}-${{ matrix.asset }}"
+          mkdir -p "$stage"
+          cp "zig-out/release/${{ matrix.target }}/nanostack" "$stage/"
+          cp LICENSE README.md SUPPORT.md SCORECARD.md CHANGELOG.md "$stage/"
+          tar -czf "dist/nanostack-${{ steps.ver.outputs.tag }}-${{ matrix.asset }}.tar.gz" \
+            -C "$(dirname "$stage")" "$(basename "$stage")"
+          (cd dist && sha256sum "nanostack-${{ steps.ver.outputs.tag }}-${{ matrix.asset }}.tar.gz" \
+            > "nanostack-${{ steps.ver.outputs.tag }}-${{ matrix.asset }}.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nanostack-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all tarballs
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build SHA256SUMS
+        run: |
+          cd dist
+          ls *.tar.gz
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Extract changelog section
+        id: notes
+        run: |
+          version="${{ steps.ver.outputs.version }}"
+          if grep -q "^## \[$version\]" CHANGELOG.md; then
+            awk "/^## \[$version\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md > release-notes.md
+          else
+            echo "No CHANGELOG entry for $version. See CHANGELOG.md." > release-notes.md
+          fi
+          echo "----- release notes -----"
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: nanostack ${{ steps.ver.outputs.tag }}
+          body_path: release-notes.md
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+
+  brew-bump:
+    name: Bump Homebrew tap (soft-fail)
+    runs-on: ubuntu-latest
+    needs: release
+    # Don't fail the whole release if the tap update has trouble.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version + checksums
+        id: ver
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download tarballs
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Render formula
+        run: |
+          version="${{ steps.ver.outputs.version }}"
+          url_base="https://github.com/${{ github.repository }}/releases/download/${{ steps.ver.outputs.tag }}"
+          sha_linux_x86_64="$(cd dist && sha256sum "nanostack-${{ steps.ver.outputs.tag }}-linux-x86_64.tar.gz" | awk '{print $1}')"
+          sha_linux_aarch64="$(cd dist && sha256sum "nanostack-${{ steps.ver.outputs.tag }}-linux-aarch64.tar.gz" | awk '{print $1}')"
+          sha_macos_x86_64="$(cd dist && sha256sum "nanostack-${{ steps.ver.outputs.tag }}-macos-x86_64.tar.gz" | awk '{print $1}')"
+          sha_macos_aarch64="$(cd dist && sha256sum "nanostack-${{ steps.ver.outputs.tag }}-macos-aarch64.tar.gz" | awk '{print $1}')"
+          sed -e "s|{{VERSION}}|$version|g" \
+              -e "s|{{URL_BASE}}|$url_base|g" \
+              -e "s|{{SHA256_LINUX_X86_64}}|$sha_linux_x86_64|g" \
+              -e "s|{{SHA256_LINUX_AARCH64}}|$sha_linux_aarch64|g" \
+              -e "s|{{SHA256_MACOS_X86_64}}|$sha_macos_x86_64|g" \
+              -e "s|{{SHA256_MACOS_AARCH64}}|$sha_macos_aarch64|g" \
+              release/nanostack.rb > /tmp/nanostack.rb
+          echo "----- rendered formula -----"
+          cat /tmp/nanostack.rb
+
+      - name: Open PR against homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN not configured; skipping tap PR."
+            exit 0
+          fi
+          git clone "https://x-access-token:$TAP_TOKEN@github.com/claudevandort/homebrew-nanostack.git" tap
+          cp /tmp/nanostack.rb tap/Formula/nanostack.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          branch="bump-${{ steps.ver.outputs.tag }}"
+          git checkout -b "$branch"
+          git add Formula/nanostack.rb
+          git commit -m "nanostack ${{ steps.ver.outputs.tag }}"
+          git push origin "$branch"
+          # Best-effort PR via the GitHub CLI; soft-fails if gh isn't authenticated for the tap.
+          gh pr create --repo claudevandort/homebrew-nanostack \
+            --title "nanostack ${{ steps.ver.outputs.tag }}" \
+            --body "Auto-generated by the nanostack release workflow." \
+            --head "$branch" || true
