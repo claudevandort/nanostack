@@ -1,6 +1,6 @@
 # nanostack Operation Support Matrix
 
-**Version:** v0.0.1 (2026-05-13)
+**Version:** v0.0.2-dev (M8 in progress — bucket versioning)
 
 **How to read this matrix:** each row is one S3 operation or cross-cutting capability. Status is one of:
 
@@ -36,6 +36,9 @@ The "Milestone" column points at the release tag in which the capability landed.
 | AbortMultipartUpload | supported (204) | M6 |
 | ListMultipartUploads | supported (prefix, delimiter, key-marker, upload-id-marker, max-uploads, encoding-type=url) | M6 |
 | ListParts | supported (part-number-marker, max-parts) | M6 |
+| PutBucketVersioning | supported (Enabled, Suspended) | M8 |
+| GetBucketVersioning | supported | M8 |
+| ListObjectVersions | supported (prefix, delimiter, key-marker, version-id-marker, max-keys, encoding-type=url) | M8 |
 
 ### v1 cross-cutting
 
@@ -70,6 +73,17 @@ The "Milestone" column points at the release tag in which the capability landed.
 | CopyObject 5 GB source-size cap | not enforced (known divergence) | post-v1 |
 | Range requests with `Accept-Ranges: bytes` | planned | M3 |
 | Correct AWS error wire format | partial (M1 codes wired) | M0–M3 |
+
+### Versioning-related (M8)
+
+| Capability | Status | Milestone |
+|---|---|---|
+| Per-object versionId on PUT/Copy/CompleteMPU (`x-amz-version-id` response header) | supported | M8 |
+| GET/HEAD/DELETE `?versionId=X` query selector | supported | M8 |
+| Delete markers (`x-amz-delete-marker: true`, 404 on GET, removable by versionId) | supported | M8 |
+| Multipart-ETag `<md5>-N` format on versioned writes | supported | M8 |
+| MFA Delete (`x-amz-mfa` header) | accepted-and-ignored (documented divergence) | post-v1.1 |
+| Object Lock (governance/compliance retention) | not supported | post-v1.1 |
 
 ### Deferred (post-v1)
 

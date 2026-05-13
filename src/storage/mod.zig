@@ -37,6 +37,10 @@ pub const Bucket = struct {
     created_unix: i64,
 };
 
+/// Bucket versioning state (M8). `none` = never enabled; once flipped to
+/// `enabled` AWS forbids returning to `none` (only `suspended`).
+pub const VersioningStatus = enum { none, enabled, suspended };
+
 /// One stored object's metadata. Strings are owned by either the backend
 /// (when surfaced through `headObject`) or the caller's allocator (when
 /// surfaced through `getObject`). The variant that owns is documented at
@@ -51,6 +55,14 @@ pub const Object = struct {
     last_modified_unix: i64,
     /// `x-amz-meta-*` user metadata, preserved verbatim (already lowercased).
     user_metadata: []const Header,
+    /// Empty when the bucket is in `none` versioning state; the literal
+    /// string `"null"` for objects written under Suspended versioning or
+    /// migrated from unversioned storage; otherwise a generated id.
+    version_id: []const u8 = "",
+    /// True when this entry is a delete marker (no data, no etag, no
+    /// content_type). Backends carry this through so the service layer can
+    /// surface `x-amz-delete-marker: true` headers.
+    is_delete_marker: bool = false,
 };
 
 pub const PutObjectInput = struct {
@@ -63,6 +75,39 @@ pub const PutObjectInput = struct {
 
 pub const PutObjectOutput = struct {
     etag: []const u8,
+    /// New version's id on a versioned bucket; empty when versioning is `none`.
+    version_id: []const u8 = "",
+};
+
+pub const GetObjectInput = struct {
+    bucket: []const u8,
+    key: []const u8,
+    /// When set, read this exact version. When null, resolve to the
+    /// current (latest) version.
+    version_id: ?[]const u8 = null,
+};
+
+pub const HeadObjectInput = struct {
+    bucket: []const u8,
+    key: []const u8,
+    version_id: ?[]const u8 = null,
+};
+
+pub const DeleteObjectInput = struct {
+    bucket: []const u8,
+    key: []const u8,
+    /// On a versioned bucket: null creates a delete marker; set
+    /// permanently removes that version.
+    version_id: ?[]const u8 = null,
+};
+
+pub const DeleteObjectOutput = struct {
+    /// Version id of the entry that was deleted or of the delete marker
+    /// that was created. Empty on unversioned buckets.
+    version_id: []const u8 = "",
+    /// True when the deleted entry was a delete marker, OR when a new
+    /// delete marker was created.
+    delete_marker: bool = false,
 };
 
 pub const GetObjectOutput = struct {
@@ -160,6 +205,8 @@ pub const CompleteMultipartUploadInput = struct {
 pub const CompleteMultipartUploadOutput = struct {
     /// AWS-style multipart etag: `"<hex>-N"`. Quoted, includes the suffix.
     etag: []const u8,
+    /// New version's id on a versioned bucket; empty otherwise.
+    version_id: []const u8 = "",
 };
 
 /// Metadata for one in-progress multipart upload (returned by
@@ -214,6 +261,45 @@ pub const ListPartsOutput = struct {
     next_part_number_marker: u32,
 };
 
+// ---------------------------------------------------------------------------
+// Versioning (M8)
+
+/// One version entry in `ListObjectVersions` output.
+pub const ObjectVersion = struct {
+    key: []const u8,
+    version_id: []const u8,
+    is_latest: bool,
+    /// True for delete-marker entries (no data, no etag, no content_type).
+    is_delete_marker: bool,
+    last_modified_unix: i64,
+    /// Empty for delete markers.
+    etag: []const u8 = "",
+    /// Zero for delete markers.
+    size: u64 = 0,
+};
+
+pub const ListObjectVersionsInput = struct {
+    bucket: []const u8,
+    prefix: []const u8 = "",
+    delimiter: []const u8 = "",
+    /// Pagination cursor — return entries strictly after (key_marker,
+    /// version_id_marker) in (key asc, version newest-first within key)
+    /// sort order.
+    key_marker: []const u8 = "",
+    version_id_marker: []const u8 = "",
+    max_keys: u32 = 1000,
+};
+
+pub const ListObjectVersionsOutput = struct {
+    /// Versions + delete markers, intermixed in sort order. Caller
+    /// distinguishes via `is_delete_marker`.
+    versions: []ObjectVersion,
+    common_prefixes: [][]const u8,
+    is_truncated: bool,
+    next_key_marker: []const u8,
+    next_version_id_marker: []const u8,
+};
+
 pub const Backend = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -224,11 +310,11 @@ pub const Backend = struct {
         deleteBucket: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
         headBucket: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
         listBuckets: *const fn (ctx: *anyopaque, allocator: Allocator) Error![]Bucket,
-        // Objects (M3).
+        // Objects (M3, extended M8 with version_id).
         putObject: *const fn (ctx: *anyopaque, in: PutObjectInput) Error!PutObjectOutput,
-        getObject: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8, key: []const u8) Error!GetObjectOutput,
-        headObject: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8, key: []const u8) Error!Object,
-        deleteObject: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8) Error!void,
+        getObject: *const fn (ctx: *anyopaque, allocator: Allocator, in: GetObjectInput) Error!GetObjectOutput,
+        headObject: *const fn (ctx: *anyopaque, allocator: Allocator, in: HeadObjectInput) Error!Object,
+        deleteObject: *const fn (ctx: *anyopaque, in: DeleteObjectInput) Error!DeleteObjectOutput,
         // Listing (M4).
         listObjects: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListObjectsInput) Error!ListObjectsOutput,
         // Multipart upload (M6).
@@ -238,6 +324,10 @@ pub const Backend = struct {
         abortMultipartUpload: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, upload_id: []const u8) Error!void,
         listMultipartUploads: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListMultipartUploadsInput) Error!ListMultipartUploadsOutput,
         listParts: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListPartsInput) Error!ListPartsOutput,
+        // Versioning (M8).
+        getBucketVersioning: *const fn (ctx: *anyopaque, bucket: []const u8) Error!VersioningStatus,
+        putBucketVersioning: *const fn (ctx: *anyopaque, bucket: []const u8, status: VersioningStatus) Error!void,
+        listObjectVersions: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListObjectVersionsInput) Error!ListObjectVersionsOutput,
     };
 
     // Pass-through helpers so call sites don't dereference the vtable.
@@ -259,15 +349,15 @@ pub const Backend = struct {
         return self.vtable.putObject(self.ctx, in);
     }
     /// Caller owns the returned body and any allocated metadata strings.
-    pub fn getObject(self: Backend, allocator: Allocator, bucket: []const u8, key: []const u8) Error!GetObjectOutput {
-        return self.vtable.getObject(self.ctx, allocator, bucket, key);
+    pub fn getObject(self: Backend, allocator: Allocator, in: GetObjectInput) Error!GetObjectOutput {
+        return self.vtable.getObject(self.ctx, allocator, in);
     }
     /// Caller owns the returned metadata strings.
-    pub fn headObject(self: Backend, allocator: Allocator, bucket: []const u8, key: []const u8) Error!Object {
-        return self.vtable.headObject(self.ctx, allocator, bucket, key);
+    pub fn headObject(self: Backend, allocator: Allocator, in: HeadObjectInput) Error!Object {
+        return self.vtable.headObject(self.ctx, allocator, in);
     }
-    pub fn deleteObject(self: Backend, bucket: []const u8, key: []const u8) Error!void {
-        return self.vtable.deleteObject(self.ctx, bucket, key);
+    pub fn deleteObject(self: Backend, in: DeleteObjectInput) Error!DeleteObjectOutput {
+        return self.vtable.deleteObject(self.ctx, in);
     }
 
     /// Caller owns the returned slice plus every nested string. Use the
@@ -293,6 +383,16 @@ pub const Backend = struct {
     }
     pub fn listParts(self: Backend, allocator: Allocator, in: ListPartsInput) Error!ListPartsOutput {
         return self.vtable.listParts(self.ctx, allocator, in);
+    }
+
+    pub fn getBucketVersioning(self: Backend, bucket: []const u8) Error!VersioningStatus {
+        return self.vtable.getBucketVersioning(self.ctx, bucket);
+    }
+    pub fn putBucketVersioning(self: Backend, bucket: []const u8, status: VersioningStatus) Error!void {
+        return self.vtable.putBucketVersioning(self.ctx, bucket, status);
+    }
+    pub fn listObjectVersions(self: Backend, allocator: Allocator, in: ListObjectVersionsInput) Error!ListObjectVersionsOutput {
+        return self.vtable.listObjectVersions(self.ctx, allocator, in);
     }
 };
 

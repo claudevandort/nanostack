@@ -17,6 +17,7 @@ const http_range = @import("../../http/range.zig");
 const fs_backend = @import("../../storage/fs.zig");
 const preconditions = @import("preconditions.zig");
 const multipart = @import("multipart.zig");
+const versioning = @import("versioning.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -32,9 +33,18 @@ pub const Output = struct {
     content_type_override: ?[]const u8 = null,
 };
 
+/// Some error paths (notably the M8 delete-marker 404 on GET/HEAD) need
+/// to carry response headers alongside the error body. This wraps an
+/// error code with an extra-headers slice owned by the request arena.
+pub const ErrorWithHeaders = struct {
+    code: errors.Code,
+    extra_headers: []const Header,
+};
+
 pub const Result = union(enum) {
     ok: Output,
     err: errors.Code,
+    err_with_headers: ErrorWithHeaders,
 };
 
 /// Per-request data the service handlers need access to. Populated by
@@ -122,6 +132,18 @@ pub fn handle(ctx: Context, parsed: router.Parsed) Result {
             parsed.key orelse return .{ .err = .invalid_request },
         ),
         .list_multipart_uploads => multipart.listMultipartUploads(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .put_bucket_versioning => versioning.putBucketVersioning(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .get_bucket_versioning => versioning.getBucketVersioning(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .list_object_versions => versioning.listObjectVersions(
             ctx,
             parsed.bucket orelse return .{ .err = .invalid_request },
         ),
@@ -250,7 +272,7 @@ fn putObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
         findHeader(ctx.request.headers, "if-none-match") != null)
     {
         var subj: preconditions.Subject = .{};
-        if (ctx.backend.headObject(ctx.allocator, bucket, key)) |meta| {
+        if (ctx.backend.headObject(ctx.allocator, .{ .bucket = bucket, .key = key })) |meta| {
             subj = .{ .etag = meta.etag, .last_modified_unix = meta.last_modified_unix, .exists = true };
         } else |err| switch (err) {
             storage.Error.NoSuchKey => {},
@@ -286,9 +308,13 @@ fn putObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
         .user_metadata = meta_list.items,
     }) catch |err| return .{ .err = mapStorageErr(err) };
 
-    const headers = ctx.allocator.dupe(Header, &.{
-        .{ .name = "ETag", .value = out.etag },
-    }) catch return .{ .err = .internal_error };
+    var hs: std.ArrayList(Header) = .empty;
+    defer hs.deinit(ctx.allocator);
+    hs.append(ctx.allocator, .{ .name = "ETag", .value = out.etag }) catch return .{ .err = .internal_error };
+    if (out.version_id.len > 0) {
+        hs.append(ctx.allocator, .{ .name = "x-amz-version-id", .value = out.version_id }) catch return .{ .err = .internal_error };
+    }
+    const headers = hs.toOwnedSlice(ctx.allocator) catch return .{ .err = .internal_error };
     return .{ .ok = .{ .status = 200, .body = "", .extra_headers = headers } };
 }
 
@@ -316,7 +342,7 @@ fn copyObject(ctx: Context, dest_bucket: []const u8, dest_key: []const u8) Resul
         return .{ .err = .invalid_argument };
 
     // ---------- Read source ----------
-    const source_obj = ctx.backend.getObject(ctx.allocator, source_bucket, source_key) catch |err|
+    const source_obj = ctx.backend.getObject(ctx.allocator, .{ .bucket = source_bucket, .key = source_key }) catch |err|
         return .{ .err = mapStorageErr(err) };
 
     // ---------- Conditional copy-source preconditions ----------
@@ -362,19 +388,41 @@ fn copyObject(ctx: Context, dest_bucket: []const u8, dest_key: []const u8) Resul
 
     // ---------- Render response ----------
     // Fetch the destination's stored last_modified_unix for the response.
-    const dest_meta = ctx.backend.headObject(ctx.allocator, dest_bucket, dest_key) catch |err|
+    const dest_meta = ctx.backend.headObject(ctx.allocator, .{ .bucket = dest_bucket, .key = dest_key }) catch |err|
         return .{ .err = mapStorageErr(err) };
     const body = object_responses.renderCopyObjectResult(ctx.allocator, put_out.etag, dest_meta.last_modified_unix) catch
         return .{ .err = .internal_error };
-    return .{ .ok = .{ .status = 200, .body = body } };
+
+    // Versioning-aware response headers: x-amz-version-id for destination,
+    // x-amz-copy-source-version-id for the source's version (M8).
+    var hs: std.ArrayList(Header) = .empty;
+    defer hs.deinit(ctx.allocator);
+    if (put_out.version_id.len > 0) {
+        hs.append(ctx.allocator, .{ .name = "x-amz-version-id", .value = put_out.version_id }) catch return .{ .err = .internal_error };
+    }
+    if (source_obj.meta.version_id.len > 0) {
+        hs.append(ctx.allocator, .{ .name = "x-amz-copy-source-version-id", .value = source_obj.meta.version_id }) catch return .{ .err = .internal_error };
+    }
+    const extras = hs.toOwnedSlice(ctx.allocator) catch return .{ .err = .internal_error };
+    return .{ .ok = .{ .status = 200, .body = body, .extra_headers = extras } };
 }
 
 const MetadataDirective = enum { copy, replace };
 
 
 fn getObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
-    const got = ctx.backend.getObject(ctx.allocator, bucket, key) catch |err|
+    const version_id = queryValue(ctx.allocator, ctx.request.query, "versionId") catch return .{ .err = .internal_error };
+    const got = ctx.backend.getObject(ctx.allocator, .{ .bucket = bucket, .key = key, .version_id = version_id }) catch |err|
         return .{ .err = mapStorageErr(err) };
+
+    // Delete-marker on the current version → 404 with marker headers.
+    if (got.meta.is_delete_marker) {
+        const extra = ctx.allocator.dupe(Header, &.{
+            .{ .name = "x-amz-delete-marker", .value = "true" },
+            .{ .name = "x-amz-version-id", .value = got.meta.version_id },
+        }) catch return .{ .err = .internal_error };
+        return .{ .err_with_headers = .{ .code = .no_such_key, .extra_headers = extra } };
+    }
 
     switch (preconditions.forRead(ctx.request.headers, .{
         .etag = got.meta.etag,
@@ -384,8 +432,6 @@ fn getObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
         .ok => {},
         .precondition_failed => return .{ .err = .precondition_failed },
         .not_modified => {
-            // RFC 9110 §15.4.5: 304 carries no body but SHOULD include
-            // ETag + Last-Modified so cache validators stay coherent.
             const hs = buildObjectHeaders(ctx, got.meta, null) catch return .{ .err = .internal_error };
             return .{ .ok = .{ .status = 304, .body = "", .extra_headers = hs } };
         },
@@ -408,7 +454,7 @@ fn getObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
         status = 206;
     }
 
-    const headers = buildObjectHeaders(ctx, got.meta, range_header) catch return .{ .err = .internal_error };
+    const headers = buildObjectHeadersWithVersion(ctx, got.meta, range_header) catch return .{ .err = .internal_error };
     return .{
         .ok = .{
             .status = status,
@@ -420,8 +466,17 @@ fn getObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
 }
 
 fn headObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
-    const meta = ctx.backend.headObject(ctx.allocator, bucket, key) catch |err|
+    const version_id = queryValue(ctx.allocator, ctx.request.query, "versionId") catch return .{ .err = .internal_error };
+    const meta = ctx.backend.headObject(ctx.allocator, .{ .bucket = bucket, .key = key, .version_id = version_id }) catch |err|
         return .{ .err = mapStorageErr(err) };
+
+    if (meta.is_delete_marker) {
+        const extra = ctx.allocator.dupe(Header, &.{
+            .{ .name = "x-amz-delete-marker", .value = "true" },
+            .{ .name = "x-amz-version-id", .value = meta.version_id },
+        }) catch return .{ .err = .internal_error };
+        return .{ .err_with_headers = .{ .code = .no_such_key, .extra_headers = extra } };
+    }
 
     switch (preconditions.forRead(ctx.request.headers, .{
         .etag = meta.etag,
@@ -437,7 +492,7 @@ fn headObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
         .invalid => return .{ .err = .invalid_argument },
     }
 
-    const headers = buildHeadHeaders(ctx, meta) catch return .{ .err = .internal_error };
+    const headers = buildHeadHeadersWithVersion(ctx, meta) catch return .{ .err = .internal_error };
     return .{
         .ok = .{
             .status = 200,
@@ -449,8 +504,22 @@ fn headObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
 }
 
 fn deleteObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
-    ctx.backend.deleteObject(bucket, key) catch |err| return .{ .err = mapStorageErr(err) };
-    return .{ .ok = .{ .status = 204, .body = "" } };
+    const version_id = queryValue(ctx.allocator, ctx.request.query, "versionId") catch return .{ .err = .internal_error };
+    const out = ctx.backend.deleteObject(.{ .bucket = bucket, .key = key, .version_id = version_id }) catch |err|
+        return .{ .err = mapStorageErr(err) };
+
+    // On a versioned bucket the response carries `x-amz-version-id` and
+    // (when applicable) `x-amz-delete-marker: true`.
+    var hs: std.ArrayList(Header) = .empty;
+    defer hs.deinit(ctx.allocator);
+    if (out.version_id.len > 0) {
+        hs.append(ctx.allocator, .{ .name = "x-amz-version-id", .value = out.version_id }) catch return .{ .err = .internal_error };
+    }
+    if (out.delete_marker) {
+        hs.append(ctx.allocator, .{ .name = "x-amz-delete-marker", .value = "true" }) catch return .{ .err = .internal_error };
+    }
+    const extras = hs.toOwnedSlice(ctx.allocator) catch return .{ .err = .internal_error };
+    return .{ .ok = .{ .status = 204, .body = "", .extra_headers = extras } };
 }
 
 fn deleteObjects(ctx: Context, bucket: []const u8) Result {
@@ -466,7 +535,7 @@ fn deleteObjects(ctx: Context, bucket: []const u8) Result {
     defer errs.deinit(ctx.allocator);
 
     for (parsed_body.keys) |k| {
-        ctx.backend.deleteObject(bucket, k) catch |err| {
+        _ = ctx.backend.deleteObject(.{ .bucket = bucket, .key = k }) catch |err| {
             const code: errors.Code = mapStorageErr(err);
             errs.append(ctx.allocator, .{
                 .key = k,
@@ -534,6 +603,28 @@ fn buildHeadHeaders(ctx: Context, meta: storage.Object) ![]Header {
     ctx.allocator.free(base);
     const len_str = try std.fmt.allocPrint(ctx.allocator, "{d}", .{meta.size});
     try hs.append(ctx.allocator, .{ .name = "Content-Length", .value = len_str });
+    return hs.toOwnedSlice(ctx.allocator);
+}
+
+fn buildObjectHeadersWithVersion(ctx: Context, meta: storage.Object, range_header: ?[]const u8) ![]Header {
+    const base = try buildObjectHeaders(ctx, meta, range_header);
+    if (meta.version_id.len == 0) return base;
+    var hs: std.ArrayList(Header) = .empty;
+    errdefer hs.deinit(ctx.allocator);
+    try hs.appendSlice(ctx.allocator, base);
+    ctx.allocator.free(base);
+    try hs.append(ctx.allocator, .{ .name = "x-amz-version-id", .value = meta.version_id });
+    return hs.toOwnedSlice(ctx.allocator);
+}
+
+fn buildHeadHeadersWithVersion(ctx: Context, meta: storage.Object) ![]Header {
+    const base = try buildHeadHeaders(ctx, meta);
+    if (meta.version_id.len == 0) return base;
+    var hs: std.ArrayList(Header) = .empty;
+    errdefer hs.deinit(ctx.allocator);
+    try hs.appendSlice(ctx.allocator, base);
+    ctx.allocator.free(base);
+    try hs.append(ctx.allocator, .{ .name = "x-amz-version-id", .value = meta.version_id });
     return hs.toOwnedSlice(ctx.allocator);
 }
 

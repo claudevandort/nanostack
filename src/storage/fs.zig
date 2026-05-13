@@ -55,14 +55,47 @@ const MultipartState = struct {
     }
 };
 
+/// One entry in a versioned key's chain. M8.
+const VersionEntry = struct {
+    version_id: []u8, // owned by backend allocator
+    is_delete_marker: bool,
+    etag: []u8, // includes surrounding quotes; empty for delete markers
+    size: u64,
+    content_type: []u8, // empty for delete markers
+    last_modified_unix: i64,
+    user_metadata: []storage.Header,
+
+    fn deinit(self: *VersionEntry, gpa: Allocator) void {
+        gpa.free(self.version_id);
+        gpa.free(self.etag);
+        gpa.free(self.content_type);
+        for (self.user_metadata) |h| {
+            gpa.free(h.name);
+            gpa.free(h.value);
+        }
+        gpa.free(self.user_metadata);
+        self.* = undefined;
+    }
+};
+
+/// Per-key chain. Sorted newest-first (index 0 is the current version).
+const VersionChain = std.ArrayList(VersionEntry);
+
 const BucketSlot = struct {
     meta: storage.Bucket,
     /// Sorted in-memory view of all keys present in this bucket. Mutated
     /// on every PutObject / DeleteObject so M4 ListObjects can read it
-    /// directly without an FS walk.
+    /// directly without an FS walk. For versioned buckets, a key is in
+    /// the index iff its chain has a non-delete-marker entry visible.
     key_index: std.ArrayList([]const u8),
     /// Keyed by upload_id (owned). M6.
     uploads: std.StringHashMap(MultipartState),
+    /// Bucket versioning state. M8.
+    versioning_status: storage.VersioningStatus = .none,
+    /// Per-key version chain. Keys are owned strings duped from the
+    /// caller's key on first insert. Only populated when versioning has
+    /// ever been enabled on this bucket.
+    versions: std.StringHashMap(VersionChain),
 
     fn deinit(self: *BucketSlot, gpa: Allocator) void {
         gpa.free(self.meta.name);
@@ -76,6 +109,14 @@ const BucketSlot = struct {
             st.deinit(gpa);
         }
         self.uploads.deinit();
+        var vit = self.versions.iterator();
+        while (vit.next()) |entry| {
+            gpa.free(entry.key_ptr.*);
+            var chain = entry.value_ptr.*;
+            for (chain.items) |*v| v.deinit(gpa);
+            chain.deinit(gpa);
+        }
+        self.versions.deinit();
         self.* = undefined;
     }
 };
@@ -141,6 +182,9 @@ const vtable: storage.Backend.VTable = .{
     .abortMultipartUpload = vtAbortMultipartUpload,
     .listMultipartUploads = vtListMultipartUploads,
     .listParts = vtListParts,
+    .getBucketVersioning = vtGetBucketVersioning,
+    .putBucketVersioning = vtPutBucketVersioning,
+    .listObjectVersions = vtListObjectVersions,
 };
 
 fn vtCreateBucket(ctx: *anyopaque, name: []const u8) storage.Error!void {
@@ -158,14 +202,14 @@ fn vtListBuckets(ctx: *anyopaque, allocator: Allocator) storage.Error![]storage.
 fn vtPutObject(ctx: *anyopaque, in: storage.PutObjectInput) storage.Error!storage.PutObjectOutput {
     return putObject(@ptrCast(@alignCast(ctx)), in);
 }
-fn vtGetObject(ctx: *anyopaque, allocator: Allocator, bucket: []const u8, key: []const u8) storage.Error!storage.GetObjectOutput {
-    return getObject(@ptrCast(@alignCast(ctx)), allocator, bucket, key);
+fn vtGetObject(ctx: *anyopaque, allocator: Allocator, in: storage.GetObjectInput) storage.Error!storage.GetObjectOutput {
+    return getObject(@ptrCast(@alignCast(ctx)), allocator, in);
 }
-fn vtHeadObject(ctx: *anyopaque, allocator: Allocator, bucket: []const u8, key: []const u8) storage.Error!storage.Object {
-    return headObject(@ptrCast(@alignCast(ctx)), allocator, bucket, key);
+fn vtHeadObject(ctx: *anyopaque, allocator: Allocator, in: storage.HeadObjectInput) storage.Error!storage.Object {
+    return headObject(@ptrCast(@alignCast(ctx)), allocator, in);
 }
-fn vtDeleteObject(ctx: *anyopaque, bucket: []const u8, key: []const u8) storage.Error!void {
-    return deleteObject(@ptrCast(@alignCast(ctx)), bucket, key);
+fn vtDeleteObject(ctx: *anyopaque, in: storage.DeleteObjectInput) storage.Error!storage.DeleteObjectOutput {
+    return deleteObject(@ptrCast(@alignCast(ctx)), in);
 }
 fn vtListObjects(ctx: *anyopaque, allocator: Allocator, in: storage.ListObjectsInput) storage.Error!storage.ListObjectsOutput {
     return listObjects(@ptrCast(@alignCast(ctx)), allocator, in);
@@ -187,6 +231,15 @@ fn vtListMultipartUploads(ctx: *anyopaque, allocator: Allocator, in: storage.Lis
 }
 fn vtListParts(ctx: *anyopaque, allocator: Allocator, in: storage.ListPartsInput) storage.Error!storage.ListPartsOutput {
     return listParts(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtGetBucketVersioning(ctx: *anyopaque, bucket: []const u8) storage.Error!storage.VersioningStatus {
+    return getBucketVersioning(@ptrCast(@alignCast(ctx)), bucket);
+}
+fn vtPutBucketVersioning(ctx: *anyopaque, bucket: []const u8, status: storage.VersioningStatus) storage.Error!void {
+    return putBucketVersioning(@ptrCast(@alignCast(ctx)), bucket, status);
+}
+fn vtListObjectVersions(ctx: *anyopaque, allocator: Allocator, in: storage.ListObjectVersionsInput) storage.Error!storage.ListObjectVersionsOutput {
+    return listObjectVersions(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +271,7 @@ pub fn createBucket(self: *Fs, name: []const u8) storage.Error!void {
         },
         .key_index = .empty,
         .uploads = std.StringHashMap(MultipartState).init(self.allocator),
+        .versions = std.StringHashMap(VersionChain).init(self.allocator),
     }) catch return storage.Error.OutOfMemory;
 
     saveRegistry(self) catch return storage.Error.Io;
@@ -274,23 +328,28 @@ pub fn putObject(self: *Fs, in: storage.PutObjectInput) storage.Error!storage.Pu
     defer self.mutex.unlock(self.io);
 
     const idx = findBucket(self, in.bucket) orelse return storage.Error.NoSuchBucket;
-    var slot = &self.buckets.items[idx];
+    const slot = &self.buckets.items[idx];
 
+    return switch (slot.versioning_status) {
+        .none => putObjectFlat(self, slot, in),
+        .enabled => putObjectVersioned(self, slot, in, false),
+        .suspended => putObjectVersioned(self, slot, in, true),
+    };
+}
+
+fn putObjectFlat(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput) storage.Error!storage.PutObjectOutput {
     const etag = etag_mod.computeEtag(self.allocator, in.body) catch return storage.Error.OutOfMemory;
     errdefer self.allocator.free(etag);
 
-    // Ensure the per-key dir exists.
     const hash = keyHash(in.key);
     var dir_buf: [4096]u8 = undefined;
     const key_dir = std.fmt.bufPrint(&dir_buf, "{s}/s3/{s}/objects/{s}", .{ self.base_dir, in.bucket, &hash }) catch return storage.Error.Io;
     Io.Dir.cwd().createDirPath(self.io, key_dir) catch return storage.Error.Io;
 
-    // 1. Atomically write data.
     var data_buf: [4096]u8 = undefined;
     const data_path = std.fmt.bufPrint(&data_buf, "{s}/data", .{key_dir}) catch return storage.Error.Io;
     writeAtomic(self.io, data_path, in.body) catch return storage.Error.Io;
 
-    // 2. Atomically write meta.json.
     const meta_doc = MetaDoc{
         .key = in.key,
         .size = in.body.len,
@@ -306,7 +365,6 @@ pub fn putObject(self: *Fs, in: storage.PutObjectInput) storage.Error!storage.Pu
     std.json.fmt(meta_doc, .{}).format(&aw.writer) catch return storage.Error.Io;
     writeAtomic(self.io, meta_path, aw.written()) catch return storage.Error.Io;
 
-    // 3. Insert into the sorted key index (only if new).
     if (!keyIndexContains(slot, in.key)) {
         const owned = self.allocator.dupe(u8, in.key) catch return storage.Error.OutOfMemory;
         errdefer self.allocator.free(owned);
@@ -314,38 +372,201 @@ pub fn putObject(self: *Fs, in: storage.PutObjectInput) storage.Error!storage.Pu
         slot.key_index.insert(self.allocator, pos, owned) catch return storage.Error.OutOfMemory;
     }
 
-    // Return etag owned by caller's allocator? — caller already saw it via the
-    // backend response; we hand back a copy that the caller frees. The slot
-    // doesn't retain `etag` (it's reloaded from meta.json on head/get).
     return .{ .etag = etag };
 }
 
-pub fn getObject(self: *Fs, allocator: Allocator, bucket: []const u8, key: []const u8) storage.Error!storage.GetObjectOutput {
-    try storage.validateObjectKey(key);
+fn putObjectVersioned(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput, suspended: bool) storage.Error!storage.PutObjectOutput {
+    const etag = etag_mod.computeEtag(self.allocator, in.body) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(etag);
+
+    // versionId: real id on Enabled; literal "null" on Suspended.
+    const version_id_owned: []u8 = if (suspended)
+        try self.allocator.dupe(u8, "null")
+    else
+        try newVersionId(self.io, self.allocator);
+    errdefer self.allocator.free(version_id_owned);
+
+    const hash = keyHash(in.key);
+    var versions_dir_buf: [4096]u8 = undefined;
+    const versions_dir = std.fmt.bufPrint(&versions_dir_buf, "{s}/s3/{s}/objects/{s}/versions/{s}", .{ self.base_dir, in.bucket, &hash, version_id_owned }) catch return storage.Error.Io;
+    Io.Dir.cwd().createDirPath(self.io, versions_dir) catch return storage.Error.Io;
+
+    // 1. Write data.
+    var data_buf: [4096]u8 = undefined;
+    const data_path = std.fmt.bufPrint(&data_buf, "{s}/data", .{versions_dir}) catch return storage.Error.Io;
+    writeAtomic(self.io, data_path, in.body) catch return storage.Error.Io;
+
+    // 2. Write meta.json.
+    const now = nowUnixSeconds(self.io);
+    const meta_doc = VersionedMetaDoc{
+        .key = in.key,
+        .size = in.body.len,
+        .etag = etag,
+        .content_type = in.content_type,
+        .last_modified_unix = now,
+        .user_metadata = in.user_metadata,
+        .is_delete_marker = false,
+    };
+    var meta_buf: [4096]u8 = undefined;
+    const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{versions_dir}) catch return storage.Error.Io;
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    std.json.fmt(meta_doc, .{}).format(&aw.writer) catch return storage.Error.Io;
+    writeAtomic(self.io, meta_path, aw.written()) catch return storage.Error.Io;
+
+    // 3. Update `current` pointer.
+    var key_dir_buf: [4096]u8 = undefined;
+    const key_dir = std.fmt.bufPrint(&key_dir_buf, "{s}/s3/{s}/objects/{s}", .{ self.base_dir, in.bucket, &hash }) catch return storage.Error.Io;
+    var current_path_buf: [4096]u8 = undefined;
+    const current_path = std.fmt.bufPrint(&current_path_buf, "{s}/current", .{key_dir}) catch return storage.Error.Io;
+    writeAtomic(self.io, current_path, version_id_owned) catch return storage.Error.Io;
+
+    // 4. In-memory chain update.
+    const chain_entry: VersionEntry = .{
+        .version_id = version_id_owned,
+        .is_delete_marker = false,
+        .etag = self.allocator.dupe(u8, etag) catch return storage.Error.OutOfMemory,
+        .size = in.body.len,
+        .content_type = self.allocator.dupe(u8, in.content_type) catch return storage.Error.OutOfMemory,
+        .last_modified_unix = now,
+        .user_metadata = try dupeHeadersStorage(self.allocator, in.user_metadata),
+    };
+
+    if (slot.versions.getPtr(in.key)) |chain| {
+        if (suspended) {
+            // Suspended: any prior "null" version gets overwritten on disk
+            // and replaced in the chain.
+            var i: usize = 0;
+            while (i < chain.items.len) : (i += 1) {
+                if (std.mem.eql(u8, chain.items[i].version_id, "null")) {
+                    var old = chain.orderedRemove(i);
+                    old.deinit(self.allocator);
+                    break;
+                }
+            }
+        }
+        chain.insert(self.allocator, 0, chain_entry) catch return storage.Error.OutOfMemory;
+    } else {
+        var chain: VersionChain = .empty;
+        chain.append(self.allocator, chain_entry) catch return storage.Error.OutOfMemory;
+        const key_owned = self.allocator.dupe(u8, in.key) catch return storage.Error.OutOfMemory;
+        slot.versions.put(key_owned, chain) catch return storage.Error.OutOfMemory;
+    }
+
+    // 5. Maintain sorted key_index (mirrors flat behaviour; presence ==
+    //    "key has a non-delete-marker current version visible").
+    if (!keyIndexContains(slot, in.key)) {
+        const owned = self.allocator.dupe(u8, in.key) catch return storage.Error.OutOfMemory;
+        const pos = std.sort.upperBound([]const u8, slot.key_index.items, in.key, orderSlices);
+        slot.key_index.insert(self.allocator, pos, owned) catch return storage.Error.OutOfMemory;
+    }
+
+    return .{
+        .etag = etag,
+        .version_id = self.allocator.dupe(u8, version_id_owned) catch return storage.Error.OutOfMemory,
+    };
+}
+
+/// Generate a 22-char base64-url-no-pad versionId from 16 random bytes.
+/// Same generator as multipart upload_id (PRD §M6 + §M8).
+fn newVersionId(io: Io, allocator: Allocator) ![]u8 {
+    var raw: [16]u8 = undefined;
+    io.random(&raw);
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const out = try allocator.alloc(u8, enc.calcSize(raw.len));
+    _ = enc.encode(out, &raw);
+    return out;
+}
+
+pub fn getObject(self: *Fs, allocator: Allocator, in: storage.GetObjectInput) storage.Error!storage.GetObjectOutput {
+    try storage.validateObjectKey(in.key);
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
 
-    _ = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
-    const meta = readMeta(self, allocator, bucket, key) catch |err| switch (err) {
-        error.FileNotFound => return storage.Error.NoSuchKey,
-        else => return storage.Error.Io,
+    const idx = findBucket(self, in.bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    if (slot.versioning_status == .none) {
+        // Flat read.
+        if (in.version_id) |_| return storage.Error.NoSuchKey; // versionId on unversioned bucket
+        const meta = readMeta(self, allocator, in.bucket, in.key) catch |err| switch (err) {
+            error.FileNotFound => return storage.Error.NoSuchKey,
+            else => return storage.Error.Io,
+        };
+        const hash = keyHash(in.key);
+        var path_buf: [4096]u8 = undefined;
+        const data_path = std.fmt.bufPrint(&path_buf, "{s}/s3/{s}/objects/{s}/data", .{ self.base_dir, in.bucket, &hash }) catch return storage.Error.Io;
+        const body = Io.Dir.cwd().readFileAlloc(self.io, data_path, allocator, .limited(5 * 1024 * 1024 * 1024)) catch return storage.Error.Io;
+        return .{ .meta = meta, .body = body };
+    }
+
+    // Versioned read.
+    const chain = slot.versions.get(in.key) orelse return storage.Error.NoSuchKey;
+    if (chain.items.len == 0) return storage.Error.NoSuchKey;
+    const v: VersionEntry = blk: {
+        if (in.version_id) |vid| {
+            for (chain.items) |entry| {
+                if (std.mem.eql(u8, entry.version_id, vid)) break :blk entry;
+            }
+            return storage.Error.NoSuchKey;
+        }
+        break :blk chain.items[0]; // current = newest
     };
 
-    const hash = keyHash(key);
+    // Surface delete markers via Object.is_delete_marker; caller (service
+    // layer) translates to 404 + headers.
+    const meta = try cloneVersionedMeta(allocator, in.key, v);
+    if (v.is_delete_marker) {
+        return .{ .meta = meta, .body = "" };
+    }
+
+    const hash = keyHash(in.key);
     var path_buf: [4096]u8 = undefined;
-    const data_path = std.fmt.bufPrint(&path_buf, "{s}/s3/{s}/objects/{s}/data", .{ self.base_dir, bucket, &hash }) catch return storage.Error.Io;
+    const data_path = std.fmt.bufPrint(&path_buf, "{s}/s3/{s}/objects/{s}/versions/{s}/data", .{ self.base_dir, in.bucket, &hash, v.version_id }) catch return storage.Error.Io;
     const body = Io.Dir.cwd().readFileAlloc(self.io, data_path, allocator, .limited(5 * 1024 * 1024 * 1024)) catch return storage.Error.Io;
     return .{ .meta = meta, .body = body };
 }
 
-pub fn headObject(self: *Fs, allocator: Allocator, bucket: []const u8, key: []const u8) storage.Error!storage.Object {
-    try storage.validateObjectKey(key);
+pub fn headObject(self: *Fs, allocator: Allocator, in: storage.HeadObjectInput) storage.Error!storage.Object {
+    try storage.validateObjectKey(in.key);
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
-    _ = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
-    return readMeta(self, allocator, bucket, key) catch |err| switch (err) {
-        error.FileNotFound => storage.Error.NoSuchKey,
-        else => storage.Error.Io,
+
+    const idx = findBucket(self, in.bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    if (slot.versioning_status == .none) {
+        if (in.version_id) |_| return storage.Error.NoSuchKey;
+        return readMeta(self, allocator, in.bucket, in.key) catch |err| switch (err) {
+            error.FileNotFound => storage.Error.NoSuchKey,
+            else => storage.Error.Io,
+        };
+    }
+
+    const chain = slot.versions.get(in.key) orelse return storage.Error.NoSuchKey;
+    if (chain.items.len == 0) return storage.Error.NoSuchKey;
+    const v: VersionEntry = blk: {
+        if (in.version_id) |vid| {
+            for (chain.items) |entry| {
+                if (std.mem.eql(u8, entry.version_id, vid)) break :blk entry;
+            }
+            return storage.Error.NoSuchKey;
+        }
+        break :blk chain.items[0];
+    };
+    return cloneVersionedMeta(allocator, in.key, v);
+}
+
+fn cloneVersionedMeta(allocator: Allocator, key: []const u8, v: VersionEntry) storage.Error!storage.Object {
+    return .{
+        .key = allocator.dupe(u8, key) catch return storage.Error.OutOfMemory,
+        .size = v.size,
+        .etag = allocator.dupe(u8, v.etag) catch return storage.Error.OutOfMemory,
+        .content_type = allocator.dupe(u8, v.content_type) catch return storage.Error.OutOfMemory,
+        .last_modified_unix = v.last_modified_unix,
+        .user_metadata = try dupeHeadersStorage(allocator, v.user_metadata),
+        .version_id = allocator.dupe(u8, v.version_id) catch return storage.Error.OutOfMemory,
+        .is_delete_marker = v.is_delete_marker,
     };
 }
 
@@ -436,26 +657,513 @@ fn freeObjectMetaOwned(gpa: Allocator, o: storage.Object) void {
     gpa.free(o.user_metadata);
 }
 
-pub fn deleteObject(self: *Fs, bucket: []const u8, key: []const u8) storage.Error!void {
-    try storage.validateObjectKey(key);
+pub fn deleteObject(self: *Fs, in: storage.DeleteObjectInput) storage.Error!storage.DeleteObjectOutput {
+    try storage.validateObjectKey(in.key);
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
-    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
-    var slot = &self.buckets.items[idx];
+    const idx = findBucket(self, in.bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
 
-    const hash = keyHash(key);
+    if (slot.versioning_status == .none) return deleteObjectFlat(self, slot, in);
+
+    // Versioned bucket.
+    if (in.version_id) |vid| {
+        return deleteVersion(self, slot, in.bucket, in.key, vid);
+    }
+    return createDeleteMarker(self, slot, in.bucket, in.key);
+}
+
+fn deleteObjectFlat(self: *Fs, slot: *BucketSlot, in: storage.DeleteObjectInput) storage.Error!storage.DeleteObjectOutput {
+    const hash = keyHash(in.key);
     var path_buf: [4096]u8 = undefined;
-    const key_dir = std.fmt.bufPrint(&path_buf, "{s}/s3/{s}/objects/{s}", .{ self.base_dir, bucket, &hash }) catch return storage.Error.Io;
-    // deleteTree is already idempotent on a missing path.
+    const key_dir = std.fmt.bufPrint(&path_buf, "{s}/s3/{s}/objects/{s}", .{ self.base_dir, in.bucket, &hash }) catch return storage.Error.Io;
     Io.Dir.cwd().deleteTree(self.io, key_dir) catch return storage.Error.Io;
 
-    // Remove from sorted index.
+    for (slot.key_index.items, 0..) |k, i| {
+        if (std.mem.eql(u8, k, in.key)) {
+            self.allocator.free(slot.key_index.orderedRemove(i));
+            break;
+        }
+    }
+    return .{ .version_id = "", .delete_marker = false };
+}
+
+/// Permanently remove one specific version. If it was the current version,
+/// the next-newest version becomes current (or the key is fully removed if
+/// no versions remain).
+fn deleteVersion(self: *Fs, slot: *BucketSlot, bucket: []const u8, key: []const u8, version_id: []const u8) storage.Error!storage.DeleteObjectOutput {
+    const chain = slot.versions.getPtr(key) orelse return storage.Error.NoSuchKey;
+    var removed_idx: ?usize = null;
+    for (chain.items, 0..) |entry, i| {
+        if (std.mem.eql(u8, entry.version_id, version_id)) {
+            removed_idx = i;
+            break;
+        }
+    }
+    const idx = removed_idx orelse return storage.Error.NoSuchKey;
+    const was_delete_marker = chain.items[idx].is_delete_marker;
+    var removed = chain.orderedRemove(idx);
+    removed.deinit(self.allocator);
+
+    // Remove the on-disk version dir.
+    const hash = keyHash(key);
+    var path_buf: [4096]u8 = undefined;
+    const version_dir = std.fmt.bufPrint(&path_buf, "{s}/s3/{s}/objects/{s}/versions/{s}", .{ self.base_dir, bucket, &hash, version_id }) catch return storage.Error.Io;
+    Io.Dir.cwd().deleteTree(self.io, version_dir) catch {};
+
+    // If the chain is now empty, also remove the key entry and the
+    // `current` pointer file.
+    var key_dir_buf: [4096]u8 = undefined;
+    const key_dir = std.fmt.bufPrint(&key_dir_buf, "{s}/s3/{s}/objects/{s}", .{ self.base_dir, bucket, &hash }) catch return storage.Error.Io;
+    if (chain.items.len == 0) {
+        Io.Dir.cwd().deleteTree(self.io, key_dir) catch {};
+        // Drop from versions map.
+        if (slot.versions.fetchRemove(key)) |kv| {
+            self.allocator.free(kv.key);
+            var c = kv.value;
+            c.deinit(self.allocator);
+        }
+        // Drop from key_index.
+        for (slot.key_index.items, 0..) |k, i| {
+            if (std.mem.eql(u8, k, key)) {
+                self.allocator.free(slot.key_index.orderedRemove(i));
+                break;
+            }
+        }
+    } else {
+        // Rewrite the `current` pointer to the new newest version.
+        const new_current = chain.items[0].version_id;
+        var current_path_buf: [4096]u8 = undefined;
+        const current_path = std.fmt.bufPrint(&current_path_buf, "{s}/current", .{key_dir}) catch return storage.Error.Io;
+        writeAtomic(self.io, current_path, new_current) catch return storage.Error.Io;
+        // If the new current is a delete marker, the key shouldn't appear
+        // in ListObjects; pull it from key_index.
+        const new_is_marker = chain.items[0].is_delete_marker;
+        if (new_is_marker) {
+            for (slot.key_index.items, 0..) |k, i| {
+                if (std.mem.eql(u8, k, key)) {
+                    self.allocator.free(slot.key_index.orderedRemove(i));
+                    break;
+                }
+            }
+        } else if (!keyIndexContains(slot, key)) {
+            const owned = self.allocator.dupe(u8, key) catch return storage.Error.OutOfMemory;
+            const pos = std.sort.upperBound([]const u8, slot.key_index.items, key, orderSlices);
+            slot.key_index.insert(self.allocator, pos, owned) catch return storage.Error.OutOfMemory;
+        }
+    }
+
+    return .{
+        .version_id = self.allocator.dupe(u8, version_id) catch return storage.Error.OutOfMemory,
+        .delete_marker = was_delete_marker,
+    };
+}
+
+/// Insert a delete-marker version. Generates a fresh versionId, writes a
+/// tombstone meta.json (no data file), updates the `current` pointer,
+/// and pulls the key out of `key_index` (so ListObjects hides it).
+fn createDeleteMarker(self: *Fs, slot: *BucketSlot, bucket: []const u8, key: []const u8) storage.Error!storage.DeleteObjectOutput {
+    const suspended = slot.versioning_status == .suspended;
+    const version_id_owned: []u8 = if (suspended)
+        try self.allocator.dupe(u8, "null")
+    else
+        try newVersionId(self.io, self.allocator);
+    errdefer self.allocator.free(version_id_owned);
+
+    const hash = keyHash(key);
+    var dir_buf: [4096]u8 = undefined;
+    const version_dir = std.fmt.bufPrint(&dir_buf, "{s}/s3/{s}/objects/{s}/versions/{s}", .{ self.base_dir, bucket, &hash, version_id_owned }) catch return storage.Error.Io;
+    Io.Dir.cwd().createDirPath(self.io, version_dir) catch return storage.Error.Io;
+
+    const now = nowUnixSeconds(self.io);
+    const meta_doc = VersionedMetaDoc{
+        .key = key,
+        .size = 0,
+        .etag = "",
+        .content_type = "",
+        .last_modified_unix = now,
+        .user_metadata = &.{},
+        .is_delete_marker = true,
+    };
+    var meta_buf: [4096]u8 = undefined;
+    const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{version_dir}) catch return storage.Error.Io;
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    std.json.fmt(meta_doc, .{}).format(&aw.writer) catch return storage.Error.Io;
+    writeAtomic(self.io, meta_path, aw.written()) catch return storage.Error.Io;
+
+    // Update `current`.
+    var key_dir_buf: [4096]u8 = undefined;
+    const key_dir = std.fmt.bufPrint(&key_dir_buf, "{s}/s3/{s}/objects/{s}", .{ self.base_dir, bucket, &hash }) catch return storage.Error.Io;
+    Io.Dir.cwd().createDirPath(self.io, key_dir) catch return storage.Error.Io;
+    var current_path_buf: [4096]u8 = undefined;
+    const current_path = std.fmt.bufPrint(&current_path_buf, "{s}/current", .{key_dir}) catch return storage.Error.Io;
+    writeAtomic(self.io, current_path, version_id_owned) catch return storage.Error.Io;
+
+    // In-memory chain: prepend new delete marker. For Suspended, overwrite
+    // any prior "null".
+    const chain_entry: VersionEntry = .{
+        .version_id = version_id_owned,
+        .is_delete_marker = true,
+        .etag = self.allocator.dupe(u8, "") catch return storage.Error.OutOfMemory,
+        .size = 0,
+        .content_type = self.allocator.dupe(u8, "") catch return storage.Error.OutOfMemory,
+        .last_modified_unix = now,
+        .user_metadata = try dupeHeadersStorage(self.allocator, &.{}),
+    };
+
+    if (slot.versions.getPtr(key)) |chain| {
+        if (suspended) {
+            var i: usize = 0;
+            while (i < chain.items.len) : (i += 1) {
+                if (std.mem.eql(u8, chain.items[i].version_id, "null")) {
+                    var old = chain.orderedRemove(i);
+                    old.deinit(self.allocator);
+                    break;
+                }
+            }
+        }
+        chain.insert(self.allocator, 0, chain_entry) catch return storage.Error.OutOfMemory;
+    } else {
+        var chain: VersionChain = .empty;
+        chain.append(self.allocator, chain_entry) catch return storage.Error.OutOfMemory;
+        const key_owned = self.allocator.dupe(u8, key) catch return storage.Error.OutOfMemory;
+        slot.versions.put(key_owned, chain) catch return storage.Error.OutOfMemory;
+    }
+
+    // Pull the key from key_index — its current version is now a delete
+    // marker, so it shouldn't show up in ListObjects.
     for (slot.key_index.items, 0..) |k, i| {
         if (std.mem.eql(u8, k, key)) {
             self.allocator.free(slot.key_index.orderedRemove(i));
             break;
         }
     }
+
+    return .{
+        .version_id = self.allocator.dupe(u8, version_id_owned) catch return storage.Error.OutOfMemory,
+        .delete_marker = true,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Versioning (M8)
+
+pub fn getBucketVersioning(self: *Fs, bucket: []const u8) storage.Error!storage.VersioningStatus {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    return self.buckets.items[idx].versioning_status;
+}
+
+pub fn putBucketVersioning(self: *Fs, bucket: []const u8, status: storage.VersioningStatus) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+
+    // PutBucketVersioning never resets to `.none` (AWS doesn't expose that
+    // in the wire format). Callers should reject `.none` at the service
+    // layer; we treat it as a no-op here defensively.
+    if (status == .none) return;
+
+    const prev = slot.versioning_status;
+    if (prev == .none and status == .enabled) {
+        // Migrate every existing object under this bucket from flat
+        // `<key-hash>/{data,meta.json}` to `<key-hash>/versions/null/{...}`
+        // and populate the in-memory chain.
+        migrateNoneToEnabled(self, slot) catch return storage.Error.Io;
+    }
+    slot.versioning_status = status;
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+/// Walks every object directory under the bucket, moves the flat
+/// `{data, meta.json}` pair into `versions/null/`, writes `current = "null"`,
+/// and populates the in-memory `versions` chain. Idempotent: if a key
+/// already has a `versions/` subdir, it's left alone.
+fn migrateNoneToEnabled(self: *Fs, slot: *BucketSlot) !void {
+    var buf: [4096]u8 = undefined;
+    const objects_path = try std.fmt.bufPrint(&buf, "{s}/s3/{s}/objects", .{ self.base_dir, slot.meta.name });
+    var dir = Io.Dir.cwd().openDir(self.io, objects_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return, // no objects yet
+        else => return err,
+    };
+    defer dir.close(self.io);
+
+    var it = dir.iterate();
+    while (try it.next(self.io)) |entry| {
+        if (entry.kind != .directory) continue;
+        var key_dir_buf: [4096]u8 = undefined;
+        const key_dir = try std.fmt.bufPrint(&key_dir_buf, "{s}/{s}", .{ objects_path, entry.name });
+        var vbuf: [4096]u8 = undefined;
+        const versions_dir = try std.fmt.bufPrint(&vbuf, "{s}/versions/null", .{key_dir});
+
+        // Skip if already migrated.
+        if (dirExists(self.io, versions_dir)) continue;
+
+        // Read the existing meta.json to populate the in-memory chain.
+        var meta_path_buf: [4096]u8 = undefined;
+        const meta_path = try std.fmt.bufPrint(&meta_path_buf, "{s}/meta.json", .{key_dir});
+        const meta_bytes = Io.Dir.cwd().readFileAlloc(self.io, meta_path, self.allocator, .limited(4 * 1024 * 1024)) catch continue;
+        defer self.allocator.free(meta_bytes);
+        var parsed = std.json.parseFromSlice(MetaDoc, self.allocator, meta_bytes, .{ .ignore_unknown_fields = true }) catch continue;
+        defer parsed.deinit();
+        const md = parsed.value;
+
+        // Move both files into versions/null/. Use createDirPath +
+        // rename (atomic on same fs).
+        Io.Dir.cwd().createDirPath(self.io, versions_dir) catch return storage.Error.Io;
+
+        var src_data: [4096]u8 = undefined;
+        const src_data_path = try std.fmt.bufPrint(&src_data, "{s}/data", .{key_dir});
+        var dst_data: [4096]u8 = undefined;
+        const dst_data_path = try std.fmt.bufPrint(&dst_data, "{s}/data", .{versions_dir});
+        Io.Dir.renameAbsolute(src_data_path, dst_data_path, self.io) catch return storage.Error.Io;
+
+        var dst_meta: [4096]u8 = undefined;
+        const dst_meta_path = try std.fmt.bufPrint(&dst_meta, "{s}/meta.json", .{versions_dir});
+        Io.Dir.renameAbsolute(meta_path, dst_meta_path, self.io) catch return storage.Error.Io;
+
+        // Write the `current` pointer.
+        var current_path_buf: [4096]u8 = undefined;
+        const current_path = try std.fmt.bufPrint(&current_path_buf, "{s}/current", .{key_dir});
+        try writeAtomic(self.io, current_path, "null");
+
+        // Populate in-memory chain (newest-first; chain has one entry).
+        var chain: VersionChain = .empty;
+        const v: VersionEntry = .{
+            .version_id = try self.allocator.dupe(u8, "null"),
+            .is_delete_marker = false,
+            .etag = try self.allocator.dupe(u8, md.etag),
+            .size = md.size,
+            .content_type = try self.allocator.dupe(u8, md.content_type),
+            .last_modified_unix = md.last_modified_unix,
+            .user_metadata = try dupeHeadersStorage(self.allocator, md.user_metadata),
+        };
+        try chain.append(self.allocator, v);
+        const key_owned = try self.allocator.dupe(u8, md.key);
+        try slot.versions.put(key_owned, chain);
+    }
+}
+
+fn dirExists(io: Io, path: []const u8) bool {
+    var d = Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    d.close(io);
+    return true;
+}
+
+/// On startup, walks `<bucket>/objects/*/versions/*/` for each key and
+/// populates `slot.versions` with the chain (newest-first by
+/// `last_modified_unix`).
+fn rebuildVersionIndex(self: *Fs, slot: *BucketSlot) !void {
+    var buf: [4096]u8 = undefined;
+    const objects_path = try std.fmt.bufPrint(&buf, "{s}/s3/{s}/objects", .{ self.base_dir, slot.meta.name });
+    var top = Io.Dir.cwd().openDir(self.io, objects_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer top.close(self.io);
+
+    var top_it = top.iterate();
+    while (try top_it.next(self.io)) |entry| {
+        if (entry.kind != .directory) continue;
+        var versions_buf: [4096]u8 = undefined;
+        const versions_path = std.fmt.bufPrint(&versions_buf, "{s}/{s}/versions", .{ objects_path, entry.name }) catch continue;
+        var versions_dir = Io.Dir.cwd().openDir(self.io, versions_path, .{ .iterate = true }) catch continue;
+        defer versions_dir.close(self.io);
+
+        var chain: VersionChain = .empty;
+        errdefer {
+            for (chain.items) |*v| v.deinit(self.allocator);
+            chain.deinit(self.allocator);
+        }
+
+        var key_buf: ?[]u8 = null;
+        var vit = versions_dir.iterate();
+        while (try vit.next(self.io)) |v_entry| {
+            if (v_entry.kind != .directory) continue;
+            var meta_buf: [4096]u8 = undefined;
+            const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/{s}/meta.json", .{ versions_path, v_entry.name }) catch continue;
+            const meta_bytes = Io.Dir.cwd().readFileAlloc(self.io, meta_path, self.allocator, .limited(4 * 1024 * 1024)) catch continue;
+            defer self.allocator.free(meta_bytes);
+
+            var parsed = std.json.parseFromSlice(VersionedMetaDoc, self.allocator, meta_bytes, .{ .ignore_unknown_fields = true }) catch continue;
+            defer parsed.deinit();
+            const md = parsed.value;
+
+            if (key_buf == null) key_buf = try self.allocator.dupe(u8, md.key);
+
+            const v: VersionEntry = .{
+                .version_id = try self.allocator.dupe(u8, v_entry.name),
+                .is_delete_marker = md.is_delete_marker,
+                .etag = try self.allocator.dupe(u8, md.etag),
+                .size = md.size,
+                .content_type = try self.allocator.dupe(u8, md.content_type),
+                .last_modified_unix = md.last_modified_unix,
+                .user_metadata = try dupeHeadersStorage(self.allocator, md.user_metadata),
+            };
+            try chain.append(self.allocator, v);
+        }
+
+        if (chain.items.len == 0 or key_buf == null) {
+            chain.deinit(self.allocator);
+            if (key_buf) |k| self.allocator.free(k);
+            continue;
+        }
+        // Sort newest-first by last_modified_unix.
+        std.mem.sort(VersionEntry, chain.items, {}, struct {
+            fn lt(_: void, a: VersionEntry, b: VersionEntry) bool {
+                return a.last_modified_unix > b.last_modified_unix;
+            }
+        }.lt);
+        try slot.versions.put(key_buf.?, chain);
+    }
+}
+
+/// On-disk version meta.json schema. Same fields as the flat MetaDoc plus
+/// `is_delete_marker` so we can persist tombstones.
+const VersionedMetaDoc = struct {
+    key: []const u8,
+    size: usize,
+    etag: []const u8,
+    content_type: []const u8,
+    last_modified_unix: i64,
+    user_metadata: []const storage.Header,
+    is_delete_marker: bool = false,
+};
+
+pub fn listObjectVersions(self: *Fs, allocator: Allocator, in: storage.ListObjectVersionsInput) storage.Error!storage.ListObjectVersionsOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, in.bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    // Collect every (key, version) into a flat list, sort by (key asc,
+    // version newest-first within key). For unversioned buckets the
+    // result is empty.
+    var keys_sorted: std.ArrayList([]const u8) = .empty;
+    defer keys_sorted.deinit(allocator);
+    {
+        var it = slot.versions.iterator();
+        while (it.next()) |entry| {
+            keys_sorted.append(allocator, entry.key_ptr.*) catch return storage.Error.OutOfMemory;
+        }
+    }
+    std.mem.sort([]const u8, keys_sorted.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+
+    var out: std.ArrayList(storage.ObjectVersion) = .empty;
+    errdefer {
+        for (out.items) |v| {
+            allocator.free(v.key);
+            allocator.free(v.version_id);
+            allocator.free(v.etag);
+        }
+        out.deinit(allocator);
+    }
+    var prefixes: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (prefixes.items) |p| allocator.free(p);
+        prefixes.deinit(allocator);
+    }
+
+    var truncated = false;
+    var last_key: []const u8 = "";
+    var last_vid: []const u8 = "";
+    const limit: usize = if (in.max_keys > 1000) 1000 else in.max_keys;
+
+    outer: for (keys_sorted.items) |k| {
+        if (in.prefix.len > 0 and !std.mem.startsWith(u8, k, in.prefix)) continue;
+
+        // Delimiter rollup — group every key whose suffix (after prefix) contains
+        // the delimiter, contribute one CommonPrefixes entry.
+        if (in.delimiter.len > 0) {
+            const after = k[in.prefix.len..];
+            if (std.mem.indexOf(u8, after, in.delimiter)) |off| {
+                const cp_end = in.prefix.len + off + in.delimiter.len;
+                const cp = k[0..cp_end];
+                if (prefixes.items.len == 0 or !std.mem.eql(u8, prefixes.items[prefixes.items.len - 1], cp)) {
+                    if (out.items.len + prefixes.items.len >= limit) {
+                        truncated = true;
+                        break :outer;
+                    }
+                    const owned = allocator.dupe(u8, cp) catch return storage.Error.OutOfMemory;
+                    prefixes.append(allocator, owned) catch return storage.Error.OutOfMemory;
+                    last_key = k;
+                    last_vid = "";
+                }
+                continue;
+            }
+        }
+
+        const chain = slot.versions.get(k).?;
+        for (chain.items, 0..) |v, i| {
+            // Pagination: skip entries on or before (key_marker, version_id_marker).
+            if (in.key_marker.len > 0) {
+                const cmp = std.mem.order(u8, k, in.key_marker);
+                if (cmp == .lt) continue;
+                if (cmp == .eq and in.version_id_marker.len > 0) {
+                    // We need to skip up through and including version_id_marker.
+                    // Use linear scan within the chain: only emit entries that
+                    // appear *after* version_id_marker in newest-first order.
+                    var seen_marker = false;
+                    for (chain.items[0..i]) |earlier| {
+                        if (std.mem.eql(u8, earlier.version_id, in.version_id_marker)) {
+                            seen_marker = true;
+                            break;
+                        }
+                    }
+                    if (!seen_marker) continue;
+                }
+            }
+
+            if (out.items.len + prefixes.items.len >= limit) {
+                truncated = true;
+                break :outer;
+            }
+            const k_dup = allocator.dupe(u8, k) catch return storage.Error.OutOfMemory;
+            const id_dup = allocator.dupe(u8, v.version_id) catch {
+                allocator.free(k_dup);
+                return storage.Error.OutOfMemory;
+            };
+            const etag_dup = allocator.dupe(u8, v.etag) catch {
+                allocator.free(k_dup);
+                allocator.free(id_dup);
+                return storage.Error.OutOfMemory;
+            };
+            out.append(allocator, .{
+                .key = k_dup,
+                .version_id = id_dup,
+                .is_latest = (i == 0),
+                .is_delete_marker = v.is_delete_marker,
+                .last_modified_unix = v.last_modified_unix,
+                .etag = etag_dup,
+                .size = v.size,
+            }) catch {
+                allocator.free(k_dup);
+                allocator.free(id_dup);
+                allocator.free(etag_dup);
+                return storage.Error.OutOfMemory;
+            };
+            last_key = k;
+            last_vid = v.version_id;
+        }
+    }
+
+    const next_key_owned: []const u8 = if (truncated) (allocator.dupe(u8, last_key) catch return storage.Error.OutOfMemory) else "";
+    const next_vid_owned: []const u8 = if (truncated) (allocator.dupe(u8, last_vid) catch return storage.Error.OutOfMemory) else "";
+
+    return .{
+        .versions = out.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory,
+        .common_prefixes = prefixes.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory,
+        .is_truncated = truncated,
+        .next_key_marker = next_key_owned,
+        .next_version_id_marker = next_vid_owned,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +1227,9 @@ const BucketRecord = struct {
     name: []const u8,
     region: []const u8,
     created_unix: i64,
+    /// M8. Missing/null on records from earlier versions is treated as
+    /// `.none` (default for unversioned buckets).
+    versioning: ?[]const u8 = null,
 };
 
 const MetaDoc = struct {
@@ -548,6 +1259,10 @@ fn loadRegistry(self: *Fs) !void {
         errdefer self.allocator.free(name_owned);
         const region_owned = try self.allocator.dupe(u8, rec.region);
         errdefer self.allocator.free(region_owned);
+        const versioning: storage.VersioningStatus = if (rec.versioning) |v|
+            (if (std.mem.eql(u8, v, "enabled")) .enabled else if (std.mem.eql(u8, v, "suspended")) .suspended else .none)
+        else
+            .none;
         var slot: BucketSlot = .{
             .meta = .{
                 .name = name_owned,
@@ -556,11 +1271,15 @@ fn loadRegistry(self: *Fs) !void {
             },
             .key_index = .empty,
             .uploads = std.StringHashMap(MultipartState).init(self.allocator),
+            .versioning_status = versioning,
+            .versions = std.StringHashMap(VersionChain).init(self.allocator),
         };
         // Walk objects/ to rebuild the in-memory key index from meta.json files.
         try rebuildKeyIndex(self, &slot);
         // Walk multipart/ to repopulate the in-memory upload index from manifests.
         try rebuildUploadIndex(self, &slot);
+        // For versioned buckets, walk objects/*/versions/* to rebuild the chains.
+        if (versioning != .none) try rebuildVersionIndex(self, &slot);
         try self.buckets.append(self.allocator, slot);
     }
 }
@@ -632,7 +1351,17 @@ fn saveRegistry(self: *Fs) !void {
     var records = try self.allocator.alloc(BucketRecord, self.buckets.items.len);
     defer self.allocator.free(records);
     for (self.buckets.items, 0..) |b, i| {
-        records[i] = .{ .name = b.meta.name, .region = b.meta.region, .created_unix = b.meta.created_unix };
+        const versioning_str: ?[]const u8 = switch (b.versioning_status) {
+            .none => null,
+            .enabled => "enabled",
+            .suspended => "suspended",
+        };
+        records[i] = .{
+            .name = b.meta.name,
+            .region = b.meta.region,
+            .created_unix = b.meta.created_unix,
+            .versioning = versioning_str,
+        };
     }
     const doc: RegistryDoc = .{ .version = registry_version, .buckets = records };
 
@@ -1236,14 +1965,14 @@ test "fs: put + head + get + delete object" {
     testing.allocator.free(out.etag);
 
     {
-        const meta = try fs.headObject(testing.allocator, "bkt", "hello.txt");
+        const meta = try fs.headObject(testing.allocator, .{ .bucket = "bkt", .key = "hello.txt" });
         defer freeObjectMeta(meta);
         try testing.expectEqual(@as(u64, "hello world".len), meta.size);
         try testing.expectEqualStrings("text/plain", meta.content_type);
     }
 
     {
-        const got = try fs.getObject(testing.allocator, "bkt", "hello.txt");
+        const got = try fs.getObject(testing.allocator, .{ .bucket = "bkt", .key = "hello.txt" });
         defer {
             testing.allocator.free(got.body);
             freeObjectMeta(got.meta);
@@ -1251,9 +1980,9 @@ test "fs: put + head + get + delete object" {
         try testing.expectEqualStrings("hello world", got.body);
     }
 
-    try fs.deleteObject("bkt", "hello.txt");
-    try testing.expectError(storage.Error.NoSuchKey, fs.headObject(testing.allocator, "bkt", "hello.txt"));
-    try fs.deleteObject("bkt", "hello.txt"); // idempotent
+    _ = try fs.deleteObject(.{ .bucket = "bkt", .key = "hello.txt" });
+    try testing.expectError(storage.Error.NoSuchKey, fs.headObject(testing.allocator, .{ .bucket = "bkt", .key = "hello.txt" }));
+    _ = try fs.deleteObject(.{ .bucket = "bkt", .key = "hello.txt" }); // idempotent
 }
 
 test "fs: deleteBucket with object → BucketNotEmpty" {

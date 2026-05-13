@@ -56,7 +56,7 @@ pub const App = struct {
         // ---------- SigV4 verification ----------
         if (!self.config.no_auth) {
             const verify_headers = collectHeaders(arena, req) catch {
-                return respondError(res, request_id, host_id, .internal_error, req.url.path);
+                return respondError(res, request_id, host_id, .internal_error, req.url.path, &.{});
             };
             sigv4.verify(arena, .{
                 .method = method_str,
@@ -73,7 +73,7 @@ pub const App = struct {
                 .now_unix = fs_backend.nowUnixSeconds(self.io),
                 .skew_tolerance_seconds = self.config.skew_seconds,
             }) catch |err| {
-                return respondError(res, request_id, host_id, mapVerifyError(err), req.url.path);
+                return respondError(res, request_id, host_id, mapVerifyError(err), req.url.path, &.{});
             };
         }
 
@@ -84,9 +84,9 @@ pub const App = struct {
         // Same shape, just a cast — but Zig 0.16 won't let us @ptrCast slices
         // of different declared types, so rebuild explicitly.
         const all_headers = collectHeaders(arena, req) catch
-            return respondError(res, request_id, host_id, .internal_error, req.url.path);
+            return respondError(res, request_id, host_id, .internal_error, req.url.path, &.{});
         const svc_headers = arena.alloc(storage.Header, all_headers.len) catch
-            return respondError(res, request_id, host_id, .internal_error, req.url.path);
+            return respondError(res, request_id, host_id, .internal_error, req.url.path, &.{});
         for (all_headers, 0..) |h, i| svc_headers[i] = .{ .name = h.name, .value = h.value };
 
         const range_header = req.header("range");
@@ -106,7 +106,15 @@ pub const App = struct {
 
         switch (result) {
             .ok => |out| respondOk(res, request_id, host_id, out),
-            .err => |code| respondError(res, request_id, host_id, code, req.url.path),
+            .err => |code| respondError(res, request_id, host_id, code, req.url.path, &.{}),
+            .err_with_headers => |ewh| {
+                // s3.Header and storage.Header are layout-compatible; bridge.
+                const extras = arena.alloc(storage.Header, ewh.extra_headers.len) catch {
+                    return respondError(res, request_id, host_id, .internal_error, req.url.path, &.{});
+                };
+                for (ewh.extra_headers, 0..) |h, i| extras[i] = .{ .name = h.name, .value = h.value };
+                respondError(res, request_id, host_id, ewh.code, req.url.path, extras);
+            },
         }
     }
 };
@@ -179,6 +187,7 @@ fn respondError(
     host_id: []const u8,
     code: errors.Code,
     resource: ?[]const u8,
+    extra_headers: []const storage.Header,
 ) void {
     // RFC 9110 §15.4.5: 304 responses MUST NOT carry a body and the server
     // SHOULD suppress entity headers like Content-Type. AWS S3 follows
@@ -187,6 +196,7 @@ fn respondError(
         res.status = 304;
         res.header("x-amz-request-id", request_id);
         res.header("x-amz-id-2", host_id);
+        for (extra_headers) |h| res.header(h.name, h.value);
         res.content_type = null;
         res.body = "";
         return;
@@ -204,6 +214,7 @@ fn respondError(
     res.status = code.httpStatus();
     res.header("x-amz-request-id", request_id);
     res.header("x-amz-id-2", host_id);
+    for (extra_headers) |h| res.header(h.name, h.value);
     res.header("Content-Type", "application/xml");
     res.content_type = null;
     res.body = body;

@@ -86,7 +86,7 @@ fn uploadPartCopy(ctx: Context, dest_bucket: []const u8, dest_key: []const u8, u
     const source_key = stripped[slash + 1 ..];
     if (source_bucket.len == 0 or source_key.len == 0) return .{ .err = .invalid_request };
 
-    const source_obj = ctx.backend.getObject(ctx.allocator, source_bucket, source_key) catch |err|
+    const source_obj = ctx.backend.getObject(ctx.allocator, .{ .bucket = source_bucket, .key = source_key }) catch |err|
         return .{ .err = mod.mapStorageErr(err) };
 
     switch (preconditions.forCopySource(ctx.request.headers, .{
@@ -123,7 +123,7 @@ pub fn completeMultipartUpload(ctx: Context, bucket: []const u8, key: []const u8
         mod.findHeader(ctx.request.headers, "if-none-match") != null)
     {
         var subj: preconditions.Subject = .{};
-        if (ctx.backend.headObject(ctx.allocator, bucket, key)) |meta| {
+        if (ctx.backend.headObject(ctx.allocator, .{ .bucket = bucket, .key = key })) |meta| {
             subj = .{ .etag = meta.etag, .last_modified_unix = meta.last_modified_unix, .exists = true };
         } else |err| switch (err) {
             storage.Error.NoSuchKey => {},

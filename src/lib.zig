@@ -9,6 +9,9 @@ pub const list_objects = @import("wire/list_objects.zig");
 pub const delete_objects_parser = @import("wire/delete_objects_parser.zig");
 pub const complete_multipart_parser = @import("wire/complete_multipart_parser.zig");
 pub const multipart_responses = @import("wire/multipart_responses.zig");
+pub const versioning_config_parser = @import("wire/versioning_config_parser.zig");
+pub const versioning_responses = @import("wire/versioning_responses.zig");
+pub const list_object_versions = @import("wire/list_object_versions.zig");
 pub const router = @import("router.zig");
 pub const http_range = @import("http/range.zig");
 pub const http_date = @import("http/date.zig");
@@ -23,6 +26,7 @@ pub const storage_etag = @import("storage/etag.zig");
 pub const s3 = @import("services/s3/mod.zig");
 pub const preconditions = @import("services/s3/preconditions.zig");
 pub const multipart_service = @import("services/s3/multipart.zig");
+pub const versioning_service = @import("services/s3/versioning.zig");
 pub const cli = @import("cli.zig");
 pub const version = @import("version.zig");
 
@@ -35,6 +39,9 @@ test {
     _ = delete_objects_parser;
     _ = complete_multipart_parser;
     _ = multipart_responses;
+    _ = versioning_config_parser;
+    _ = versioning_responses;
+    _ = list_object_versions;
     _ = router;
     _ = http_range;
     _ = http_date;
@@ -49,6 +56,7 @@ test {
     _ = s3;
     _ = preconditions;
     _ = multipart_service;
+    _ = versioning_service;
     _ = cli;
     _ = version;
 }

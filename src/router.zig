@@ -24,6 +24,9 @@ pub const Operation = enum {
     abort_multipart_upload,
     list_parts,
     list_multipart_uploads,
+    put_bucket_versioning,
+    get_bucket_versioning,
+    list_object_versions,
     unknown,
 };
 
@@ -92,11 +95,16 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
 
     if (eql(method, "GET") and !has_bucket) return .list_buckets;
     if (eql(method, "GET") and has_bucket) {
+        if (hasQueryParam(query, "versioning")) return .get_bucket_versioning;
+        if (hasQueryParam(query, "versions")) return .list_object_versions;
         if (hasQueryParam(query, "uploads")) return .list_multipart_uploads;
         if (queryParamEquals(query, "list-type", "2")) return .list_objects_v2;
         return .list_objects;
     }
-    if (eql(method, "PUT") and has_bucket) return .create_bucket;
+    if (eql(method, "PUT") and has_bucket) {
+        if (hasQueryParam(query, "versioning")) return .put_bucket_versioning;
+        return .create_bucket;
+    }
     if (eql(method, "DELETE") and has_bucket) return .delete_bucket;
     if (eql(method, "HEAD") and has_bucket) return .head_bucket;
 
@@ -284,6 +292,21 @@ test "multipart: DELETE /b/k?uploadId=X → abort_multipart_upload" {
 test "multipart: GET /b/k?uploadId=X → list_parts" {
     const p = parse("GET", "localhost", "/buk/k", "uploadId=abc");
     try testing.expectEqual(Operation.list_parts, p.op);
+}
+
+test "versioning: PUT /b?versioning → put_bucket_versioning" {
+    const p = parse("PUT", "localhost", "/buk", "versioning");
+    try testing.expectEqual(Operation.put_bucket_versioning, p.op);
+}
+
+test "versioning: GET /b?versioning → get_bucket_versioning" {
+    const p = parse("GET", "localhost", "/buk", "versioning");
+    try testing.expectEqual(Operation.get_bucket_versioning, p.op);
+}
+
+test "versioning: GET /b?versions → list_object_versions" {
+    const p = parse("GET", "localhost", "/buk", "versions");
+    try testing.expectEqual(Operation.list_object_versions, p.op);
 }
 
 test "multipart: GET /b?uploads → list_multipart_uploads" {
