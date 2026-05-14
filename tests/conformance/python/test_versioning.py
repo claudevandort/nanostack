@@ -7,6 +7,7 @@ from conftest import (
     aws_http_status,
     best_effort_delete_bucket,
     drain_versions,
+    sign_and_send,
 )
 
 
@@ -160,6 +161,34 @@ def test_versioning_copy_object_version_id_roundtrip(s3, bucket_name):
             CopySource=f"{bucket_name}/src",
         )
         assert out.get("VersionId"), "dest missing VersionId"
+    finally:
+        drain_versions(s3, bucket_name)
+        best_effort_delete_bucket(s3, bucket_name)
+
+
+def test_versioning_head_on_delete_marker_returns_405(s3, bucket_name):
+    """AWS-exact: HEAD on a delete marker → 405 + Allow: DELETE.
+
+    GET on the same key returns 404 + x-amz-delete-marker (verified in
+    `test_versioning_delete_creates_marker_get_returns_404`). HEAD diverges
+    on status. Drift table row 3. boto3's head_object swallows non-200
+    response headers, so we drop to a raw signed HTTP request.
+    """
+    s3.create_bucket(Bucket=bucket_name)
+    _enable_versioning(s3, bucket_name)
+    try:
+        s3.put_object(Bucket=bucket_name, Key="k", Body=b"v")
+        s3.delete_object(Bucket=bucket_name, Key="k")
+
+        resp = sign_and_send("HEAD", f"/{bucket_name}/k")
+        assert resp.status_code == 405, \
+            f"expected 405 on HEAD-of-delete-marker, got {resp.status_code}"
+        assert resp.headers.get("Allow") == "DELETE", \
+            f"expected `Allow: DELETE`, got {resp.headers.get('Allow')!r}"
+        assert resp.headers.get("x-amz-delete-marker") == "true", \
+            f"expected x-amz-delete-marker: true, got {resp.headers.get('x-amz-delete-marker')!r}"
+        assert resp.headers.get("x-amz-version-id"), \
+            "expected x-amz-version-id header"
     finally:
         drain_versions(s3, bucket_name)
         best_effort_delete_bucket(s3, bucket_name)

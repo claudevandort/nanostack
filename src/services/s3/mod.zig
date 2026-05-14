@@ -796,11 +796,16 @@ fn headObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
         return .{ .err = mapStorageErr(err) };
 
     if (meta.is_delete_marker) {
+        // AWS-exact: HEAD on a delete marker → 405 Method Not Allowed +
+        // `Allow: DELETE` + delete-marker / version-id headers. GET takes
+        // the analogous-but-distinct path further up (404 NoSuchKey + same
+        // marker headers). Drift table row 3.
         const extra = ctx.allocator.dupe(Header, &.{
+            .{ .name = "Allow", .value = "DELETE" },
             .{ .name = "x-amz-delete-marker", .value = "true" },
             .{ .name = "x-amz-version-id", .value = meta.version_id },
         }) catch return .{ .err = .internal_error };
-        return .{ .err_with_headers = .{ .code = .no_such_key, .extra_headers = extra } };
+        return .{ .err_with_headers = .{ .code = .method_not_allowed, .extra_headers = extra } };
     }
 
     switch (preconditions.forRead(ctx.request.headers, .{
