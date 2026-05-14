@@ -1,6 +1,6 @@
 # nanostack Operation Support Matrix
 
-**Version:** v0.0.2-dev (M9 in progress — S3 tagging)
+**Version:** v0.0.2-dev (M10 in progress — ACLs, policies, ownership, public access block)
 
 **How to read this matrix:** each row is one S3 operation or cross-cutting capability. Status is one of:
 
@@ -45,6 +45,19 @@ The "Milestone" column points at the release tag in which the capability landed.
 | PutObjectTagging | supported (per-version with `?versionId=X`) | M9 |
 | GetObjectTagging | supported (200 + empty TagSet on untagged object, AWS-exact) | M9 |
 | DeleteObjectTagging | supported (204; idempotent) | M9 |
+| PutBucketAcl | supported (accept-store-roundtrip; XML body OR `x-amz-acl` canned OR `x-amz-grant-*` headers) | M10 |
+| GetBucketAcl | supported (synthesizes default Owner FULL_CONTROL when none set) | M10 |
+| PutObjectAcl | supported (per-version with `?versionId=X`) | M10 |
+| GetObjectAcl | supported | M10 |
+| PutBucketPolicy | supported (well-formed JSON only; no condition-key validation) | M10 |
+| GetBucketPolicy | supported (404 `NoSuchBucketPolicy` on unset bucket, AWS-exact) | M10 |
+| DeleteBucketPolicy | supported (204; idempotent) | M10 |
+| PutBucketOwnershipControls | supported (BucketOwnerEnforced / BucketOwnerPreferred / ObjectWriter) | M10 |
+| GetBucketOwnershipControls | supported (404 `OwnershipControlsNotFoundError` on unset, AWS-exact) | M10 |
+| DeleteBucketOwnershipControls | supported (204; idempotent) | M10 |
+| PutPublicAccessBlock | supported (all 4 bool fields) | M10 |
+| GetPublicAccessBlock | supported (404 `NoSuchPublicAccessBlockConfiguration` on unset, AWS-exact) | M10 |
+| DeletePublicAccessBlock | supported (204; idempotent) | M10 |
 
 ### v1 cross-cutting
 
@@ -90,6 +103,23 @@ The "Milestone" column points at the release tag in which the capability landed.
 | Multipart-ETag `<md5>-N` format on versioned writes | supported | M8 |
 | MFA Delete (`x-amz-mfa` header) | accepted-and-ignored (documented divergence) | post-v1.1 |
 | Object Lock (governance/compliance retention) | not supported | post-v1.1 |
+
+### ACL / policy / ownership / PAB (M10)
+
+| Capability | Status | Milestone |
+|---|---|---|
+| Inline `x-amz-acl` canned header on PutObject / CopyObject / CreateMultipartUpload | supported | M10 |
+| Inline `x-amz-grant-{read,write,read-acp,write-acp,full-control}` headers on writes + ACL Puts (full pass-through; folded into persisted ACL) | supported | M10 |
+| `x-amz-tagging-directive: COPY \| REPLACE` on CopyObject (M9) — ACL also flows through dest when `x-amz-acl` is set on the copy | supported | M10 |
+| Per-version object ACL (`PutObjectAcl?versionId=X`) | supported | M10 |
+| `AccessControlListNotSupported` (400) on PutBucketAcl/PutObjectAcl when bucket ownership is `BucketOwnerEnforced` | supported | M10 |
+| Canned ACL values: `private`, `public-read`, `public-read-write`, `authenticated-read`, `log-delivery-write` | supported (full expansion) | M10 |
+| Canned ACL values: `bucket-owner-read`, `bucket-owner-full-control`, `aws-exec-read` | supported (degrades to "private" — emulator has no distinct bucket owner; documented divergence) | M10 |
+| Default `AccessControlPolicy` synthesis (Owner FULL_CONTROL) when none stored | supported | M10 |
+| **Access enforcement (ACL / policy / PAB)** | **not enforced** (documented divergence — accept-store-roundtrip only) | M10 |
+| Bucket-policy condition-key validation | not supported (well-formed JSON only) | post-v1.1 |
+| Bucket-policy size cap (20 KB) | not enforced (documented divergence) | post-v1.1 |
+| Access Points / MRAP / S3 Access Grants | not supported | post-v1.1 |
 
 ### Tagging-related (M9)
 

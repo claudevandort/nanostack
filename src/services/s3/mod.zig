@@ -7,19 +7,24 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const router = @import("../../router.zig");
-const errors = @import("../../wire/errors.zig");
+pub const errors = @import("../../wire/errors.zig");
 const storage = @import("../../storage/mod.zig");
 const s3_responses = @import("../../wire/s3_responses.zig");
 const object_responses = @import("../../wire/object_responses.zig");
 const delete_parser = @import("../../wire/delete_objects_parser.zig");
 const list_objects_wire = @import("../../wire/list_objects.zig");
 const tagging_parser = @import("../../wire/tagging_parser.zig");
+const acl_parser = @import("../../wire/acl_parser.zig");
 const http_range = @import("../../http/range.zig");
 const fs_backend = @import("../../storage/fs.zig");
 const preconditions = @import("preconditions.zig");
 const multipart = @import("multipart.zig");
 const versioning = @import("versioning.zig");
 const tagging = @import("tagging.zig");
+const acl_service = @import("acl.zig");
+const policy = @import("policy.zig");
+const ownership = @import("ownership.zig");
+const public_access_block_service = @import("public_access_block.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -176,6 +181,60 @@ pub fn handle(ctx: Context, parsed: router.Parsed) Result {
             parsed.bucket orelse return .{ .err = .invalid_request },
             parsed.key orelse return .{ .err = .invalid_request },
         ),
+        .put_bucket_acl => acl_service.putBucketAcl(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .get_bucket_acl => acl_service.getBucketAcl(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .put_object_acl => acl_service.putObjectAcl(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .get_object_acl => acl_service.getObjectAcl(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .put_bucket_policy => policy.putBucketPolicy(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .get_bucket_policy => policy.getBucketPolicy(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .delete_bucket_policy => policy.deleteBucketPolicy(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .put_bucket_ownership_controls => ownership.putBucketOwnershipControls(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .get_bucket_ownership_controls => ownership.getBucketOwnershipControls(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .delete_bucket_ownership_controls => ownership.deleteBucketOwnershipControls(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .put_public_access_block => public_access_block_service.putPublicAccessBlock(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .get_public_access_block => public_access_block_service.getPublicAccessBlock(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
+        .delete_public_access_block => public_access_block_service.deletePublicAccessBlock(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+        ),
         .unknown => .{ .err = .not_implemented },
     };
 }
@@ -230,12 +289,60 @@ fn hexDigit(c: u8) ?u8 {
     return null;
 }
 
+/// Result of extracting an inline ACL from `x-amz-acl` + `x-amz-grant-*`
+/// headers on a write request. `.none` means no ACL-related headers
+/// were present (caller should pass `null` to the backend).
+pub const InlineAclOutcome = union(enum) {
+    none: void,
+    ok: storage.Acl,
+    err: errors.Code,
+};
+
+/// Extract an inline ACL from a request's headers. Returns `.none` when
+/// no ACL-related headers are present. Otherwise, expands the canned
+/// value (default "private") and folds in any `x-amz-grant-*` headers.
+pub fn extractInlineAcl(ctx: Context) InlineAclOutcome {
+    const has_canned = findHeader(ctx.request.headers, "x-amz-acl") != null;
+    const grant_pairs = [_]GrantPair{
+        .{ .name = "x-amz-grant-read", .perm = .READ },
+        .{ .name = "x-amz-grant-write", .perm = .WRITE },
+        .{ .name = "x-amz-grant-read-acp", .perm = .READ_ACP },
+        .{ .name = "x-amz-grant-write-acp", .perm = .WRITE_ACP },
+        .{ .name = "x-amz-grant-full-control", .perm = .FULL_CONTROL },
+    };
+    var has_grant = false;
+    for (grant_pairs) |g| {
+        if (findHeader(ctx.request.headers, g.name) != null) {
+            has_grant = true;
+            break;
+        }
+    }
+    if (!has_canned and !has_grant) return .{ .none = {} };
+
+    const canned_str = findHeader(ctx.request.headers, "x-amz-acl") orelse "private";
+    const canned = acl_parser.parseCanned(canned_str) catch return .{ .err = .invalid_argument };
+    var acl = acl_parser.cannedToAcl(ctx.allocator, canned) catch return .{ .err = .internal_error };
+
+    for (grant_pairs) |g| {
+        const v = findHeader(ctx.request.headers, g.name) orelse continue;
+        const extras = acl_parser.parseGrantHeader(ctx.allocator, v, g.perm) catch return .{ .err = .malformed_acl_error };
+        acl = acl_parser.mergeGrants(ctx.allocator, acl, extras) catch return .{ .err = .internal_error };
+    }
+    return .{ .ok = acl };
+}
+
+const GrantPair = struct { name: []const u8, perm: storage.Permission };
+
 pub fn mapStorageErr(e: storage.Error) errors.Code {
     return switch (e) {
         storage.Error.NoSuchBucket => .no_such_bucket,
         storage.Error.NoSuchKey => .no_such_key,
         storage.Error.NoSuchUpload => .no_such_upload,
         storage.Error.NoSuchTagSet => .no_such_tag_set,
+        storage.Error.NoSuchBucketPolicy => .no_such_bucket_policy,
+        storage.Error.OwnershipControlsNotFound => .ownership_controls_not_found,
+        storage.Error.NoSuchPublicAccessBlockConfiguration => .no_such_public_access_block_configuration,
+        storage.Error.AccessControlListNotSupported => .access_control_list_not_supported,
         storage.Error.BucketAlreadyExists => .bucket_already_exists,
         storage.Error.BucketAlreadyOwnedByYou => .bucket_already_owned_by_you,
         storage.Error.BucketNotEmpty => .bucket_not_empty,
@@ -341,6 +448,13 @@ fn putObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
     else
         &.{};
 
+    // M10 inline ACL via `x-amz-acl` + `x-amz-grant-*` headers.
+    const inline_acl: ?storage.Acl = switch (extractInlineAcl(ctx)) {
+        .none => null,
+        .ok => |a| a,
+        .err => |c| return .{ .err = c },
+    };
+
     const out = ctx.backend.putObject(.{
         .bucket = bucket,
         .key = key,
@@ -348,6 +462,7 @@ fn putObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
         .content_type = content_type,
         .user_metadata = meta_list.items,
         .tags = inline_tags,
+        .acl = inline_acl,
     }) catch |err| return .{ .err = mapStorageErr(err) };
 
     var hs: std.ArrayList(Header) = .empty;
@@ -441,6 +556,16 @@ fn copyObject(ctx: Context, dest_bucket: []const u8, dest_key: []const u8) Resul
         break :blk &.{};
     } else source_obj.meta.tags;
 
+    // ---------- ACL ----------
+    // M10. CopyObject: if `x-amz-acl` or `x-amz-grant-*` headers are
+    // present, they take effect on the destination. Otherwise the dest
+    // gets the source's ACL (which itself may be null → default).
+    const dest_acl: ?storage.Acl = switch (extractInlineAcl(ctx)) {
+        .none => source_obj.meta.acl,
+        .ok => |a| a,
+        .err => |c| return .{ .err = c },
+    };
+
     // ---------- Write destination ----------
     const put_out = ctx.backend.putObject(.{
         .bucket = dest_bucket,
@@ -449,6 +574,7 @@ fn copyObject(ctx: Context, dest_bucket: []const u8, dest_key: []const u8) Resul
         .content_type = dest_content_type,
         .user_metadata = dest_metadata,
         .tags = dest_tags,
+        .acl = dest_acl,
     }) catch |err| return .{ .err = mapStorageErr(err) };
 
     // ---------- Render response ----------

@@ -35,6 +35,12 @@ pub const Code = enum {
     invalid_part_order,
     invalid_tag,
     no_such_tag_set,
+    malformed_acl_error,
+    malformed_policy,
+    no_such_bucket_policy,
+    ownership_controls_not_found,
+    no_such_public_access_block_configuration,
+    access_control_list_not_supported,
     internal_error,
 
     pub fn awsCode(self: Code) []const u8 {
@@ -65,6 +71,12 @@ pub const Code = enum {
             .invalid_part_order => "InvalidPartOrder",
             .invalid_tag => "InvalidTag",
             .no_such_tag_set => "NoSuchTagSet",
+            .malformed_acl_error => "MalformedACLError",
+            .malformed_policy => "MalformedPolicy",
+            .no_such_bucket_policy => "NoSuchBucketPolicy",
+            .ownership_controls_not_found => "OwnershipControlsNotFoundError",
+            .no_such_public_access_block_configuration => "NoSuchPublicAccessBlockConfiguration",
+            .access_control_list_not_supported => "AccessControlListNotSupported",
             .internal_error => "InternalError",
         };
     }
@@ -97,6 +109,12 @@ pub const Code = enum {
             .invalid_part_order => "The list of parts was not in ascending order. Parts must be ordered by part number.",
             .invalid_tag => "The tag provided was not a valid tag. This error can occur if the tag did not pass input validation.",
             .no_such_tag_set => "The TagSet does not exist.",
+            .malformed_acl_error => "The XML you provided was not well-formed or did not validate against our published schema.",
+            .malformed_policy => "Policies must be valid JSON and the first byte must be '{'.",
+            .no_such_bucket_policy => "The bucket policy does not exist",
+            .ownership_controls_not_found => "The bucket ownership controls were not found",
+            .no_such_public_access_block_configuration => "The public access block configuration was not found",
+            .access_control_list_not_supported => "The bucket does not allow ACLs.",
             .internal_error => "We encountered an internal error. Please try again.",
         };
     }
@@ -116,6 +134,12 @@ pub const Code = enum {
             .invalid_part, .invalid_part_order => 400,
             .invalid_tag => 400,
             .no_such_tag_set => 404,
+            .malformed_acl_error => 400,
+            .malformed_policy => 400,
+            .no_such_bucket_policy => 404,
+            .ownership_controls_not_found => 404,
+            .no_such_public_access_block_configuration => 404,
+            .access_control_list_not_supported => 400,
             .method_not_allowed => 405,
             .internal_error => 500,
         };

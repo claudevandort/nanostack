@@ -13,6 +13,10 @@ pub const Error = error{
     NoSuchKey,
     NoSuchUpload,
     NoSuchTagSet,
+    NoSuchBucketPolicy,
+    OwnershipControlsNotFound,
+    NoSuchPublicAccessBlockConfiguration,
+    AccessControlListNotSupported,
     BucketAlreadyExists,
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
@@ -75,6 +79,131 @@ fn hasAwsPrefix(s: []const u8) bool {
     return std.ascii.eqlIgnoreCase(s[0..4], "aws:");
 }
 
+// ---------------------------------------------------------------------------
+// ACLs + bucket policies + ownership + public access block (M10).
+//
+// nanostack does NOT enforce ACLs or policies on requests. M10 is
+// accept-store-roundtrip: parse, persist, and surface on Get. Documented
+// divergence in SUPPORT.md.
+
+pub const CannedAcl = enum {
+    private,
+    public_read,
+    public_read_write,
+    authenticated_read,
+    log_delivery_write,
+    bucket_owner_read,
+    bucket_owner_full_control,
+    aws_exec_read,
+};
+
+pub const Permission = enum {
+    FULL_CONTROL,
+    WRITE,
+    WRITE_ACP,
+    READ,
+    READ_ACP,
+};
+
+pub const GranteeKind = enum {
+    canonical_user,
+    group,
+    amazon_customer_by_email,
+};
+
+/// AWS Grantee. Exactly one of (id+display_name) / uri / email_address is
+/// meaningful per `kind`. Strings owned per call-site contract.
+pub const Grantee = struct {
+    kind: GranteeKind,
+    id: []const u8 = "",
+    display_name: []const u8 = "",
+    uri: []const u8 = "",
+    email_address: []const u8 = "",
+};
+
+pub const Grant = struct {
+    grantee: Grantee,
+    permission: Permission,
+};
+
+pub const Owner = struct {
+    id: []const u8,
+    display_name: []const u8 = "",
+};
+
+pub const Acl = struct {
+    owner: Owner,
+    grants: []const Grant = &.{},
+};
+
+pub const OwnershipControl = enum {
+    BucketOwnerEnforced,
+    BucketOwnerPreferred,
+    ObjectWriter,
+};
+
+pub const PublicAccessBlockConfig = struct {
+    block_public_acls: bool = false,
+    ignore_public_acls: bool = false,
+    block_public_policy: bool = false,
+    restrict_public_buckets: bool = false,
+};
+
+/// The synthesized Owner we return for every bucket/object the client
+/// never explicitly assigned a different owner to. AWS uses 64-hex-char
+/// canonical IDs; ours is stable and distinct from anything AWS would
+/// emit so it round-trips deterministically.
+pub const default_owner_id = "0000000000000000000000000000000000000000000000000000000000000000";
+pub const default_owner_display_name = "nanostack";
+
+/// AWS predefined-group URIs used in canned ACL expansion + grant
+/// header parsing.
+pub const group_all_users = "http://acs.amazonaws.com/groups/global/AllUsers";
+pub const group_authenticated_users = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
+pub const group_log_delivery = "http://acs.amazonaws.com/groups/s3/LogDelivery";
+
+/// Parse a canned ACL header value. Returns the enum or an error so the
+/// caller can map to 400 InvalidArgument.
+pub fn parseCannedAcl(value: []const u8) error{UnknownCannedAcl}!CannedAcl {
+    const map = .{
+        .{ "private", CannedAcl.private },
+        .{ "public-read", CannedAcl.public_read },
+        .{ "public-read-write", CannedAcl.public_read_write },
+        .{ "authenticated-read", CannedAcl.authenticated_read },
+        .{ "log-delivery-write", CannedAcl.log_delivery_write },
+        .{ "bucket-owner-read", CannedAcl.bucket_owner_read },
+        .{ "bucket-owner-full-control", CannedAcl.bucket_owner_full_control },
+        .{ "aws-exec-read", CannedAcl.aws_exec_read },
+    };
+    inline for (map) |entry| {
+        if (std.mem.eql(u8, value, entry[0])) return entry[1];
+    }
+    return error.UnknownCannedAcl;
+}
+
+/// Permission XML literal.
+pub fn permissionToXml(p: Permission) []const u8 {
+    return @tagName(p);
+}
+
+pub fn permissionFromXml(s: []const u8) error{InvalidPermission}!Permission {
+    inline for (@typeInfo(Permission).@"enum".fields) |f| {
+        if (std.mem.eql(u8, s, f.name)) return @field(Permission, f.name);
+    }
+    return error.InvalidPermission;
+}
+
+pub fn ownershipControlFromString(s: []const u8) error{InvalidOwnershipControl}!OwnershipControl {
+    inline for (@typeInfo(OwnershipControl).@"enum".fields) |f| {
+        if (std.mem.eql(u8, s, f.name)) return @field(OwnershipControl, f.name);
+    }
+    return error.InvalidOwnershipControl;
+}
+
+pub fn ownershipControlToString(oc: OwnershipControl) []const u8 {
+    return @tagName(oc);
+}
+
 /// One bucket's persisted metadata. Strings borrow from the backend's
 /// allocator; consumers must not retain past the backend lifetime unless
 /// they dupe. `listBuckets` returns a slice freshly allocated by the
@@ -114,6 +243,11 @@ pub const Object = struct {
     is_delete_marker: bool = false,
     /// M9. Per-object (per-version on versioned buckets) tag set.
     tags: []const Tag = &.{},
+    /// M10. Per-object (per-version on versioned buckets) ACL. `null`
+    /// means "synthesize the default private Owner FULL_CONTROL Acl on
+    /// Get". An explicit Acl from canned/grant headers / PutObjectAcl
+    /// gets persisted as-given.
+    acl: ?Acl = null,
 };
 
 pub const PutObjectInput = struct {
@@ -124,6 +258,8 @@ pub const PutObjectInput = struct {
     user_metadata: []const Header = &.{},
     /// M9. Inline tagging from the `x-amz-tagging` header.
     tags: []const Tag = &.{},
+    /// M10. Inline ACL from `x-amz-acl` + `x-amz-grant-*` headers.
+    acl: ?Acl = null,
 };
 
 pub const PutObjectOutput = struct {
@@ -221,6 +357,8 @@ pub const InitiateMultipartUploadInput = struct {
     user_metadata: []const Header = &.{},
     /// M9. Tags applied to the final merged object on CompleteMultipartUpload.
     tags: []const Tag = &.{},
+    /// M10. ACL applied to the final merged object on CompleteMultipartUpload.
+    acl: ?Acl = null,
 };
 
 pub const InitiateMultipartUploadOutput = struct {
@@ -391,6 +529,24 @@ pub const Backend = struct {
         putObjectTagging: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, tags: []const Tag) Error!void,
         getObjectTagging: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error![]Tag,
         deleteObjectTagging: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!void,
+        // ACLs (M10). Object-ACL entries take optional version_id.
+        putBucketAcl: *const fn (ctx: *anyopaque, bucket: []const u8, acl: Acl) Error!void,
+        getBucketAcl: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8) Error!Acl,
+        putObjectAcl: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, acl: Acl) Error!void,
+        getObjectAcl: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!Acl,
+        // Bucket policies (M10). Body is raw JSON bytes — well-formedness
+        // checked at the wire layer; storage stores opaque.
+        putBucketPolicy: *const fn (ctx: *anyopaque, bucket: []const u8, policy_json: []const u8) Error!void,
+        getBucketPolicy: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8) Error![]u8,
+        deleteBucketPolicy: *const fn (ctx: *anyopaque, bucket: []const u8) Error!void,
+        // Ownership controls (M10).
+        putBucketOwnershipControls: *const fn (ctx: *anyopaque, bucket: []const u8, oc: OwnershipControl) Error!void,
+        getBucketOwnershipControls: *const fn (ctx: *anyopaque, bucket: []const u8) Error!OwnershipControl,
+        deleteBucketOwnershipControls: *const fn (ctx: *anyopaque, bucket: []const u8) Error!void,
+        // Public access block (M10).
+        putPublicAccessBlock: *const fn (ctx: *anyopaque, bucket: []const u8, pab: PublicAccessBlockConfig) Error!void,
+        getPublicAccessBlock: *const fn (ctx: *anyopaque, bucket: []const u8) Error!PublicAccessBlockConfig,
+        deletePublicAccessBlock: *const fn (ctx: *anyopaque, bucket: []const u8) Error!void,
     };
 
     // Pass-through helpers so call sites don't dereference the vtable.
@@ -475,6 +631,49 @@ pub const Backend = struct {
     }
     pub fn deleteObjectTagging(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!void {
         return self.vtable.deleteObjectTagging(self.ctx, bucket, key, version_id);
+    }
+
+    pub fn putBucketAcl(self: Backend, bucket: []const u8, acl: Acl) Error!void {
+        return self.vtable.putBucketAcl(self.ctx, bucket, acl);
+    }
+    pub fn getBucketAcl(self: Backend, allocator: Allocator, bucket: []const u8) Error!Acl {
+        return self.vtable.getBucketAcl(self.ctx, allocator, bucket);
+    }
+    pub fn putObjectAcl(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8, acl: Acl) Error!void {
+        return self.vtable.putObjectAcl(self.ctx, bucket, key, version_id, acl);
+    }
+    pub fn getObjectAcl(self: Backend, allocator: Allocator, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!Acl {
+        return self.vtable.getObjectAcl(self.ctx, allocator, bucket, key, version_id);
+    }
+
+    pub fn putBucketPolicy(self: Backend, bucket: []const u8, policy_json: []const u8) Error!void {
+        return self.vtable.putBucketPolicy(self.ctx, bucket, policy_json);
+    }
+    pub fn getBucketPolicy(self: Backend, allocator: Allocator, bucket: []const u8) Error![]u8 {
+        return self.vtable.getBucketPolicy(self.ctx, allocator, bucket);
+    }
+    pub fn deleteBucketPolicy(self: Backend, bucket: []const u8) Error!void {
+        return self.vtable.deleteBucketPolicy(self.ctx, bucket);
+    }
+
+    pub fn putBucketOwnershipControls(self: Backend, bucket: []const u8, oc: OwnershipControl) Error!void {
+        return self.vtable.putBucketOwnershipControls(self.ctx, bucket, oc);
+    }
+    pub fn getBucketOwnershipControls(self: Backend, bucket: []const u8) Error!OwnershipControl {
+        return self.vtable.getBucketOwnershipControls(self.ctx, bucket);
+    }
+    pub fn deleteBucketOwnershipControls(self: Backend, bucket: []const u8) Error!void {
+        return self.vtable.deleteBucketOwnershipControls(self.ctx, bucket);
+    }
+
+    pub fn putPublicAccessBlock(self: Backend, bucket: []const u8, pab: PublicAccessBlockConfig) Error!void {
+        return self.vtable.putPublicAccessBlock(self.ctx, bucket, pab);
+    }
+    pub fn getPublicAccessBlock(self: Backend, bucket: []const u8) Error!PublicAccessBlockConfig {
+        return self.vtable.getPublicAccessBlock(self.ctx, bucket);
+    }
+    pub fn deletePublicAccessBlock(self: Backend, bucket: []const u8) Error!void {
+        return self.vtable.deletePublicAccessBlock(self.ctx, bucket);
     }
 };
 
@@ -563,4 +762,29 @@ test "validateTagSet: rejects invalid chars" {
     try testing.expectError(Error.InvalidTag, validateTagSet(&.{
         .{ .key = "k!", .value = "v" },
     }));
+}
+
+test "parseCannedAcl: known values + unknown" {
+    const testing = std.testing;
+    try testing.expectEqual(CannedAcl.private, try parseCannedAcl("private"));
+    try testing.expectEqual(CannedAcl.public_read, try parseCannedAcl("public-read"));
+    try testing.expectEqual(CannedAcl.bucket_owner_full_control, try parseCannedAcl("bucket-owner-full-control"));
+    try testing.expectError(error.UnknownCannedAcl, parseCannedAcl("frobnicate"));
+    try testing.expectError(error.UnknownCannedAcl, parseCannedAcl(""));
+}
+
+test "permissionFromXml + permissionToXml round-trip" {
+    const testing = std.testing;
+    try testing.expectEqual(Permission.FULL_CONTROL, try permissionFromXml("FULL_CONTROL"));
+    try testing.expectEqual(Permission.READ, try permissionFromXml("READ"));
+    try testing.expectError(error.InvalidPermission, permissionFromXml("OWNER"));
+    try testing.expectEqualStrings("WRITE_ACP", permissionToXml(.WRITE_ACP));
+}
+
+test "ownershipControlFromString round-trip" {
+    const testing = std.testing;
+    try testing.expectEqual(OwnershipControl.BucketOwnerEnforced, try ownershipControlFromString("BucketOwnerEnforced"));
+    try testing.expectEqual(OwnershipControl.ObjectWriter, try ownershipControlFromString("ObjectWriter"));
+    try testing.expectError(error.InvalidOwnershipControl, ownershipControlFromString("Whatever"));
+    try testing.expectEqualStrings("BucketOwnerPreferred", ownershipControlToString(.BucketOwnerPreferred));
 }

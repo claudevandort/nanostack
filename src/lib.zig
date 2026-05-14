@@ -14,6 +14,11 @@ pub const versioning_responses = @import("wire/versioning_responses.zig");
 pub const list_object_versions = @import("wire/list_object_versions.zig");
 pub const tagging_parser = @import("wire/tagging_parser.zig");
 pub const tagging_responses = @import("wire/tagging_responses.zig");
+pub const acl_parser = @import("wire/acl_parser.zig");
+pub const acl_responses = @import("wire/acl_responses.zig");
+pub const policy_parser = @import("wire/policy_parser.zig");
+pub const ownership_controls_wire = @import("wire/ownership_controls.zig");
+pub const public_access_block_wire = @import("wire/public_access_block.zig");
 pub const router = @import("router.zig");
 pub const http_range = @import("http/range.zig");
 pub const http_date = @import("http/date.zig");
@@ -30,6 +35,10 @@ pub const preconditions = @import("services/s3/preconditions.zig");
 pub const multipart_service = @import("services/s3/multipart.zig");
 pub const versioning_service = @import("services/s3/versioning.zig");
 pub const tagging_service = @import("services/s3/tagging.zig");
+pub const acl_service = @import("services/s3/acl.zig");
+pub const policy_service = @import("services/s3/policy.zig");
+pub const ownership_service = @import("services/s3/ownership.zig");
+pub const public_access_block_service = @import("services/s3/public_access_block.zig");
 pub const cli = @import("cli.zig");
 pub const version = @import("version.zig");
 
@@ -47,6 +56,11 @@ test {
     _ = list_object_versions;
     _ = tagging_parser;
     _ = tagging_responses;
+    _ = acl_parser;
+    _ = acl_responses;
+    _ = policy_parser;
+    _ = ownership_controls_wire;
+    _ = public_access_block_wire;
     _ = router;
     _ = http_range;
     _ = http_date;
@@ -63,6 +77,10 @@ test {
     _ = multipart_service;
     _ = versioning_service;
     _ = tagging_service;
+    _ = acl_service;
+    _ = policy_service;
+    _ = ownership_service;
+    _ = public_access_block_service;
     _ = cli;
     _ = version;
 }

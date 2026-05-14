@@ -49,12 +49,21 @@ pub fn createMultipartUpload(ctx: Context, bucket: []const u8, key: []const u8) 
     else
         &.{};
 
+    // M10 inline ACL on CreateMultipartUpload — applied to the merged
+    // object when CompleteMultipartUpload runs.
+    const inline_acl: ?storage.Acl = switch (mod.extractInlineAcl(ctx)) {
+        .none => null,
+        .ok => |a| a,
+        .err => |c| return .{ .err = c },
+    };
+
     const out = ctx.backend.initiateMultipartUpload(ctx.allocator, .{
         .bucket = bucket,
         .key = key,
         .content_type = content_type,
         .user_metadata = meta_list.items,
         .tags = inline_tags,
+        .acl = inline_acl,
     }) catch |err| return .{ .err = mod.mapStorageErr(err) };
 
     const body = multipart_wire.renderInitiateMultipartUploadResult(ctx.allocator, bucket, key, out.upload_id) catch

@@ -33,6 +33,19 @@ pub const Operation = enum {
     put_object_tagging,
     get_object_tagging,
     delete_object_tagging,
+    put_bucket_acl,
+    get_bucket_acl,
+    put_object_acl,
+    get_object_acl,
+    put_bucket_policy,
+    get_bucket_policy,
+    delete_bucket_policy,
+    put_bucket_ownership_controls,
+    get_bucket_ownership_controls,
+    delete_bucket_ownership_controls,
+    put_public_access_block,
+    get_public_access_block,
+    delete_public_access_block,
     unknown,
 };
 
@@ -95,6 +108,10 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
             if (eql(method, "GET")) return .get_object_tagging;
             if (eql(method, "DELETE")) return .delete_object_tagging;
         }
+        if (hasQueryParam(query, "acl")) {
+            if (eql(method, "PUT")) return .put_object_acl;
+            if (eql(method, "GET")) return .get_object_acl;
+        }
         if (eql(method, "PUT")) return .put_object;
         if (eql(method, "GET")) return .get_object;
         if (eql(method, "HEAD")) return .head_object;
@@ -109,6 +126,10 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
         if (hasQueryParam(query, "versioning")) return .get_bucket_versioning;
         if (hasQueryParam(query, "versions")) return .list_object_versions;
         if (hasQueryParam(query, "tagging")) return .get_bucket_tagging;
+        if (hasQueryParam(query, "acl")) return .get_bucket_acl;
+        if (hasQueryParam(query, "policy")) return .get_bucket_policy;
+        if (hasQueryParam(query, "ownershipControls")) return .get_bucket_ownership_controls;
+        if (hasQueryParam(query, "publicAccessBlock")) return .get_public_access_block;
         if (hasQueryParam(query, "uploads")) return .list_multipart_uploads;
         if (queryParamEquals(query, "list-type", "2")) return .list_objects_v2;
         return .list_objects;
@@ -116,10 +137,17 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
     if (eql(method, "PUT") and has_bucket) {
         if (hasQueryParam(query, "versioning")) return .put_bucket_versioning;
         if (hasQueryParam(query, "tagging")) return .put_bucket_tagging;
+        if (hasQueryParam(query, "acl")) return .put_bucket_acl;
+        if (hasQueryParam(query, "policy")) return .put_bucket_policy;
+        if (hasQueryParam(query, "ownershipControls")) return .put_bucket_ownership_controls;
+        if (hasQueryParam(query, "publicAccessBlock")) return .put_public_access_block;
         return .create_bucket;
     }
     if (eql(method, "DELETE") and has_bucket) {
         if (hasQueryParam(query, "tagging")) return .delete_bucket_tagging;
+        if (hasQueryParam(query, "policy")) return .delete_bucket_policy;
+        if (hasQueryParam(query, "ownershipControls")) return .delete_bucket_ownership_controls;
+        if (hasQueryParam(query, "publicAccessBlock")) return .delete_public_access_block;
         return .delete_bucket;
     }
     if (eql(method, "HEAD") and has_bucket) return .head_bucket;
@@ -363,4 +391,69 @@ test "tagging: DELETE /b/k?tagging → delete_object_tagging" {
 test "tagging: PUT /b/k?tagging&versionId=X → put_object_tagging (versionId is a sub-resource handled in service layer)" {
     const p = parse("PUT", "localhost", "/buk/k", "tagging&versionId=abc");
     try testing.expectEqual(Operation.put_object_tagging, p.op);
+}
+
+test "acl: PUT /b?acl → put_bucket_acl" {
+    const p = parse("PUT", "localhost", "/buk", "acl");
+    try testing.expectEqual(Operation.put_bucket_acl, p.op);
+}
+
+test "acl: GET /b?acl → get_bucket_acl" {
+    const p = parse("GET", "localhost", "/buk", "acl");
+    try testing.expectEqual(Operation.get_bucket_acl, p.op);
+}
+
+test "acl: PUT /b/k?acl → put_object_acl" {
+    const p = parse("PUT", "localhost", "/buk/k", "acl");
+    try testing.expectEqual(Operation.put_object_acl, p.op);
+}
+
+test "acl: GET /b/k?acl&versionId=X → get_object_acl" {
+    const p = parse("GET", "localhost", "/buk/k", "acl&versionId=v1");
+    try testing.expectEqual(Operation.get_object_acl, p.op);
+}
+
+test "policy: PUT /b?policy → put_bucket_policy" {
+    const p = parse("PUT", "localhost", "/buk", "policy");
+    try testing.expectEqual(Operation.put_bucket_policy, p.op);
+}
+
+test "policy: GET /b?policy → get_bucket_policy" {
+    const p = parse("GET", "localhost", "/buk", "policy");
+    try testing.expectEqual(Operation.get_bucket_policy, p.op);
+}
+
+test "policy: DELETE /b?policy → delete_bucket_policy" {
+    const p = parse("DELETE", "localhost", "/buk", "policy");
+    try testing.expectEqual(Operation.delete_bucket_policy, p.op);
+}
+
+test "ownership: PUT /b?ownershipControls → put_bucket_ownership_controls" {
+    const p = parse("PUT", "localhost", "/buk", "ownershipControls");
+    try testing.expectEqual(Operation.put_bucket_ownership_controls, p.op);
+}
+
+test "ownership: GET /b?ownershipControls → get_bucket_ownership_controls" {
+    const p = parse("GET", "localhost", "/buk", "ownershipControls");
+    try testing.expectEqual(Operation.get_bucket_ownership_controls, p.op);
+}
+
+test "ownership: DELETE /b?ownershipControls → delete_bucket_ownership_controls" {
+    const p = parse("DELETE", "localhost", "/buk", "ownershipControls");
+    try testing.expectEqual(Operation.delete_bucket_ownership_controls, p.op);
+}
+
+test "publicAccessBlock: PUT /b?publicAccessBlock → put_public_access_block" {
+    const p = parse("PUT", "localhost", "/buk", "publicAccessBlock");
+    try testing.expectEqual(Operation.put_public_access_block, p.op);
+}
+
+test "publicAccessBlock: GET /b?publicAccessBlock → get_public_access_block" {
+    const p = parse("GET", "localhost", "/buk", "publicAccessBlock");
+    try testing.expectEqual(Operation.get_public_access_block, p.op);
+}
+
+test "publicAccessBlock: DELETE /b?publicAccessBlock → delete_public_access_block" {
+    const p = parse("DELETE", "localhost", "/buk", "publicAccessBlock");
+    try testing.expectEqual(Operation.delete_public_access_block, p.op);
 }

@@ -41,6 +41,8 @@ const MultipartState = struct {
     parts: std.AutoHashMap(u32, PartMeta),
     /// M9. Tags applied to the merged object on Complete.
     tags: []storage.Tag = &.{},
+    /// M10. ACL applied to the merged object on Complete.
+    acl: ?storage.Acl = null,
 
     fn deinit(self: *MultipartState, gpa: Allocator) void {
         gpa.free(self.key);
@@ -54,11 +56,12 @@ const MultipartState = struct {
         while (it.next()) |entry| gpa.free(entry.value_ptr.etag);
         self.parts.deinit();
         freeTagsOwned(gpa, self.tags);
+        if (self.acl) |a| freeAclOwned(gpa, a);
         self.* = undefined;
     }
 };
 
-/// One entry in a versioned key's chain. M8 + M9 tags.
+/// One entry in a versioned key's chain. M8 + M9 tags + M10 acl.
 const VersionEntry = struct {
     version_id: []u8, // owned by backend allocator
     is_delete_marker: bool,
@@ -69,6 +72,8 @@ const VersionEntry = struct {
     user_metadata: []storage.Header,
     /// M9. Per-version tag set.
     tags: []storage.Tag = &.{},
+    /// M10. Per-version ACL. `null` means "synthesize default on Get".
+    acl: ?storage.Acl = null,
 
     fn deinit(self: *VersionEntry, gpa: Allocator) void {
         gpa.free(self.version_id);
@@ -80,6 +85,7 @@ const VersionEntry = struct {
         }
         gpa.free(self.user_metadata);
         freeTagsOwned(gpa, self.tags);
+        if (self.acl) |a| freeAclOwned(gpa, a);
         self.* = undefined;
     }
 };
@@ -105,6 +111,16 @@ const BucketSlot = struct {
     /// Bucket-level tag set (M9). Empty means "no TagSet"; GetBucketTagging
     /// returns 404 NoSuchTagSet in that case.
     tags: []storage.Tag = &.{},
+    /// Bucket-level ACL (M10). `null` means "synthesize default on Get".
+    acl: ?storage.Acl = null,
+    /// Bucket policy JSON bytes (M10). `null` → 404 NoSuchBucketPolicy.
+    policy_json: ?[]u8 = null,
+    /// Bucket ownership controls (M10). `null` → 404
+    /// OwnershipControlsNotFoundError.
+    ownership_controls: ?storage.OwnershipControl = null,
+    /// Bucket public access block configuration (M10). `null` → 404
+    /// NoSuchPublicAccessBlockConfiguration.
+    public_access_block: ?storage.PublicAccessBlockConfig = null,
 
     fn deinit(self: *BucketSlot, gpa: Allocator) void {
         gpa.free(self.meta.name);
@@ -127,6 +143,8 @@ const BucketSlot = struct {
         }
         self.versions.deinit();
         freeTagsOwned(gpa, self.tags);
+        if (self.acl) |a| freeAclOwned(gpa, a);
+        if (self.policy_json) |p| gpa.free(p);
         self.* = undefined;
     }
 };
@@ -157,6 +175,96 @@ fn dupeTagsOwned(gpa: Allocator, src: []const storage.Tag) ![]storage.Tag {
         made += 1;
     }
     return out;
+}
+
+/// Free an ACL whose owner + grant strings were duped with the given
+/// allocator.
+fn freeAclOwned(gpa: Allocator, acl: storage.Acl) void {
+    gpa.free(acl.owner.id);
+    gpa.free(acl.owner.display_name);
+    for (acl.grants) |g| {
+        gpa.free(g.grantee.id);
+        gpa.free(g.grantee.display_name);
+        gpa.free(g.grantee.uri);
+        gpa.free(g.grantee.email_address);
+    }
+    gpa.free(acl.grants);
+}
+
+/// Dupe an ACL into `gpa`-owned strings + slice.
+fn dupeAclOwned(gpa: Allocator, src: storage.Acl) !storage.Acl {
+    const owner_id = try gpa.dupe(u8, src.owner.id);
+    errdefer gpa.free(owner_id);
+    const owner_dn = try gpa.dupe(u8, src.owner.display_name);
+    errdefer gpa.free(owner_dn);
+
+    const grants = try gpa.alloc(storage.Grant, src.grants.len);
+    errdefer gpa.free(grants);
+    var made: usize = 0;
+    errdefer for (grants[0..made]) |g| {
+        gpa.free(g.grantee.id);
+        gpa.free(g.grantee.display_name);
+        gpa.free(g.grantee.uri);
+        gpa.free(g.grantee.email_address);
+    };
+    for (src.grants) |g| {
+        const gid = try gpa.dupe(u8, g.grantee.id);
+        errdefer gpa.free(gid);
+        const gdn = try gpa.dupe(u8, g.grantee.display_name);
+        errdefer gpa.free(gdn);
+        const guri = try gpa.dupe(u8, g.grantee.uri);
+        errdefer gpa.free(guri);
+        const gemail = try gpa.dupe(u8, g.grantee.email_address);
+        grants[made] = .{
+            .grantee = .{
+                .kind = g.grantee.kind,
+                .id = gid,
+                .display_name = gdn,
+                .uri = guri,
+                .email_address = gemail,
+            },
+            .permission = g.permission,
+        };
+        made += 1;
+    }
+    return .{
+        .owner = .{ .id = owner_id, .display_name = owner_dn },
+        .grants = grants,
+    };
+}
+
+/// Synthesize the default "private" ACL (Owner FULL_CONTROL) into
+/// `allocator`-owned memory.
+pub fn defaultAcl(allocator: Allocator) !storage.Acl {
+    const owner_id = try allocator.dupe(u8, storage.default_owner_id);
+    errdefer allocator.free(owner_id);
+    const owner_dn = try allocator.dupe(u8, storage.default_owner_display_name);
+    errdefer allocator.free(owner_dn);
+
+    const grants = try allocator.alloc(storage.Grant, 1);
+    errdefer allocator.free(grants);
+    const gid = try allocator.dupe(u8, storage.default_owner_id);
+    errdefer allocator.free(gid);
+    const gdn = try allocator.dupe(u8, storage.default_owner_display_name);
+    errdefer allocator.free(gdn);
+    const guri = try allocator.dupe(u8, "");
+    errdefer allocator.free(guri);
+    const gemail = try allocator.dupe(u8, "");
+
+    grants[0] = .{
+        .grantee = .{
+            .kind = .canonical_user,
+            .id = gid,
+            .display_name = gdn,
+            .uri = guri,
+            .email_address = gemail,
+        },
+        .permission = .FULL_CONTROL,
+    };
+    return .{
+        .owner = .{ .id = owner_id, .display_name = owner_dn },
+        .grants = grants,
+    };
 }
 
 allocator: Allocator,
@@ -229,6 +337,19 @@ const vtable: storage.Backend.VTable = .{
     .putObjectTagging = vtPutObjectTagging,
     .getObjectTagging = vtGetObjectTagging,
     .deleteObjectTagging = vtDeleteObjectTagging,
+    .putBucketAcl = vtPutBucketAcl,
+    .getBucketAcl = vtGetBucketAcl,
+    .putObjectAcl = vtPutObjectAcl,
+    .getObjectAcl = vtGetObjectAcl,
+    .putBucketPolicy = vtPutBucketPolicy,
+    .getBucketPolicy = vtGetBucketPolicy,
+    .deleteBucketPolicy = vtDeleteBucketPolicy,
+    .putBucketOwnershipControls = vtPutBucketOwnershipControls,
+    .getBucketOwnershipControls = vtGetBucketOwnershipControls,
+    .deleteBucketOwnershipControls = vtDeleteBucketOwnershipControls,
+    .putPublicAccessBlock = vtPutPublicAccessBlock,
+    .getPublicAccessBlock = vtGetPublicAccessBlock,
+    .deletePublicAccessBlock = vtDeletePublicAccessBlock,
 };
 
 fn vtCreateBucket(ctx: *anyopaque, name: []const u8) storage.Error!void {
@@ -302,6 +423,45 @@ fn vtGetObjectTagging(ctx: *anyopaque, allocator: Allocator, bucket: []const u8,
 }
 fn vtDeleteObjectTagging(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error!void {
     return deleteObjectTagging(@ptrCast(@alignCast(ctx)), bucket, key, version_id);
+}
+fn vtPutBucketAcl(ctx: *anyopaque, bucket: []const u8, acl: storage.Acl) storage.Error!void {
+    return putBucketAcl(@ptrCast(@alignCast(ctx)), bucket, acl);
+}
+fn vtGetBucketAcl(ctx: *anyopaque, allocator: Allocator, bucket: []const u8) storage.Error!storage.Acl {
+    return getBucketAcl(@ptrCast(@alignCast(ctx)), allocator, bucket);
+}
+fn vtPutObjectAcl(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, acl: storage.Acl) storage.Error!void {
+    return putObjectAcl(@ptrCast(@alignCast(ctx)), bucket, key, version_id, acl);
+}
+fn vtGetObjectAcl(ctx: *anyopaque, allocator: Allocator, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error!storage.Acl {
+    return getObjectAcl(@ptrCast(@alignCast(ctx)), allocator, bucket, key, version_id);
+}
+fn vtPutBucketPolicy(ctx: *anyopaque, bucket: []const u8, policy_json: []const u8) storage.Error!void {
+    return putBucketPolicy(@ptrCast(@alignCast(ctx)), bucket, policy_json);
+}
+fn vtGetBucketPolicy(ctx: *anyopaque, allocator: Allocator, bucket: []const u8) storage.Error![]u8 {
+    return getBucketPolicy(@ptrCast(@alignCast(ctx)), allocator, bucket);
+}
+fn vtDeleteBucketPolicy(ctx: *anyopaque, bucket: []const u8) storage.Error!void {
+    return deleteBucketPolicy(@ptrCast(@alignCast(ctx)), bucket);
+}
+fn vtPutBucketOwnershipControls(ctx: *anyopaque, bucket: []const u8, oc: storage.OwnershipControl) storage.Error!void {
+    return putBucketOwnershipControls(@ptrCast(@alignCast(ctx)), bucket, oc);
+}
+fn vtGetBucketOwnershipControls(ctx: *anyopaque, bucket: []const u8) storage.Error!storage.OwnershipControl {
+    return getBucketOwnershipControls(@ptrCast(@alignCast(ctx)), bucket);
+}
+fn vtDeleteBucketOwnershipControls(ctx: *anyopaque, bucket: []const u8) storage.Error!void {
+    return deleteBucketOwnershipControls(@ptrCast(@alignCast(ctx)), bucket);
+}
+fn vtPutPublicAccessBlock(ctx: *anyopaque, bucket: []const u8, pab: storage.PublicAccessBlockConfig) storage.Error!void {
+    return putPublicAccessBlock(@ptrCast(@alignCast(ctx)), bucket, pab);
+}
+fn vtGetPublicAccessBlock(ctx: *anyopaque, bucket: []const u8) storage.Error!storage.PublicAccessBlockConfig {
+    return getPublicAccessBlock(@ptrCast(@alignCast(ctx)), bucket);
+}
+fn vtDeletePublicAccessBlock(ctx: *anyopaque, bucket: []const u8) storage.Error!void {
+    return deletePublicAccessBlock(@ptrCast(@alignCast(ctx)), bucket);
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +581,7 @@ fn putObjectFlat(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput) stora
         .last_modified_unix = nowUnixSeconds(self.io),
         .user_metadata = in.user_metadata,
         .tags = in.tags,
+        .acl = in.acl,
     };
     var meta_buf: [4096]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{key_dir}) catch return storage.Error.Io;
@@ -471,6 +632,7 @@ fn putObjectVersioned(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput, 
         .user_metadata = in.user_metadata,
         .is_delete_marker = false,
         .tags = in.tags,
+        .acl = in.acl,
     };
     var meta_buf: [4096]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{versions_dir}) catch return storage.Error.Io;
@@ -487,6 +649,10 @@ fn putObjectVersioned(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput, 
     writeAtomic(self.io, current_path, version_id_owned) catch return storage.Error.Io;
 
     // 4. In-memory chain update.
+    const acl_dup: ?storage.Acl = if (in.acl) |a|
+        dupeAclOwned(self.allocator, a) catch return storage.Error.OutOfMemory
+    else
+        null;
     const chain_entry: VersionEntry = .{
         .version_id = version_id_owned,
         .is_delete_marker = false,
@@ -496,6 +662,7 @@ fn putObjectVersioned(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput, 
         .last_modified_unix = now,
         .user_metadata = try dupeHeadersStorage(self.allocator, in.user_metadata),
         .tags = try dupeTagsOwned(self.allocator, in.tags),
+        .acl = acl_dup,
     };
 
     if (slot.versions.getPtr(in.key)) |chain| {
@@ -624,6 +791,10 @@ pub fn headObject(self: *Fs, allocator: Allocator, in: storage.HeadObjectInput) 
 }
 
 fn cloneVersionedMeta(allocator: Allocator, key: []const u8, v: VersionEntry) storage.Error!storage.Object {
+    const acl_out: ?storage.Acl = if (v.acl) |a|
+        dupeAclOwned(allocator, a) catch return storage.Error.OutOfMemory
+    else
+        null;
     return .{
         .key = allocator.dupe(u8, key) catch return storage.Error.OutOfMemory,
         .size = v.size,
@@ -634,6 +805,7 @@ fn cloneVersionedMeta(allocator: Allocator, key: []const u8, v: VersionEntry) st
         .version_id = allocator.dupe(u8, v.version_id) catch return storage.Error.OutOfMemory,
         .is_delete_marker = v.is_delete_marker,
         .tags = try cloneTagsTo(allocator, v.tags),
+        .acl = acl_out,
     };
 }
 
@@ -727,6 +899,7 @@ fn freeObjectMetaOwned(gpa: Allocator, o: storage.Object) void {
         gpa.free(t.value);
     }
     gpa.free(o.tags);
+    if (o.acl) |a| freeAclOwned(gpa, a);
     if (o.version_id.len > 0) gpa.free(o.version_id);
 }
 
@@ -1005,6 +1178,10 @@ fn migrateNoneToEnabled(self: *Fs, slot: *BucketSlot) !void {
 
         // Populate in-memory chain (newest-first; chain has one entry).
         var chain: VersionChain = .empty;
+        const acl_dup: ?storage.Acl = if (md.acl) |a|
+            try dupeAclOwned(self.allocator, a)
+        else
+            null;
         const v: VersionEntry = .{
             .version_id = try self.allocator.dupe(u8, "null"),
             .is_delete_marker = false,
@@ -1014,6 +1191,7 @@ fn migrateNoneToEnabled(self: *Fs, slot: *BucketSlot) !void {
             .last_modified_unix = md.last_modified_unix,
             .user_metadata = try dupeHeadersStorage(self.allocator, md.user_metadata),
             .tags = try dupeTagsOwned(self.allocator, md.tags),
+            .acl = acl_dup,
         };
         try chain.append(self.allocator, v);
         const key_owned = try self.allocator.dupe(u8, md.key);
@@ -1068,6 +1246,10 @@ fn rebuildVersionIndex(self: *Fs, slot: *BucketSlot) !void {
 
             if (key_buf == null) key_buf = try self.allocator.dupe(u8, md.key);
 
+            const acl_dup: ?storage.Acl = if (md.acl) |a|
+                try dupeAclOwned(self.allocator, a)
+            else
+                null;
             const v: VersionEntry = .{
                 .version_id = try self.allocator.dupe(u8, v_entry.name),
                 .is_delete_marker = md.is_delete_marker,
@@ -1077,6 +1259,7 @@ fn rebuildVersionIndex(self: *Fs, slot: *BucketSlot) !void {
                 .last_modified_unix = md.last_modified_unix,
                 .user_metadata = try dupeHeadersStorage(self.allocator, md.user_metadata),
                 .tags = try dupeTagsOwned(self.allocator, md.tags),
+                .acl = acl_dup,
             };
             try chain.append(self.allocator, v);
         }
@@ -1108,6 +1291,8 @@ const VersionedMetaDoc = struct {
     is_delete_marker: bool = false,
     /// M9. Defaults to empty for older records.
     tags: []const storage.Tag = &.{},
+    /// M10. `null` on older records → synthesize default on Get.
+    acl: ?storage.Acl = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -1243,6 +1428,7 @@ fn writeFlatObjectTags(self: *Fs, bucket: []const u8, key: []const u8, tags: []c
         .last_modified_unix = meta.last_modified_unix,
         .user_metadata = meta.user_metadata,
         .tags = tags,
+        .acl = meta.acl,
     };
     const hash = keyHash(key);
     var path_buf: [4096]u8 = undefined;
@@ -1263,10 +1449,229 @@ fn rewriteVersionMeta(self: *Fs, bucket: []const u8, key: []const u8, v: *const 
         .user_metadata = v.user_metadata,
         .is_delete_marker = v.is_delete_marker,
         .tags = v.tags,
+        .acl = v.acl,
     };
     const hash = keyHash(key);
     var path_buf: [4096]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&path_buf, "{s}/s3/{s}/objects/{s}/versions/{s}/meta.json", .{ self.base_dir, bucket, &hash, v.version_id }) catch return storage.Error.Io;
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    std.json.fmt(meta_doc, .{}).format(&aw.writer) catch return storage.Error.Io;
+    writeAtomic(self.io, meta_path, aw.written()) catch return storage.Error.Io;
+}
+
+// ---------------------------------------------------------------------------
+// ACLs + policies + ownership + public access block (M10). Bucket-level
+// state lives in the registry; object ACLs live inside per-object/
+// per-version meta.json. Accept-store-roundtrip — no enforcement.
+
+pub fn putBucketAcl(self: *Fs, bucket: []const u8, acl: storage.Acl) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    if (slot.ownership_controls) |oc| {
+        if (oc == .BucketOwnerEnforced) return storage.Error.AccessControlListNotSupported;
+    }
+    const new_acl = dupeAclOwned(self.allocator, acl) catch return storage.Error.OutOfMemory;
+    if (slot.acl) |old| freeAclOwned(self.allocator, old);
+    slot.acl = new_acl;
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+pub fn getBucketAcl(self: *Fs, allocator: Allocator, bucket: []const u8) storage.Error!storage.Acl {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    if (slot.acl) |a| return dupeAclOwned(allocator, a) catch return storage.Error.OutOfMemory;
+    return defaultAcl(allocator) catch return storage.Error.OutOfMemory;
+}
+
+pub fn putObjectAcl(self: *Fs, bucket: []const u8, key: []const u8, version_id: ?[]const u8, acl: storage.Acl) storage.Error!void {
+    try storage.validateObjectKey(key);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    if (slot.ownership_controls) |oc| {
+        if (oc == .BucketOwnerEnforced) return storage.Error.AccessControlListNotSupported;
+    }
+
+    if (slot.versioning_status == .none) {
+        if (version_id) |_| return storage.Error.NoSuchKey;
+        return writeFlatObjectAcl(self, bucket, key, acl);
+    }
+
+    const chain = slot.versions.getPtr(key) orelse return storage.Error.NoSuchKey;
+    if (chain.items.len == 0) return storage.Error.NoSuchKey;
+    var target_idx: usize = 0;
+    if (version_id) |vid| {
+        var found: ?usize = null;
+        for (chain.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.version_id, vid)) {
+                found = i;
+                break;
+            }
+        }
+        target_idx = found orelse return storage.Error.NoSuchKey;
+    }
+    if (chain.items[target_idx].is_delete_marker) return storage.Error.NoSuchKey;
+
+    const new_acl = dupeAclOwned(self.allocator, acl) catch return storage.Error.OutOfMemory;
+    if (chain.items[target_idx].acl) |old| freeAclOwned(self.allocator, old);
+    chain.items[target_idx].acl = new_acl;
+    try rewriteVersionMeta(self, bucket, key, &chain.items[target_idx]);
+}
+
+pub fn getObjectAcl(self: *Fs, allocator: Allocator, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error!storage.Acl {
+    try storage.validateObjectKey(key);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    if (slot.versioning_status == .none) {
+        if (version_id) |_| return storage.Error.NoSuchKey;
+        const meta = readMeta(self, allocator, bucket, key) catch |err| switch (err) {
+            error.FileNotFound => return storage.Error.NoSuchKey,
+            else => return storage.Error.Io,
+        };
+        defer freeObjectMetaOwned(allocator, meta);
+        if (meta.acl) |a| return dupeAclOwned(allocator, a) catch return storage.Error.OutOfMemory;
+        return defaultAcl(allocator) catch return storage.Error.OutOfMemory;
+    }
+
+    const chain = slot.versions.get(key) orelse return storage.Error.NoSuchKey;
+    if (chain.items.len == 0) return storage.Error.NoSuchKey;
+    var target: VersionEntry = chain.items[0];
+    if (version_id) |vid| {
+        var found = false;
+        for (chain.items) |entry| {
+            if (std.mem.eql(u8, entry.version_id, vid)) {
+                target = entry;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return storage.Error.NoSuchKey;
+    }
+    if (target.is_delete_marker) return storage.Error.NoSuchKey;
+    if (target.acl) |a| return dupeAclOwned(allocator, a) catch return storage.Error.OutOfMemory;
+    return defaultAcl(allocator) catch return storage.Error.OutOfMemory;
+}
+
+pub fn putBucketPolicy(self: *Fs, bucket: []const u8, policy_json: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+
+    const copy = self.allocator.dupe(u8, policy_json) catch return storage.Error.OutOfMemory;
+    if (slot.policy_json) |old| self.allocator.free(old);
+    slot.policy_json = copy;
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+pub fn getBucketPolicy(self: *Fs, allocator: Allocator, bucket: []const u8) storage.Error![]u8 {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    const p = slot.policy_json orelse return storage.Error.NoSuchBucketPolicy;
+    return allocator.dupe(u8, p) catch return storage.Error.OutOfMemory;
+}
+
+pub fn deleteBucketPolicy(self: *Fs, bucket: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    if (slot.policy_json) |old| {
+        self.allocator.free(old);
+        slot.policy_json = null;
+        saveRegistry(self) catch return storage.Error.Io;
+    }
+}
+
+pub fn putBucketOwnershipControls(self: *Fs, bucket: []const u8, oc: storage.OwnershipControl) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    slot.ownership_controls = oc;
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+pub fn getBucketOwnershipControls(self: *Fs, bucket: []const u8) storage.Error!storage.OwnershipControl {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    return slot.ownership_controls orelse return storage.Error.OwnershipControlsNotFound;
+}
+
+pub fn deleteBucketOwnershipControls(self: *Fs, bucket: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    if (slot.ownership_controls) |_| {
+        slot.ownership_controls = null;
+        saveRegistry(self) catch return storage.Error.Io;
+    }
+}
+
+pub fn putPublicAccessBlock(self: *Fs, bucket: []const u8, pab: storage.PublicAccessBlockConfig) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    slot.public_access_block = pab;
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+pub fn getPublicAccessBlock(self: *Fs, bucket: []const u8) storage.Error!storage.PublicAccessBlockConfig {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    return slot.public_access_block orelse return storage.Error.NoSuchPublicAccessBlockConfiguration;
+}
+
+pub fn deletePublicAccessBlock(self: *Fs, bucket: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    if (slot.public_access_block) |_| {
+        slot.public_access_block = null;
+        saveRegistry(self) catch return storage.Error.Io;
+    }
+}
+
+fn writeFlatObjectAcl(self: *Fs, bucket: []const u8, key: []const u8, acl: storage.Acl) storage.Error!void {
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const meta = readMeta(self, arena, bucket, key) catch |err| switch (err) {
+        error.FileNotFound => return storage.Error.NoSuchKey,
+        else => return storage.Error.Io,
+    };
+    const meta_doc = MetaDoc{
+        .key = meta.key,
+        .size = meta.size,
+        .etag = meta.etag,
+        .content_type = meta.content_type,
+        .last_modified_unix = meta.last_modified_unix,
+        .user_metadata = meta.user_metadata,
+        .tags = meta.tags,
+        .acl = acl,
+    };
+    const hash = keyHash(key);
+    var path_buf: [4096]u8 = undefined;
+    const meta_path = std.fmt.bufPrint(&path_buf, "{s}/s3/{s}/objects/{s}/meta.json", .{ self.base_dir, bucket, &hash }) catch return storage.Error.Io;
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
     defer aw.deinit();
     std.json.fmt(meta_doc, .{}).format(&aw.writer) catch return storage.Error.Io;
@@ -1493,6 +1898,16 @@ const BucketRecord = struct {
     /// M9. Bucket-level tag set. Missing/null on older records is treated
     /// as "no TagSet" (404 NoSuchTagSet on GetBucketTagging).
     tags: ?[]const storage.Tag = null,
+    /// M10. Bucket-level ACL. `null` → synthesize default on GetBucketAcl.
+    acl: ?storage.Acl = null,
+    /// M10. Bucket policy JSON bytes. `null` → 404 NoSuchBucketPolicy.
+    policy_json: ?[]const u8 = null,
+    /// M10. Tag name for OwnershipControl. `null` → 404
+    /// OwnershipControlsNotFoundError.
+    ownership_controls: ?[]const u8 = null,
+    /// M10. PublicAccessBlock config. `null` → 404
+    /// NoSuchPublicAccessBlockConfiguration.
+    public_access_block: ?storage.PublicAccessBlockConfig = null,
 };
 
 const MetaDoc = struct {
@@ -1504,6 +1919,8 @@ const MetaDoc = struct {
     user_metadata: []const storage.Header,
     /// M9. Defaults to empty for older records.
     tags: []const storage.Tag = &.{},
+    /// M10. `null` on older records → synthesize default on Get.
+    acl: ?storage.Acl = null,
 };
 
 fn loadRegistry(self: *Fs) !void {
@@ -1532,6 +1949,18 @@ fn loadRegistry(self: *Fs) !void {
             try dupeTagsOwned(self.allocator, t)
         else
             &.{};
+        const acl_owned: ?storage.Acl = if (rec.acl) |a|
+            try dupeAclOwned(self.allocator, a)
+        else
+            null;
+        const policy_owned: ?[]u8 = if (rec.policy_json) |p|
+            try self.allocator.dupe(u8, p)
+        else
+            null;
+        const oc_parsed: ?storage.OwnershipControl = if (rec.ownership_controls) |s|
+            storage.ownershipControlFromString(s) catch null
+        else
+            null;
         var slot: BucketSlot = .{
             .meta = .{
                 .name = name_owned,
@@ -1543,6 +1972,10 @@ fn loadRegistry(self: *Fs) !void {
             .versioning_status = versioning,
             .versions = std.StringHashMap(VersionChain).init(self.allocator),
             .tags = tags_owned,
+            .acl = acl_owned,
+            .policy_json = policy_owned,
+            .ownership_controls = oc_parsed,
+            .public_access_block = rec.public_access_block,
         };
         // Walk objects/ to rebuild the in-memory key index from meta.json files.
         try rebuildKeyIndex(self, &slot);
@@ -1605,6 +2038,10 @@ fn readMeta(self: *Fs, allocator: Allocator, bucket: []const u8, key: []const u8
     }
 
     const tags = try cloneTagsTo(allocator, value.tags);
+    const acl_out: ?storage.Acl = if (value.acl) |a|
+        dupeAclOwned(allocator, a) catch return storage.Error.OutOfMemory
+    else
+        null;
 
     return .{
         .key = try allocator.dupe(u8, value.key),
@@ -1614,6 +2051,7 @@ fn readMeta(self: *Fs, allocator: Allocator, bucket: []const u8, key: []const u8
         .last_modified_unix = value.last_modified_unix,
         .user_metadata = headers,
         .tags = tags,
+        .acl = acl_out,
     };
 }
 
@@ -1630,12 +2068,17 @@ fn saveRegistry(self: *Fs) !void {
             .suspended => "suspended",
         };
         const tags_field: ?[]const storage.Tag = if (b.tags.len == 0) null else b.tags;
+        const oc_str: ?[]const u8 = if (b.ownership_controls) |oc| storage.ownershipControlToString(oc) else null;
         records[i] = .{
             .name = b.meta.name,
             .region = b.meta.region,
             .created_unix = b.meta.created_unix,
             .versioning = versioning_str,
             .tags = tags_field,
+            .acl = b.acl,
+            .policy_json = b.policy_json,
+            .ownership_controls = oc_str,
+            .public_access_block = b.public_access_block,
         };
     }
     const doc: RegistryDoc = .{ .version = registry_version, .buckets = records };
@@ -1663,6 +2106,8 @@ const ManifestDoc = struct {
     parts: []const ManifestPart,
     /// M9. Tags applied to the merged object on Complete.
     tags: []const storage.Tag = &.{},
+    /// M10. ACL applied to the merged object on Complete.
+    acl: ?storage.Acl = null,
 };
 
 const ManifestPart = struct {
@@ -1697,6 +2142,11 @@ pub fn initiateMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Init
     errdefer freeHeadersStorage(self.allocator, meta_owned);
     const tags_owned = dupeTagsOwned(self.allocator, in.tags) catch return storage.Error.OutOfMemory;
     errdefer freeTagsOwned(self.allocator, tags_owned);
+    const acl_owned: ?storage.Acl = if (in.acl) |a|
+        dupeAclOwned(self.allocator, a) catch return storage.Error.OutOfMemory
+    else
+        null;
+    errdefer if (acl_owned) |a| freeAclOwned(self.allocator, a);
 
     const state: MultipartState = .{
         .key = key_owned,
@@ -1705,6 +2155,7 @@ pub fn initiateMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Init
         .initiated_unix = nowUnixSeconds(self.io),
         .parts = std.AutoHashMap(u32, PartMeta).init(self.allocator),
         .tags = tags_owned,
+        .acl = acl_owned,
     };
 
     const id_for_map = self.allocator.dupe(u8, upload_id) catch return storage.Error.OutOfMemory;
@@ -1803,6 +2254,7 @@ pub fn completeMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Comp
         .last_modified_unix = nowUnixSeconds(self.io),
         .user_metadata = state.user_metadata,
         .tags = state.tags,
+        .acl = state.acl,
     };
     var meta_buf: [4096]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{key_dir}) catch return storage.Error.Io;
@@ -2040,6 +2492,7 @@ fn writeManifest(self: *Fs, bucket: []const u8, upload_id: []const u8, state: *c
         .initiated_unix = state.initiated_unix,
         .parts = parts,
         .tags = state.tags,
+        .acl = state.acl,
     };
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
     defer aw.deinit();
@@ -2071,6 +2524,10 @@ fn rebuildUploadIndex(self: *Fs, slot: *BucketSlot) !void {
         defer parsed.deinit();
         const value = parsed.value;
 
+        const acl_dup: ?storage.Acl = if (value.acl) |a|
+            try dupeAclOwned(self.allocator, a)
+        else
+            null;
         var state: MultipartState = .{
             .key = try self.allocator.dupe(u8, value.key),
             .content_type = try self.allocator.dupe(u8, value.content_type),
@@ -2078,6 +2535,7 @@ fn rebuildUploadIndex(self: *Fs, slot: *BucketSlot) !void {
             .initiated_unix = value.initiated_unix,
             .parts = std.AutoHashMap(u32, PartMeta).init(self.allocator),
             .tags = try dupeTagsOwned(self.allocator, value.tags),
+            .acl = acl_dup,
         };
         for (value.parts) |p| {
             const etag_owned = try self.allocator.dupe(u8, p.etag);
