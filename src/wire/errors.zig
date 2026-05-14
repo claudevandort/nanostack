@@ -49,6 +49,7 @@ pub const Code = enum {
     object_lock_configuration_not_found_error,
     invalid_bucket_state,
     invalid_retention_period,
+    replication_configuration_not_found_error,
     internal_error,
 
     pub fn awsCode(self: Code) []const u8 {
@@ -93,6 +94,7 @@ pub const Code = enum {
             .object_lock_configuration_not_found_error => "ObjectLockConfigurationNotFoundError",
             .invalid_bucket_state => "InvalidBucketState",
             .invalid_retention_period => "InvalidRetentionPeriod",
+            .replication_configuration_not_found_error => "ReplicationConfigurationNotFoundError",
             .internal_error => "InternalError",
         };
     }
@@ -139,6 +141,7 @@ pub const Code = enum {
             .object_lock_configuration_not_found_error => "Object Lock configuration does not exist for this bucket",
             .invalid_bucket_state => "The request is not valid with the current state of the bucket.",
             .invalid_retention_period => "The retention period specified is not valid.",
+            .replication_configuration_not_found_error => "The replication configuration was not found",
             .internal_error => "We encountered an internal error. Please try again.",
         };
     }
@@ -172,6 +175,7 @@ pub const Code = enum {
             .object_lock_configuration_not_found_error => 404,
             .invalid_bucket_state => 409,
             .invalid_retention_period => 400,
+            .replication_configuration_not_found_error => 404,
             .method_not_allowed => 405,
             .internal_error => 500,
         };

@@ -25,6 +25,7 @@ pub const Error = error{
     InvalidBucketState,
     InvalidRetentionPeriod,
     AccessDenied,
+    ReplicationConfigurationNotFound,
     BucketAlreadyExists,
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
@@ -544,6 +545,40 @@ pub const ObjectRetention = struct {
     retain_until_unix: i64,
 };
 
+// ---------------------------------------------------------------------------
+// Bucket replication (M13). Accept-store-roundtrip — no data actually
+// crosses to a destination bucket.
+
+pub const ReplicationStatus = enum { Enabled, Disabled };
+
+pub fn replicationStatusFromString(s: []const u8) error{InvalidReplicationStatus}!ReplicationStatus {
+    inline for (@typeInfo(ReplicationStatus).@"enum".fields) |f| {
+        if (std.mem.eql(u8, s, f.name)) return @field(ReplicationStatus, f.name);
+    }
+    return error.InvalidReplicationStatus;
+}
+
+pub const ReplicationDestination = struct {
+    /// ARN of the destination bucket (e.g. `arn:aws:s3:::dest-bucket`).
+    bucket: []const u8,
+    /// Optional storage class for replicated objects.
+    storage_class: []const u8 = "",
+};
+
+pub const ReplicationRule = struct {
+    id: []const u8 = "",
+    status: ReplicationStatus,
+    /// Legacy prefix filter (AWS V1 form).
+    prefix: []const u8 = "",
+    destination: ReplicationDestination,
+};
+
+pub const ReplicationConfig = struct {
+    /// IAM role ARN used to perform replication.
+    role: []const u8,
+    rules: []const ReplicationRule,
+};
+
 /// One bucket's persisted metadata. Strings borrow from the backend's
 /// allocator; consumers must not retain past the backend lifetime unless
 /// they dupe. `listBuckets` returns a slice freshly allocated by the
@@ -592,6 +627,15 @@ pub const Object = struct {
     retention_mode: ?RetentionMode = null,
     retain_until_unix: i64 = 0,
     legal_hold: bool = false,
+    /// M13. Restore-from-Glacier state. `restore_in_progress` flips to
+    /// true on POST `?restore`; `restore_expiry_unix` is computed from
+    /// `now + Days*86400`. No actual data movement.
+    restore_in_progress: bool = false,
+    restore_expiry_unix: i64 = 0,
+    /// M13. Per-object SSE algorithm + KMS key id (set via
+    /// `UpdateObjectEncryption`). No actual cipher work.
+    sse_algorithm: ?SseAlgorithm = null,
+    sse_kms_key_id: []const u8 = "",
 };
 
 pub const PutObjectInput = struct {
@@ -611,6 +655,11 @@ pub const PutObjectInput = struct {
     retention_mode: ?RetentionMode = null,
     retain_until_unix: i64 = 0,
     legal_hold: bool = false,
+    /// M13. Per-object SSE (typically set via UpdateObjectEncryption,
+    /// but also accepted via `x-amz-server-side-encryption[-aws-kms-key-id]`
+    /// headers on the write).
+    sse_algorithm: ?SseAlgorithm = null,
+    sse_kms_key_id: []const u8 = "",
 };
 
 pub const PutObjectOutput = struct {
@@ -718,6 +767,9 @@ pub const InitiateMultipartUploadInput = struct {
     retention_mode: ?RetentionMode = null,
     retain_until_unix: i64 = 0,
     legal_hold: bool = false,
+    /// M13. SSE applied to the final merged object.
+    sse_algorithm: ?SseAlgorithm = null,
+    sse_kms_key_id: []const u8 = "",
 };
 
 /// M12. Input to `createBucket`. The `object_lock_enabled` flag is set
@@ -941,6 +993,13 @@ pub const Backend = struct {
         getObjectRetention: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!ObjectRetention,
         putObjectLegalHold: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, status: LegalHoldStatus) Error!void,
         getObjectLegalHold: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!LegalHoldStatus,
+        // M13.
+        getBucketPolicyStatus: *const fn (ctx: *anyopaque, bucket: []const u8) Error!bool,
+        restoreObject: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) Error!void,
+        updateObjectEncryption: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, algorithm: SseAlgorithm, kms_key_id: []const u8) Error!void,
+        putBucketReplication: *const fn (ctx: *anyopaque, bucket: []const u8, cfg: ReplicationConfig) Error!void,
+        getBucketReplication: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8) Error!ReplicationConfig,
+        deleteBucketReplication: *const fn (ctx: *anyopaque, bucket: []const u8) Error!void,
     };
 
     // Pass-through helpers so call sites don't dereference the vtable.
@@ -1135,6 +1194,25 @@ pub const Backend = struct {
     pub fn getObjectLegalHold(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!LegalHoldStatus {
         return self.vtable.getObjectLegalHold(self.ctx, bucket, key, version_id);
     }
+
+    pub fn getBucketPolicyStatus(self: Backend, bucket: []const u8) Error!bool {
+        return self.vtable.getBucketPolicyStatus(self.ctx, bucket);
+    }
+    pub fn restoreObject(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) Error!void {
+        return self.vtable.restoreObject(self.ctx, bucket, key, version_id, days);
+    }
+    pub fn updateObjectEncryption(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8, algorithm: SseAlgorithm, kms_key_id: []const u8) Error!void {
+        return self.vtable.updateObjectEncryption(self.ctx, bucket, key, version_id, algorithm, kms_key_id);
+    }
+    pub fn putBucketReplication(self: Backend, bucket: []const u8, cfg: ReplicationConfig) Error!void {
+        return self.vtable.putBucketReplication(self.ctx, bucket, cfg);
+    }
+    pub fn getBucketReplication(self: Backend, allocator: Allocator, bucket: []const u8) Error!ReplicationConfig {
+        return self.vtable.getBucketReplication(self.ctx, allocator, bucket);
+    }
+    pub fn deleteBucketReplication(self: Backend, bucket: []const u8) Error!void {
+        return self.vtable.deleteBucketReplication(self.ctx, bucket);
+    }
 };
 
 /// Validate an S3 object key. AWS permits virtually any UTF-8; the only
@@ -1306,4 +1384,11 @@ test "legalHoldFromString round-trip" {
     try testing.expectEqual(LegalHoldStatus.OFF, try legalHoldFromString("OFF"));
     try testing.expectError(error.InvalidLegalHoldStatus, legalHoldFromString("on"));
     try testing.expectEqualStrings("ON", legalHoldToString(.ON));
+}
+
+test "replicationStatusFromString" {
+    const testing = std.testing;
+    try testing.expectEqual(ReplicationStatus.Enabled, try replicationStatusFromString("Enabled"));
+    try testing.expectEqual(ReplicationStatus.Disabled, try replicationStatusFromString("Disabled"));
+    try testing.expectError(error.InvalidReplicationStatus, replicationStatusFromString("enabled"));
 }

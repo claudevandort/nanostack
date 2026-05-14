@@ -67,6 +67,12 @@ pub const Operation = enum {
     get_object_retention,
     put_object_legal_hold,
     get_object_legal_hold,
+    get_bucket_policy_status,
+    restore_object,
+    update_object_encryption,
+    put_bucket_replication,
+    get_bucket_replication,
+    delete_bucket_replication,
     unknown,
 };
 
@@ -142,6 +148,13 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
             if (eql(method, "PUT")) return .put_object_legal_hold;
             if (eql(method, "GET")) return .get_object_legal_hold;
         }
+        // M13: object-level restore (POST) + per-object encryption (PUT).
+        if (eql(method, "POST") and hasQueryParam(query, "restore")) return .restore_object;
+        if (eql(method, "PUT") and hasQueryParam(query, "encryption")) return .update_object_encryption;
+        // Explicitly never-implemented sub-resources route to `.unknown`
+        // (501 NotImplemented) rather than falling through to get_object.
+        if (hasQueryParam(query, "torrent")) return .unknown;
+        if (hasQueryParam(query, "select")) return .unknown;
         if (eql(method, "PUT")) return .put_object;
         if (eql(method, "GET")) return .get_object;
         if (eql(method, "HEAD")) return .head_object;
@@ -166,6 +179,8 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
         if (hasQueryParam(query, "notification")) return .get_bucket_notification;
         if (hasQueryParam(query, "website")) return .get_bucket_website;
         if (hasQueryParam(query, "object-lock")) return .get_object_lock_config;
+        if (hasQueryParam(query, "policyStatus")) return .get_bucket_policy_status;
+        if (hasQueryParam(query, "replication")) return .get_bucket_replication;
         if (hasQueryParam(query, "uploads")) return .list_multipart_uploads;
         if (queryParamEquals(query, "list-type", "2")) return .list_objects_v2;
         return .list_objects;
@@ -183,6 +198,7 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
         if (hasQueryParam(query, "notification")) return .put_bucket_notification;
         if (hasQueryParam(query, "website")) return .put_bucket_website;
         if (hasQueryParam(query, "object-lock")) return .put_object_lock_config;
+        if (hasQueryParam(query, "replication")) return .put_bucket_replication;
         return .create_bucket;
     }
     if (eql(method, "DELETE") and has_bucket) {
@@ -194,6 +210,7 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
         if (hasQueryParam(query, "encryption")) return .delete_bucket_encryption;
         if (hasQueryParam(query, "lifecycle")) return .delete_bucket_lifecycle;
         if (hasQueryParam(query, "website")) return .delete_bucket_website;
+        if (hasQueryParam(query, "replication")) return .delete_bucket_replication;
         return .delete_bucket;
     }
     if (eql(method, "HEAD") and has_bucket) return .head_bucket;
@@ -551,4 +568,22 @@ test "retention: PUT/GET /b/k?retention" {
 test "legal-hold: PUT/GET /b/k?legal-hold" {
     try testing.expectEqual(Operation.put_object_legal_hold, parse("PUT", "localhost", "/buk/k", "legal-hold").op);
     try testing.expectEqual(Operation.get_object_legal_hold, parse("GET", "localhost", "/buk/k", "legal-hold").op);
+}
+
+test "policyStatus: GET /b?policyStatus" {
+    try testing.expectEqual(Operation.get_bucket_policy_status, parse("GET", "localhost", "/buk", "policyStatus").op);
+}
+
+test "restore: POST /b/k?restore" {
+    try testing.expectEqual(Operation.restore_object, parse("POST", "localhost", "/buk/k", "restore").op);
+}
+
+test "objectEncryption: PUT /b/k?encryption" {
+    try testing.expectEqual(Operation.update_object_encryption, parse("PUT", "localhost", "/buk/k", "encryption").op);
+}
+
+test "replication: PUT/GET/DELETE /b?replication" {
+    try testing.expectEqual(Operation.put_bucket_replication, parse("PUT", "localhost", "/buk", "replication").op);
+    try testing.expectEqual(Operation.get_bucket_replication, parse("GET", "localhost", "/buk", "replication").op);
+    try testing.expectEqual(Operation.delete_bucket_replication, parse("DELETE", "localhost", "/buk", "replication").op);
 }

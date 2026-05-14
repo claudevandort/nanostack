@@ -1,6 +1,6 @@
 # nanostack Operation Support Matrix
 
-**Version:** v0.0.2 + M11 + M12 in progress (Object Lock with WORM enforcement)
+**Version:** v0.1.0 in progress (S3 functionally complete for local dev)
 
 **How to read this matrix:** each row is one S3 operation or cross-cutting capability. Status is one of:
 
@@ -67,6 +67,10 @@ The "Milestone" column points at the release tag in which the capability landed.
 | PutObjectLockConfiguration / GetObjectLockConfiguration | supported (XML body + default-retention rule; 409 InvalidBucketState on non-locked bucket; 404 ObjectLockConfigurationNotFoundError) | M12 |
 | PutObjectRetention / GetObjectRetention | supported (per-version; GOVERNANCE/COMPLIANCE mode-transition rules enforced) | M12 |
 | PutObjectLegalHold / GetObjectLegalHold | supported (per-version; legal hold supersedes retention) | M12 |
+| GetBucketPolicyStatus | supported (lightweight IsPublic heuristic; 404 NoSuchBucketPolicy on untouched) | M13 |
+| RestoreObject | supported (accept-store-roundtrip; 202 Accepted; surfaces `x-amz-restore` on HEAD/GET; no actual data movement) | M13 |
+| UpdateObjectEncryption | supported (per-version; persists algorithm + KMS key id; surfaces `x-amz-server-side-encryption[-aws-kms-key-id]` on HEAD/GET; no actual cipher) | M13 |
+| PutBucketReplication / GetBucketReplication / DeleteBucketReplication | supported (accept-store-roundtrip; no actual replication; 404 ReplicationConfigurationNotFoundError on untouched) | M13 |
 
 ### v1 cross-cutting
 
@@ -129,6 +133,30 @@ The "Milestone" column points at the release tag in which the capability landed.
 | Bucket-policy condition-key validation | not supported (well-formed JSON only) | post-v1.1 |
 | Bucket-policy size cap (20 KB) | not enforced (documented divergence) | post-v1.1 |
 | Access Points / MRAP / S3 Access Grants | not supported | post-v1.1 |
+
+### Post-v0.1.0 deferred (~39 ops, S3 dev-emulator non-goals)
+
+After v0.1.0, S3 is functionally complete for **local dev** purposes — ~99% of real dev workflows are covered. The remaining ~36% Smithy coverage is split between three categories nanostack doesn't aim to provide:
+
+**Observability / metrics CRUDs (16 ops; "M14 deferred indefinitely")**
+- `Put/Get/Delete/ListBucketMetricsConfiguration(s)` — CloudWatch request metrics filters; no CloudWatch in nanostack.
+- `Put/Get/Delete/ListBucketInventoryConfiguration(s)` — periodic inventory reports; we don't generate them.
+- `Put/Get/Delete/ListBucketAnalyticsConfiguration(s)` — storage-class analysis output; same.
+- `Put/Get/Delete/ListBucketIntelligentTieringConfiguration(s)` — auto-tiering; no tiering happens.
+
+**Niche / rarely-emitted (~6 ops)**
+- `Put/GetBucketLogging` — server access logs; we don't generate them.
+- `Put/GetBucketAccelerateConfiguration` — Transfer Acceleration; no CloudFront in nanostack.
+- `Put/GetBucketRequestPayment` — requester-pays billing; no billing.
+
+**Distinct sub-services + deprecated (~13 ops)**
+- `CreateSession`, `RenameObject` — S3 Express One Zone (directory buckets). Different service surface.
+- `WriteGetObjectResponse` — S3 Object Lambda. Requires Lambda service.
+- `SelectObjectContent` — S3 Select (SQL over objects). AWS-deprecated; huge implementation surface. Currently nanostack's 501 sentinel.
+- `GetObjectTorrent` — deprecated BitTorrent feature; never coming back.
+- Bucket metadata tables (`Create/Delete/GetBucketMetadataConfiguration`, etc., 7 ops) — 2024 Iceberg-table feature; niche.
+
+These will only be added if a real user hits a setup-script gap; not on any roadmap.
 
 ### Object Lock + WORM enforcement (M12)
 

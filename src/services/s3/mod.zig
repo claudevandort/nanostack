@@ -35,6 +35,10 @@ const object_lock_service = @import("object_lock.zig");
 const object_retention_service = @import("object_retention.zig");
 const object_legal_hold_service = @import("object_legal_hold.zig");
 const object_retention_wire = @import("../../wire/object_retention.zig");
+const policy_status_service = @import("policy_status.zig");
+const restore_service = @import("restore.zig");
+const object_encryption_service = @import("object_encryption.zig");
+const replication_service = @import("replication.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -286,6 +290,20 @@ pub fn handle(ctx: Context, parsed: router.Parsed) Result {
             parsed.bucket orelse return .{ .err = .invalid_request },
             parsed.key orelse return .{ .err = .invalid_request },
         ),
+        .get_bucket_policy_status => policy_status_service.getBucketPolicyStatus(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .restore_object => restore_service.restoreObject(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .update_object_encryption => object_encryption_service.updateObjectEncryption(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .put_bucket_replication => replication_service.putBucketReplication(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .get_bucket_replication => replication_service.getBucketReplication(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .delete_bucket_replication => replication_service.deleteBucketReplication(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
         .unknown => .{ .err = .not_implemented },
     };
 }
@@ -430,6 +448,7 @@ pub fn mapStorageErr(e: storage.Error) errors.Code {
         storage.Error.InvalidBucketState => .invalid_bucket_state,
         storage.Error.InvalidRetentionPeriod => .invalid_retention_period,
         storage.Error.AccessDenied => .access_denied,
+        storage.Error.ReplicationConfigurationNotFound => .replication_configuration_not_found_error,
         storage.Error.BucketAlreadyExists => .bucket_already_exists,
         storage.Error.BucketAlreadyOwnedByYou => .bucket_already_owned_by_you,
         storage.Error.BucketNotEmpty => .bucket_not_empty,
@@ -919,6 +938,21 @@ fn buildHeadHeaders(ctx: Context, meta: storage.Object) ![]Header {
     return hs.toOwnedSlice(ctx.allocator);
 }
 
+/// M13: emit x-amz-restore (when restore state set) + SSE response headers.
+fn appendRestoreAndSseHeaders(ctx: Context, hs: *std.ArrayList(Header), meta: storage.Object) !void {
+    if (meta.restore_in_progress) {
+        const expiry = try object_retention_wire.formatIsoUnix(ctx.allocator, meta.restore_expiry_unix);
+        const val = try std.fmt.allocPrint(ctx.allocator, "ongoing-request=\"false\", expiry-date=\"{s}\"", .{expiry});
+        try hs.append(ctx.allocator, .{ .name = "x-amz-restore", .value = val });
+    }
+    if (meta.sse_algorithm) |a| {
+        try hs.append(ctx.allocator, .{ .name = "x-amz-server-side-encryption", .value = storage.sseAlgorithmToString(a) });
+        if (meta.sse_kms_key_id.len > 0) {
+            try hs.append(ctx.allocator, .{ .name = "x-amz-server-side-encryption-aws-kms-key-id", .value = meta.sse_kms_key_id });
+        }
+    }
+}
+
 fn appendLockHeaders(ctx: Context, hs: *std.ArrayList(Header), meta: storage.Object) !void {
     if (meta.retention_mode) |m| {
         try hs.append(ctx.allocator, .{ .name = "x-amz-object-lock-mode", .value = storage.retentionModeToString(m) });
@@ -949,6 +983,7 @@ fn buildObjectHeadersWithVersion(ctx: Context, meta: storage.Object, range_heade
         try hs.append(ctx.allocator, .{ .name = "x-amz-tagging-count", .value = count_str });
     }
     try appendLockHeaders(ctx, &hs, meta);
+    try appendRestoreAndSseHeaders(ctx, &hs, meta);
     return hs.toOwnedSlice(ctx.allocator);
 }
 
@@ -966,6 +1001,7 @@ fn buildHeadHeadersWithVersion(ctx: Context, meta: storage.Object) ![]Header {
         try hs.append(ctx.allocator, .{ .name = "x-amz-tagging-count", .value = count_str });
     }
     try appendLockHeaders(ctx, &hs, meta);
+    try appendRestoreAndSseHeaders(ctx, &hs, meta);
     return hs.toOwnedSlice(ctx.allocator);
 }
 

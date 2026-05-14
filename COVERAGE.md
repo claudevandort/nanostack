@@ -2,9 +2,9 @@
 
 Generated from `s3.json` and `src/router.zig`.
 
-**Coverage: 62 / 107 operations (57.9%)**
+**Coverage: 68 / 107 operations (63.6%)**
 
-## Covered (62)
+## Covered (68)
 
 - AbortMultipartUpload
 - CompleteMultipartUpload
@@ -17,6 +17,7 @@ Generated from `s3.json` and `src/router.zig`.
 - DeleteBucketLifecycle
 - DeleteBucketOwnershipControls
 - DeleteBucketPolicy
+- DeleteBucketReplication
 - DeleteBucketTagging
 - DeleteBucketWebsite
 - DeleteObject
@@ -30,6 +31,8 @@ Generated from `s3.json` and `src/router.zig`.
 - GetBucketNotificationConfiguration
 - GetBucketOwnershipControls
 - GetBucketPolicy
+- GetBucketPolicyStatus
+- GetBucketReplication
 - GetBucketTagging
 - GetBucketVersioning
 - GetBucketWebsite
@@ -56,6 +59,7 @@ Generated from `s3.json` and `src/router.zig`.
 - PutBucketNotificationConfiguration
 - PutBucketOwnershipControls
 - PutBucketPolicy
+- PutBucketReplication
 - PutBucketTagging
 - PutBucketVersioning
 - PutBucketWebsite
@@ -66,16 +70,14 @@ Generated from `s3.json` and `src/router.zig`.
 - PutObjectRetention
 - PutObjectTagging
 - PutPublicAccessBlock
+- RestoreObject
+- UpdateObjectEncryption
 - UploadPart
 - UploadPartCopy — *Dispatched from upload_part when x-amz-copy-source header is present*
 
-## Unrouted (45)
+## Unrouted (39)
 
 Grouped thematically. Most of these are explicit non-goals for v1.x (PRD §15) — kept here as the AWS-side checklist.
-
-### ACL / policy / ownership (1)
-
-- GetBucketPolicyStatus
 
 ### Accelerate (2)
 
@@ -106,10 +108,6 @@ Grouped thematically. Most of these are explicit non-goals for v1.x (PRD §15) �
 - GetBucketLocation
 - ListDirectoryBuckets
 - PutBucketAbac
-
-### Encryption / SSE (1)
-
-- UpdateObjectEncryption
 
 ### Intelligent tiering (4)
 
@@ -150,19 +148,12 @@ Grouped thematically. Most of these are explicit non-goals for v1.x (PRD §15) �
 
 - CreateSession
 
-### Replication (3)
-
-- DeleteBucketReplication
-- GetBucketReplication
-- PutBucketReplication
-
 ### Request payment (2)
 
 - GetBucketRequestPayment
 - PutBucketRequestPayment
 
-### Restore / Glacier (2)
+### Restore / Glacier (1)
 
-- RestoreObject
 - SelectObjectContent
 

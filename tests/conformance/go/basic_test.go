@@ -2,10 +2,9 @@
 // official aws-sdk-go-v2 client.
 //
 // This file keeps the basic NotImplemented contract for un-mapped
-// operations. M3 routed all object operations; M4 routed ListObjects(V2);
-// M6 routed the seven multipart operations. RestoreObject
-// (`POST /bucket/key?restore`) is the current sentinel — restore is
-// post-v1 per the PRD and stays unrouted indefinitely.
+// operations. M13 routed RestoreObject (formerly the sentinel); the new
+// sentinel is GetObjectTorrent — an AWS-deprecated op that stays unrouted
+// indefinitely.
 package conformance
 
 import (
@@ -16,7 +15,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithy "github.com/aws/smithy-go"
 )
 
@@ -28,15 +26,12 @@ func TestUnroutedOperationReturnsNotImplemented(t *testing.T) {
 	}
 	defer cleanupBucket(t, c, bucket)
 
-	// RestoreObject is post-v1 (`POST /bucket/key?restore`) — POST on a
-	// keyed path with no `?uploads`/`?uploadId` falls through to
-	// `.unknown` in the router and should surface as 501 NotImplemented.
-	_, err := c.RestoreObject(context.Background(), &s3.RestoreObjectInput{
+	// GetObjectTorrent (`GET /bucket/key?torrent`) is AWS-deprecated — GET
+	// on a keyed path with `?torrent` falls through to `.unknown` in the
+	// router and should surface as 501 NotImplemented.
+	_, err := c.GetObjectTorrent(context.Background(), &s3.GetObjectTorrentInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String("k"),
-		RestoreRequest: &types.RestoreRequest{
-			Days: aws.Int32(1),
-		},
 	})
 	if err == nil {
 		t.Fatalf("expected NotImplemented error, got nil")

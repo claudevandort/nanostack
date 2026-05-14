@@ -28,6 +28,10 @@ pub const object_attributes = @import("wire/object_attributes.zig");
 pub const object_lock_config = @import("wire/object_lock_config.zig");
 pub const object_retention = @import("wire/object_retention.zig");
 pub const object_legal_hold = @import("wire/object_legal_hold.zig");
+pub const policy_status = @import("wire/policy_status.zig");
+pub const restore_request = @import("wire/restore_request.zig");
+pub const object_encryption_update = @import("wire/object_encryption_update.zig");
+pub const replication_config = @import("wire/replication_config.zig");
 pub const router = @import("router.zig");
 pub const http_range = @import("http/range.zig");
 pub const http_date = @import("http/date.zig");
@@ -57,6 +61,10 @@ pub const object_attributes_service = @import("services/s3/object_attributes.zig
 pub const object_lock_service = @import("services/s3/object_lock.zig");
 pub const object_retention_service = @import("services/s3/object_retention.zig");
 pub const object_legal_hold_service = @import("services/s3/object_legal_hold.zig");
+pub const policy_status_service = @import("services/s3/policy_status.zig");
+pub const restore_service = @import("services/s3/restore.zig");
+pub const object_encryption_service = @import("services/s3/object_encryption.zig");
+pub const replication_service = @import("services/s3/replication.zig");
 pub const cli = @import("cli.zig");
 pub const version = @import("version.zig");
 
@@ -88,6 +96,10 @@ test {
     _ = object_lock_config;
     _ = object_retention;
     _ = object_legal_hold;
+    _ = policy_status;
+    _ = restore_request;
+    _ = object_encryption_update;
+    _ = replication_config;
     _ = router;
     _ = http_range;
     _ = http_date;
@@ -117,6 +129,10 @@ test {
     _ = object_lock_service;
     _ = object_retention_service;
     _ = object_legal_hold_service;
+    _ = policy_status_service;
+    _ = restore_service;
+    _ = object_encryption_service;
+    _ = replication_service;
     _ = cli;
     _ = version;
 }

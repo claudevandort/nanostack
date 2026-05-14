@@ -47,6 +47,9 @@ const MultipartState = struct {
     retention_mode: ?storage.RetentionMode = null,
     retain_until_unix: i64 = 0,
     legal_hold: bool = false,
+    /// M13. SSE applied to the merged object on Complete.
+    sse_algorithm: ?storage.SseAlgorithm = null,
+    sse_kms_key_id: []u8 = &.{},
 
     fn deinit(self: *MultipartState, gpa: Allocator) void {
         gpa.free(self.key);
@@ -61,6 +64,7 @@ const MultipartState = struct {
         self.parts.deinit();
         freeTagsOwned(gpa, self.tags);
         if (self.acl) |a| freeAclOwned(gpa, a);
+        if (self.sse_kms_key_id.len > 0) gpa.free(self.sse_kms_key_id);
         self.* = undefined;
     }
 };
@@ -82,6 +86,11 @@ const VersionEntry = struct {
     retention_mode: ?storage.RetentionMode = null,
     retain_until_unix: i64 = 0,
     legal_hold: bool = false,
+    /// M13. Per-version restore + SSE state.
+    restore_in_progress: bool = false,
+    restore_expiry_unix: i64 = 0,
+    sse_algorithm: ?storage.SseAlgorithm = null,
+    sse_kms_key_id: []u8 = &.{},
 
     fn deinit(self: *VersionEntry, gpa: Allocator) void {
         gpa.free(self.version_id);
@@ -94,6 +103,7 @@ const VersionEntry = struct {
         gpa.free(self.user_metadata);
         freeTagsOwned(gpa, self.tags);
         if (self.acl) |a| freeAclOwned(gpa, a);
+        if (self.sse_kms_key_id.len > 0) gpa.free(self.sse_kms_key_id);
         self.* = undefined;
     }
 };
@@ -147,6 +157,8 @@ const BucketSlot = struct {
     /// `getObjectLockConfig` returns the empty-Rule config (Enabled=true,
     /// no default retention) when locked but unset, and 404 when not locked.
     object_lock_config: ?storage.ObjectLockConfig = null,
+    /// Replication config (M13). `null` → 404 ReplicationConfigurationNotFoundError.
+    replication: ?storage.ReplicationConfig = null,
 
     fn deinit(self: *BucketSlot, gpa: Allocator) void {
         gpa.free(self.meta.name);
@@ -177,6 +189,7 @@ const BucketSlot = struct {
         if (self.notification) |c| freeNotificationConfig(gpa, c);
         if (self.website) |c| freeWebsiteConfig(gpa, c);
         if (self.object_lock_config) |_| {}  // No owned strings in this config.
+        if (self.replication) |c| freeReplicationConfig(gpa, c);
         self.* = undefined;
     }
 };
@@ -651,6 +664,46 @@ fn freeWebsiteConfig(gpa: Allocator, cfg: storage.WebsiteConfig) void {
     gpa.free(cfg.routing_rules);
 }
 
+// Replication (M13)
+fn dupeReplicationRule(gpa: Allocator, r: storage.ReplicationRule) !storage.ReplicationRule {
+    return .{
+        .id = try gpa.dupe(u8, r.id),
+        .status = r.status,
+        .prefix = try gpa.dupe(u8, r.prefix),
+        .destination = .{
+            .bucket = try gpa.dupe(u8, r.destination.bucket),
+            .storage_class = try gpa.dupe(u8, r.destination.storage_class),
+        },
+    };
+}
+
+fn freeReplicationRule(gpa: Allocator, r: storage.ReplicationRule) void {
+    gpa.free(r.id);
+    gpa.free(r.prefix);
+    gpa.free(r.destination.bucket);
+    gpa.free(r.destination.storage_class);
+}
+
+fn dupeReplicationConfig(gpa: Allocator, src: storage.ReplicationConfig) !storage.ReplicationConfig {
+    const role = try gpa.dupe(u8, src.role);
+    errdefer gpa.free(role);
+    const rules = try gpa.alloc(storage.ReplicationRule, src.rules.len);
+    errdefer gpa.free(rules);
+    var made: usize = 0;
+    errdefer for (rules[0..made]) |r| freeReplicationRule(gpa, r);
+    for (src.rules) |r| {
+        rules[made] = try dupeReplicationRule(gpa, r);
+        made += 1;
+    }
+    return .{ .role = role, .rules = rules };
+}
+
+fn freeReplicationConfig(gpa: Allocator, cfg: storage.ReplicationConfig) void {
+    gpa.free(cfg.role);
+    for (cfg.rules) |r| freeReplicationRule(gpa, r);
+    gpa.free(cfg.rules);
+}
+
 allocator: Allocator,
 io: Io,
 base_dir: []u8,
@@ -754,6 +807,12 @@ const vtable: storage.Backend.VTable = .{
     .getObjectRetention = vtGetObjectRetention,
     .putObjectLegalHold = vtPutObjectLegalHold,
     .getObjectLegalHold = vtGetObjectLegalHold,
+    .getBucketPolicyStatus = vtGetBucketPolicyStatus,
+    .restoreObject = vtRestoreObject,
+    .updateObjectEncryption = vtUpdateObjectEncryption,
+    .putBucketReplication = vtPutBucketReplication,
+    .getBucketReplication = vtGetBucketReplication,
+    .deleteBucketReplication = vtDeleteBucketReplication,
 };
 
 fn vtCreateBucket(ctx: *anyopaque, in: storage.CreateBucketInput) storage.Error!void {
@@ -927,6 +986,24 @@ fn vtPutObjectLegalHold(ctx: *anyopaque, bucket: []const u8, key: []const u8, ve
 fn vtGetObjectLegalHold(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error!storage.LegalHoldStatus {
     return getObjectLegalHold(@ptrCast(@alignCast(ctx)), bucket, key, version_id);
 }
+fn vtGetBucketPolicyStatus(ctx: *anyopaque, bucket: []const u8) storage.Error!bool {
+    return getBucketPolicyStatus(@ptrCast(@alignCast(ctx)), bucket);
+}
+fn vtRestoreObject(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) storage.Error!void {
+    return restoreObject(@ptrCast(@alignCast(ctx)), bucket, key, version_id, days);
+}
+fn vtUpdateObjectEncryption(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, algorithm: storage.SseAlgorithm, kms_key_id: []const u8) storage.Error!void {
+    return updateObjectEncryption(@ptrCast(@alignCast(ctx)), bucket, key, version_id, algorithm, kms_key_id);
+}
+fn vtPutBucketReplication(ctx: *anyopaque, bucket: []const u8, cfg: storage.ReplicationConfig) storage.Error!void {
+    return putBucketReplication(@ptrCast(@alignCast(ctx)), bucket, cfg);
+}
+fn vtGetBucketReplication(ctx: *anyopaque, allocator: Allocator, bucket: []const u8) storage.Error!storage.ReplicationConfig {
+    return getBucketReplication(@ptrCast(@alignCast(ctx)), allocator, bucket);
+}
+fn vtDeleteBucketReplication(ctx: *anyopaque, bucket: []const u8) storage.Error!void {
+    return deleteBucketReplication(@ptrCast(@alignCast(ctx)), bucket);
+}
 
 // ---------------------------------------------------------------------------
 // Bucket ops
@@ -1057,6 +1134,8 @@ fn putObjectFlat(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput) stora
         .retention_mode = effective.mode,
         .retain_until_unix = effective.retain_until_unix,
         .legal_hold = effective.legal_hold,
+        .sse_algorithm = in.sse_algorithm,
+        .sse_kms_key_id = in.sse_kms_key_id,
     };
     var meta_buf: [4096]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{key_dir}) catch return storage.Error.Io;
@@ -1160,6 +1239,8 @@ fn putObjectVersioned(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput, 
         .retention_mode = effective.mode,
         .retain_until_unix = effective.retain_until_unix,
         .legal_hold = effective.legal_hold,
+        .sse_algorithm = in.sse_algorithm,
+        .sse_kms_key_id = in.sse_kms_key_id,
     };
     var meta_buf: [4096]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{versions_dir}) catch return storage.Error.Io;
@@ -1180,6 +1261,10 @@ fn putObjectVersioned(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput, 
         dupeAclOwned(self.allocator, a) catch return storage.Error.OutOfMemory
     else
         null;
+    const sse_kms_dup: []u8 = if (in.sse_kms_key_id.len > 0)
+        try self.allocator.dupe(u8, in.sse_kms_key_id)
+    else
+        &.{};
     const chain_entry: VersionEntry = .{
         .version_id = version_id_owned,
         .is_delete_marker = false,
@@ -1193,6 +1278,8 @@ fn putObjectVersioned(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput, 
         .retention_mode = effective.mode,
         .retain_until_unix = effective.retain_until_unix,
         .legal_hold = effective.legal_hold,
+        .sse_algorithm = in.sse_algorithm,
+        .sse_kms_key_id = sse_kms_dup,
     };
 
     if (slot.versions.getPtr(in.key)) |chain| {
@@ -1339,6 +1426,10 @@ fn cloneVersionedMeta(allocator: Allocator, key: []const u8, v: VersionEntry) st
         .retention_mode = v.retention_mode,
         .retain_until_unix = v.retain_until_unix,
         .legal_hold = v.legal_hold,
+        .restore_in_progress = v.restore_in_progress,
+        .restore_expiry_unix = v.restore_expiry_unix,
+        .sse_algorithm = v.sse_algorithm,
+        .sse_kms_key_id = allocator.dupe(u8, v.sse_kms_key_id) catch return storage.Error.OutOfMemory,
     };
 }
 
@@ -1433,6 +1524,7 @@ fn freeObjectMetaOwned(gpa: Allocator, o: storage.Object) void {
     }
     gpa.free(o.tags);
     if (o.acl) |a| freeAclOwned(gpa, a);
+    if (o.sse_kms_key_id.len > 0) gpa.free(o.sse_kms_key_id);
     if (o.version_id.len > 0) gpa.free(o.version_id);
 }
 
@@ -1752,6 +1844,10 @@ fn migrateNoneToEnabled(self: *Fs, slot: *BucketSlot) !void {
             .retention_mode = md.retention_mode,
             .retain_until_unix = md.retain_until_unix,
             .legal_hold = md.legal_hold,
+            .restore_in_progress = md.restore_in_progress,
+            .restore_expiry_unix = md.restore_expiry_unix,
+            .sse_algorithm = md.sse_algorithm,
+            .sse_kms_key_id = try self.allocator.dupe(u8, md.sse_kms_key_id),
         };
         try chain.append(self.allocator, v);
         const key_owned = try self.allocator.dupe(u8, md.key);
@@ -1820,6 +1916,10 @@ fn rebuildVersionIndex(self: *Fs, slot: *BucketSlot) !void {
                 .user_metadata = try dupeHeadersStorage(self.allocator, md.user_metadata),
                 .tags = try dupeTagsOwned(self.allocator, md.tags),
                 .acl = acl_dup,
+                .restore_in_progress = md.restore_in_progress,
+                .restore_expiry_unix = md.restore_expiry_unix,
+                .sse_algorithm = md.sse_algorithm,
+                .sse_kms_key_id = try self.allocator.dupe(u8, md.sse_kms_key_id),
                 .retention_mode = md.retention_mode,
                 .retain_until_unix = md.retain_until_unix,
                 .legal_hold = md.legal_hold,
@@ -1860,6 +1960,11 @@ const VersionedMetaDoc = struct {
     retention_mode: ?storage.RetentionMode = null,
     retain_until_unix: i64 = 0,
     legal_hold: bool = false,
+    /// M13. Restore + SSE.
+    restore_in_progress: bool = false,
+    restore_expiry_unix: i64 = 0,
+    sse_algorithm: ?storage.SseAlgorithm = null,
+    sse_kms_key_id: []const u8 = "",
 };
 
 // ---------------------------------------------------------------------------
@@ -1999,6 +2104,10 @@ fn writeFlatObjectTags(self: *Fs, bucket: []const u8, key: []const u8, tags: []c
         .retention_mode = meta.retention_mode,
         .retain_until_unix = meta.retain_until_unix,
         .legal_hold = meta.legal_hold,
+        .restore_in_progress = meta.restore_in_progress,
+        .restore_expiry_unix = meta.restore_expiry_unix,
+        .sse_algorithm = meta.sse_algorithm,
+        .sse_kms_key_id = meta.sse_kms_key_id,
     };
     const hash = keyHash(key);
     var path_buf: [4096]u8 = undefined;
@@ -2023,6 +2132,10 @@ fn rewriteVersionMeta(self: *Fs, bucket: []const u8, key: []const u8, v: *const 
         .retention_mode = v.retention_mode,
         .retain_until_unix = v.retain_until_unix,
         .legal_hold = v.legal_hold,
+        .restore_in_progress = v.restore_in_progress,
+        .restore_expiry_unix = v.restore_expiry_unix,
+        .sse_algorithm = v.sse_algorithm,
+        .sse_kms_key_id = v.sse_kms_key_id,
     };
     const hash = keyHash(key);
     var path_buf: [4096]u8 = undefined;
@@ -2550,6 +2663,221 @@ pub fn getObjectLegalHold(self: *Fs, bucket: []const u8, key: []const u8, versio
     return if (target.legal_hold) .ON else .OFF;
 }
 
+// ---------------------------------------------------------------------------
+// M13: PolicyStatus, RestoreObject, UpdateObjectEncryption, Replication.
+
+pub fn getBucketPolicyStatus(self: *Fs, bucket: []const u8) storage.Error!bool {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    const policy = slot.policy_json orelse return storage.Error.NoSuchBucketPolicy;
+    // Lightweight heuristic: IsPublic=true if policy contains both
+    // `"Principal":"*"` (with optional whitespace) and `"Effect":"Allow"`.
+    return containsPublicPrincipalAllow(policy);
+}
+
+fn containsPublicPrincipalAllow(s: []const u8) bool {
+    // Look for "Principal" : "*" (allowing whitespace around the colon)
+    // and "Effect" : "Allow" similarly. Cheap and matches real Statement
+    // shapes; misses edge cases like Principal: { "AWS": "*" } which we
+    // treat as conservative-false.
+    var i: usize = 0;
+    var has_principal_star = false;
+    while (std.mem.indexOfPos(u8, s, i, "\"Principal\"")) |p| {
+        const rest = s[p + "\"Principal\"".len ..];
+        var j: usize = 0;
+        while (j < rest.len and (rest[j] == ' ' or rest[j] == '\t' or rest[j] == ':')) : (j += 1) {}
+        if (j < rest.len and rest[j] == '"') {
+            j += 1;
+            if (j < rest.len and rest[j] == '*') {
+                has_principal_star = true;
+                break;
+            }
+        }
+        i = p + 1;
+    }
+    if (!has_principal_star) return false;
+    i = 0;
+    while (std.mem.indexOfPos(u8, s, i, "\"Effect\"")) |p| {
+        const rest = s[p + "\"Effect\"".len ..];
+        if (std.mem.indexOf(u8, rest, "\"Allow\"")) |_| return true;
+        i = p + 1;
+    }
+    return false;
+}
+
+pub fn restoreObject(self: *Fs, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) storage.Error!void {
+    try storage.validateObjectKey(key);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    if (slot.versioning_status == .none) {
+        // Restore on a flat object: rewrite meta.json.
+        if (version_id) |_| return storage.Error.NoSuchKey;
+        return writeFlatRestore(self, bucket, key, days);
+    }
+
+    const chain = slot.versions.getPtr(key) orelse return storage.Error.NoSuchKey;
+    if (chain.items.len == 0) return storage.Error.NoSuchKey;
+    var target_idx: usize = 0;
+    if (version_id) |vid| {
+        var found: ?usize = null;
+        for (chain.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.version_id, vid)) {
+                found = i;
+                break;
+            }
+        }
+        target_idx = found orelse return storage.Error.NoSuchKey;
+    }
+    if (chain.items[target_idx].is_delete_marker) return storage.Error.NoSuchKey;
+
+    const now = nowUnixSeconds(self.io);
+    chain.items[target_idx].restore_in_progress = true;
+    chain.items[target_idx].restore_expiry_unix = now + @as(i64, @intCast(days)) * 86400;
+    try rewriteVersionMeta(self, bucket, key, &chain.items[target_idx]);
+}
+
+fn writeFlatRestore(self: *Fs, bucket: []const u8, key: []const u8, days: u32) storage.Error!void {
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const meta = readMeta(self, arena, bucket, key) catch |err| switch (err) {
+        error.FileNotFound => return storage.Error.NoSuchKey,
+        else => return storage.Error.Io,
+    };
+    const now = nowUnixSeconds(self.io);
+    const meta_doc = MetaDoc{
+        .key = meta.key,
+        .size = meta.size,
+        .etag = meta.etag,
+        .content_type = meta.content_type,
+        .last_modified_unix = meta.last_modified_unix,
+        .user_metadata = meta.user_metadata,
+        .tags = meta.tags,
+        .acl = meta.acl,
+        .retention_mode = meta.retention_mode,
+        .retain_until_unix = meta.retain_until_unix,
+        .legal_hold = meta.legal_hold,
+        .restore_in_progress = true,
+        .restore_expiry_unix = now + @as(i64, @intCast(days)) * 86400,
+        .sse_algorithm = meta.sse_algorithm,
+        .sse_kms_key_id = meta.sse_kms_key_id,
+    };
+    const hash = keyHash(key);
+    var path_buf: [4096]u8 = undefined;
+    const meta_path = std.fmt.bufPrint(&path_buf, "{s}/s3/{s}/objects/{s}/meta.json", .{ self.base_dir, bucket, &hash }) catch return storage.Error.Io;
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    std.json.fmt(meta_doc, .{}).format(&aw.writer) catch return storage.Error.Io;
+    writeAtomic(self.io, meta_path, aw.written()) catch return storage.Error.Io;
+}
+
+pub fn updateObjectEncryption(self: *Fs, bucket: []const u8, key: []const u8, version_id: ?[]const u8, algorithm: storage.SseAlgorithm, kms_key_id: []const u8) storage.Error!void {
+    try storage.validateObjectKey(key);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    if (slot.versioning_status == .none) {
+        if (version_id) |_| return storage.Error.NoSuchKey;
+        return writeFlatObjectEncryption(self, bucket, key, algorithm, kms_key_id);
+    }
+
+    const chain = slot.versions.getPtr(key) orelse return storage.Error.NoSuchKey;
+    if (chain.items.len == 0) return storage.Error.NoSuchKey;
+    var target_idx: usize = 0;
+    if (version_id) |vid| {
+        var found: ?usize = null;
+        for (chain.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.version_id, vid)) {
+                found = i;
+                break;
+            }
+        }
+        target_idx = found orelse return storage.Error.NoSuchKey;
+    }
+    if (chain.items[target_idx].is_delete_marker) return storage.Error.NoSuchKey;
+
+    const new_kms: []u8 = if (kms_key_id.len > 0) try self.allocator.dupe(u8, kms_key_id) else &.{};
+    if (chain.items[target_idx].sse_kms_key_id.len > 0) self.allocator.free(chain.items[target_idx].sse_kms_key_id);
+    chain.items[target_idx].sse_algorithm = algorithm;
+    chain.items[target_idx].sse_kms_key_id = new_kms;
+    try rewriteVersionMeta(self, bucket, key, &chain.items[target_idx]);
+}
+
+fn writeFlatObjectEncryption(self: *Fs, bucket: []const u8, key: []const u8, algorithm: storage.SseAlgorithm, kms_key_id: []const u8) storage.Error!void {
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const meta = readMeta(self, arena, bucket, key) catch |err| switch (err) {
+        error.FileNotFound => return storage.Error.NoSuchKey,
+        else => return storage.Error.Io,
+    };
+    const meta_doc = MetaDoc{
+        .key = meta.key,
+        .size = meta.size,
+        .etag = meta.etag,
+        .content_type = meta.content_type,
+        .last_modified_unix = meta.last_modified_unix,
+        .user_metadata = meta.user_metadata,
+        .tags = meta.tags,
+        .acl = meta.acl,
+        .retention_mode = meta.retention_mode,
+        .retain_until_unix = meta.retain_until_unix,
+        .legal_hold = meta.legal_hold,
+        .restore_in_progress = meta.restore_in_progress,
+        .restore_expiry_unix = meta.restore_expiry_unix,
+        .sse_algorithm = algorithm,
+        .sse_kms_key_id = kms_key_id,
+    };
+    const hash = keyHash(key);
+    var path_buf: [4096]u8 = undefined;
+    const meta_path = std.fmt.bufPrint(&path_buf, "{s}/s3/{s}/objects/{s}/meta.json", .{ self.base_dir, bucket, &hash }) catch return storage.Error.Io;
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    std.json.fmt(meta_doc, .{}).format(&aw.writer) catch return storage.Error.Io;
+    writeAtomic(self.io, meta_path, aw.written()) catch return storage.Error.Io;
+}
+
+pub fn putBucketReplication(self: *Fs, bucket: []const u8, cfg: storage.ReplicationConfig) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    const dup = dupeReplicationConfig(self.allocator, cfg) catch return storage.Error.OutOfMemory;
+    if (slot.replication) |old| freeReplicationConfig(self.allocator, old);
+    slot.replication = dup;
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+pub fn getBucketReplication(self: *Fs, allocator: Allocator, bucket: []const u8) storage.Error!storage.ReplicationConfig {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    const cfg = slot.replication orelse return storage.Error.ReplicationConfigurationNotFound;
+    return dupeReplicationConfig(allocator, cfg) catch return storage.Error.OutOfMemory;
+}
+
+pub fn deleteBucketReplication(self: *Fs, bucket: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    if (slot.replication) |old| {
+        freeReplicationConfig(self.allocator, old);
+        slot.replication = null;
+        saveRegistry(self) catch return storage.Error.Io;
+    }
+}
+
 fn writeFlatObjectAcl(self: *Fs, bucket: []const u8, key: []const u8, acl: storage.Acl) storage.Error!void {
     var arena_state = std.heap.ArenaAllocator.init(self.allocator);
     defer arena_state.deinit();
@@ -2571,6 +2899,10 @@ fn writeFlatObjectAcl(self: *Fs, bucket: []const u8, key: []const u8, acl: stora
         .retention_mode = meta.retention_mode,
         .retain_until_unix = meta.retain_until_unix,
         .legal_hold = meta.legal_hold,
+        .restore_in_progress = meta.restore_in_progress,
+        .restore_expiry_unix = meta.restore_expiry_unix,
+        .sse_algorithm = meta.sse_algorithm,
+        .sse_kms_key_id = meta.sse_kms_key_id,
     };
     const hash = keyHash(key);
     var path_buf: [4096]u8 = undefined;
@@ -2820,6 +3152,8 @@ const BucketRecord = struct {
     /// M12. Object Lock state.
     object_lock_enabled: bool = false,
     object_lock_config: ?storage.ObjectLockConfig = null,
+    /// M13. Replication config.
+    replication: ?storage.ReplicationConfig = null,
 };
 
 const MetaDoc = struct {
@@ -2837,6 +3171,11 @@ const MetaDoc = struct {
     retention_mode: ?storage.RetentionMode = null,
     retain_until_unix: i64 = 0,
     legal_hold: bool = false,
+    /// M13. Restore + SSE.
+    restore_in_progress: bool = false,
+    restore_expiry_unix: i64 = 0,
+    sse_algorithm: ?storage.SseAlgorithm = null,
+    sse_kms_key_id: []const u8 = "",
 };
 
 fn loadRegistry(self: *Fs) !void {
@@ -2904,6 +3243,7 @@ fn loadRegistry(self: *Fs) !void {
             .website = website_owned,
             .object_lock_enabled = rec.object_lock_enabled,
             .object_lock_config = rec.object_lock_config,
+            .replication = if (rec.replication) |c| try dupeReplicationConfig(self.allocator, c) else null,
         };
         // Walk objects/ to rebuild the in-memory key index from meta.json files.
         try rebuildKeyIndex(self, &slot);
@@ -2983,6 +3323,10 @@ fn readMeta(self: *Fs, allocator: Allocator, bucket: []const u8, key: []const u8
         .retention_mode = value.retention_mode,
         .retain_until_unix = value.retain_until_unix,
         .legal_hold = value.legal_hold,
+        .restore_in_progress = value.restore_in_progress,
+        .restore_expiry_unix = value.restore_expiry_unix,
+        .sse_algorithm = value.sse_algorithm,
+        .sse_kms_key_id = try allocator.dupe(u8, value.sse_kms_key_id),
     };
 }
 
@@ -3017,6 +3361,7 @@ fn saveRegistry(self: *Fs) !void {
             .website = b.website,
             .object_lock_enabled = b.object_lock_enabled,
             .object_lock_config = b.object_lock_config,
+            .replication = b.replication,
         };
     }
     const doc: RegistryDoc = .{ .version = registry_version, .buckets = records };
@@ -3050,6 +3395,9 @@ const ManifestDoc = struct {
     retention_mode: ?storage.RetentionMode = null,
     retain_until_unix: i64 = 0,
     legal_hold: bool = false,
+    /// M13. SSE applied to the merged object on Complete.
+    sse_algorithm: ?storage.SseAlgorithm = null,
+    sse_kms_key_id: []const u8 = "",
 };
 
 const ManifestPart = struct {
@@ -3090,6 +3438,10 @@ pub fn initiateMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Init
         null;
     errdefer if (acl_owned) |a| freeAclOwned(self.allocator, a);
 
+    const sse_kms_dup: []u8 = if (in.sse_kms_key_id.len > 0)
+        try self.allocator.dupe(u8, in.sse_kms_key_id)
+    else
+        &.{};
     const state: MultipartState = .{
         .key = key_owned,
         .content_type = ct_owned,
@@ -3101,6 +3453,8 @@ pub fn initiateMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Init
         .retention_mode = in.retention_mode,
         .retain_until_unix = in.retain_until_unix,
         .legal_hold = in.legal_hold,
+        .sse_algorithm = in.sse_algorithm,
+        .sse_kms_key_id = sse_kms_dup,
     };
 
     const id_for_map = self.allocator.dupe(u8, upload_id) catch return storage.Error.OutOfMemory;
@@ -3205,6 +3559,8 @@ pub fn completeMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Comp
         .retention_mode = effective_mpu.mode,
         .retain_until_unix = effective_mpu.retain_until_unix,
         .legal_hold = effective_mpu.legal_hold,
+        .sse_algorithm = state.sse_algorithm,
+        .sse_kms_key_id = state.sse_kms_key_id,
     };
     var meta_buf: [4096]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{key_dir}) catch return storage.Error.Io;
@@ -3446,6 +3802,8 @@ fn writeManifest(self: *Fs, bucket: []const u8, upload_id: []const u8, state: *c
         .retention_mode = state.retention_mode,
         .retain_until_unix = state.retain_until_unix,
         .legal_hold = state.legal_hold,
+        .sse_algorithm = state.sse_algorithm,
+        .sse_kms_key_id = state.sse_kms_key_id,
     };
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
     defer aw.deinit();
@@ -3492,6 +3850,8 @@ fn rebuildUploadIndex(self: *Fs, slot: *BucketSlot) !void {
             .retention_mode = value.retention_mode,
             .retain_until_unix = value.retain_until_unix,
             .legal_hold = value.legal_hold,
+            .sse_algorithm = value.sse_algorithm,
+            .sse_kms_key_id = try self.allocator.dupe(u8, value.sse_kms_key_id),
         };
         for (value.parts) |p| {
             const etag_owned = try self.allocator.dupe(u8, p.etag);
