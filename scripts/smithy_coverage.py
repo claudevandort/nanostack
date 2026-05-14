@@ -2,13 +2,12 @@
 """Compare nanostack's routed S3 operations against the AWS S3 Smithy model.
 
 Reads the cached Smithy JSON at `scripts/.cache/s3.json` (refresh with
-`make smithy-refresh` or by re-running this script's fetch step) and the
-`Operation` enum in `src/router.zig`. Emits a Markdown coverage report
-to stdout.
+`--refresh`) and the `Operation` enum in `src/router.zig`. Emits a
+Markdown coverage report to stdout.
 
 Usage:
-    python3 scripts/smithy_coverage.py
-    python3 scripts/smithy_coverage.py --refresh   # re-download s3.json
+    python3 scripts/smithy_coverage.py > docs/COVERAGE.md
+    python3 scripts/smithy_coverage.py --refresh > docs/COVERAGE.md
 """
 
 from __future__ import annotations

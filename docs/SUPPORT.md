@@ -9,7 +9,7 @@
 - **deferred** — explicitly out of scope for v1; not yet routed.
 - **planned** — on the roadmap for the indicated milestone.
 
-The "Milestone" column points at the release tag in which the capability landed. If you need a behaviour that's not on this matrix, file an issue — we'd rather be honest about gaps than over-promise. The source of truth for the v1 scope (the surface we aim to cover by `v0.0.1`) is [`docs/PRD.md`](docs/PRD.md) §8.
+The "Milestone" column points at the release tag in which the capability landed. If you need a behaviour that's not on this matrix, file an issue — we'd rather be honest about gaps than over-promise. The source of truth for the v1 scope (the surface we aim to cover by `v0.0.1`) is [`PRD.md`](PRD.md) §8.
 
 ## S3
 

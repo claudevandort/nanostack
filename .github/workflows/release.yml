@@ -55,7 +55,8 @@ jobs:
           stage="$(mktemp -d)/nanostack-${{ steps.ver.outputs.tag }}-${{ matrix.asset }}"
           mkdir -p "$stage"
           cp "zig-out/release/${{ matrix.target }}/nanostack" "$stage/"
-          cp LICENSE README.md SUPPORT.md SCORECARD.md CHANGELOG.md "$stage/"
+          cp LICENSE README.md "$stage/"
+          cp -r docs "$stage/docs"
           tar -czf "dist/nanostack-${{ steps.ver.outputs.tag }}-${{ matrix.asset }}.tar.gz" \
             -C "$(dirname "$stage")" "$(basename "$stage")"
           (cd dist && sha256sum "nanostack-${{ steps.ver.outputs.tag }}-${{ matrix.asset }}.tar.gz" \
@@ -100,10 +101,10 @@ jobs:
         id: notes
         run: |
           version="${{ steps.ver.outputs.version }}"
-          if grep -q "^## \[$version\]" CHANGELOG.md; then
-            awk "/^## \[$version\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md > release-notes.md
+          if grep -q "^## \[$version\]" docs/CHANGELOG.md; then
+            awk "/^## \[$version\]/{flag=1; next} /^## \[/{flag=0} flag" docs/CHANGELOG.md > release-notes.md
           else
-            echo "No CHANGELOG entry for $version. See CHANGELOG.md." > release-notes.md
+            echo "No CHANGELOG entry for $version. See docs/CHANGELOG.md." > release-notes.md
           fi
           echo "----- release notes -----"
           cat release-notes.md

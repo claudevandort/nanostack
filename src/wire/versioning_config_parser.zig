@@ -8,7 +8,7 @@
 //!
 //! Driven by `ianprime0509/zig-xml`. Only the `<Status>` value is
 //! interpreted; `<MfaDelete>` is ignored (M8 deferral, documented in
-//! SUPPORT.md).
+//! docs/SUPPORT.md).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

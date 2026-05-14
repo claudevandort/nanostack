@@ -19,6 +19,6 @@
         "src",
         "LICENSE",
         "README.md",
-        "SUPPORT.md",
+        "docs",
     },
 }

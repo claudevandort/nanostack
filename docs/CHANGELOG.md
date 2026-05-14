@@ -95,4 +95,4 @@ First pinned release of the nanostack S3 v1 surface. 19 operations, full SigV4 (
 - The pre-M7 in-memory backend (`--ephemeral`) was removed (commit `0656161`). Tests and CI now use `--data-dir <tmp>` for wipe-clean runs.
 - See [`SUPPORT.md`](SUPPORT.md) for the full operation matrix and the deferred-feature list.
 - See [`SCORECARD.md`](SCORECARD.md) for the LocalStack-comparable accuracy claims.
-- See [`docs/PRD.md`](docs/PRD.md) for the product spec, design decisions (§17a), and post-v1 roadmap (§15).
+- See [`PRD.md`](PRD.md) for the product spec, design decisions (§17a), and post-v1 roadmap (§15).

@@ -1,6 +1,6 @@
 # nanostack — Performance Gate
 
-**Version:** v0.0.1 (2026-05-13)
+**Version:** v0.1.0 (2026-05-14)
 
 The PRD's "snappy" promise is enforced by a perf gate that runs in CI on every push. This document explains what we measure, the budgets we hold ourselves to, and the latest numbers from the most recent main-branch run.
 
@@ -18,7 +18,7 @@ The harness spawns nanostack with `--data-dir <mktemp>` so every run starts from
 
 ## What we measure
 
-All gated budgets come from [`docs/PRD.md`](docs/PRD.md) §12. Source of truth lives in [`bench/budgets.json`](bench/budgets.json).
+All gated budgets come from [`PRD.md`](PRD.md) §12. Source of truth lives in [`../bench/budgets.json`](../bench/budgets.json).
 
 | Metric | Budget |
 |---|---|

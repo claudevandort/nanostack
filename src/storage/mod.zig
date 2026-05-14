@@ -93,7 +93,7 @@ fn hasAwsPrefix(s: []const u8) bool {
 //
 // nanostack does NOT enforce ACLs or policies on requests. M10 is
 // accept-store-roundtrip: parse, persist, and surface on Get. Documented
-// divergence in SUPPORT.md.
+// divergence in docs/SUPPORT.md.
 
 pub const CannedAcl = enum {
     private,

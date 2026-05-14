@@ -6,7 +6,7 @@ labels: enhancement
 ---
 
 > **Please check first:**
-> - [`SUPPORT.md`](../../SUPPORT.md) — is it already listed as `stub`, `planned`, or `deferred`?
+> - [`docs/SUPPORT.md`](../../docs/SUPPORT.md) — is it already listed as `stub`, `planned`, or `deferred`?
 > - [`docs/PRD.md`](../../docs/PRD.md) §15 (post-v1 roadmap) — is it on the deliberate-defer list?
 >
 > If it's there, this issue is most useful as a `+1` with your use case attached.
