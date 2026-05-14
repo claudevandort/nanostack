@@ -14,6 +14,35 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ---
 
+## [0.1.0] — 2026-05-14
+
+**First minor release. S3 is functionally complete for local-dev use.**
+
+Per the [versioning scheme](#versioning-scheme), minor releases mark "one AWS service fully implemented against the real-AWS surface." We meet this for *local dev emulator* purposes: 68 / 107 Smithy ops routed (63.6%), but **~99% of real dev workflows** covered. The remaining 39 ops are observability padding, distinct sub-services, or deprecated — none of them are observable in a local dev context.
+
+### S3 milestones since v0.0.2
+
+- **M11 — Bucket setup essentials** (`6211715`): CORS, Encryption, Lifecycle, Notifications, Website, GetObjectAttributes. 15 ops. Closes the "real setup script tries to call X after CreateBucket" gap.
+- **M12 — Object Lock + retention + legal hold** (`34f53f7`): 6 ops with **real WORM enforcement** — first nanostack milestone where persisted state actually blocks deletes. GOVERNANCE/COMPLIANCE mode transitions, legal hold supersedes retention, bypass-governance honoured, CreateBucket auto-enables versioning on locked buckets.
+- **M13 — Close the S3 dev-emulator surface** (`7877760`): GetBucketPolicyStatus (IsPublic heuristic), RestoreObject (flips the 501 sentinel to GetObjectTorrent), UpdateObjectEncryption (per-version SSE), Put/Get/DeleteBucketReplication. 6 ops.
+
+### Operation coverage
+
+68 routed / 107 Smithy operations. See [`COVERAGE.md`](COVERAGE.md) for the table and [`SUPPORT.md`](SUPPORT.md) for the categorised "post-v0.1.0 deferred" list (~39 ops split into observability padding, niche, and distinct sub-services).
+
+### Conformance + perf gate
+
+Every CI run (Ubuntu + macOS) executes:
+- Full Zig unit suite (~316 tests).
+- Full Go conformance (~117 tests) at port 14566.
+- Full JS conformance (51 tests) at port 14566.
+- Perf gate from PRD §12 (cold start, idle RSS, binary size, PUT/GET p50/p99, throughput, multipart).
+
+### Notes
+- The pre-M7 in-memory backend stays removed; everything uses `--data-dir` (pass a tmpdir for wipe-clean runs).
+- The Object Lock WORM enforcement (M12) is a documented departure from the M10/M11 "accept-store-only" pattern — see SUPPORT.md.
+- Per the assessment in the project notes, the next high-leverage move is **a second AWS service** (DynamoDB / SQS / IAM / SNS). Padding the S3 number with M14-class observability CRUDs has diminishing returns for a local dev emulator.
+
 ## [0.0.2] — 2026-05-14
 
 Second pinned cut. Closes the **v1.1 wave**: bucket versioning, S3 tagging, and ACLs/policies/ownership/public-access-block (accept-store-roundtrip). Full Go + JS conformance green on every CI run; perf gate unchanged.

@@ -1,6 +1,6 @@
 # nanostack Operation Support Matrix
 
-**Version:** v0.1.0 in progress (S3 functionally complete for local dev)
+**Version:** v0.1.0 (S3 functionally complete for local dev)
 
 **How to read this matrix:** each row is one S3 operation or cross-cutting capability. Status is one of:
 
