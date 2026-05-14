@@ -711,6 +711,12 @@ pub const GetObjectOutput = struct {
 
 pub const DeletedKey = struct {
     key: []const u8,
+    /// Echoed back when the request supplied an explicit VersionId.
+    version_id: ?[]const u8 = null,
+    /// True when the delete created (or removed) a delete marker.
+    delete_marker: bool = false,
+    /// The version id of the delete marker (if `delete_marker == true`).
+    delete_marker_version_id: ?[]const u8 = null,
 };
 
 pub const DeleteError = struct {

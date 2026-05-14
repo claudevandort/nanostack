@@ -872,17 +872,32 @@ fn deleteObjects(ctx: Context, bucket: []const u8) Result {
         const hv = findHeader(ctx.request.headers, "x-amz-bypass-governance-retention") orelse break :blk false;
         break :blk std.ascii.eqlIgnoreCase(hv, "true");
     };
-    for (parsed_body.keys) |k| {
-        _ = ctx.backend.deleteObject(.{ .bucket = bucket, .key = k, .bypass_governance = bypass_governance }) catch |err| {
+    for (parsed_body.objects) |entry| {
+        const out = ctx.backend.deleteObject(.{
+            .bucket = bucket,
+            .key = entry.key,
+            .version_id = entry.version_id,
+            .bypass_governance = bypass_governance,
+        }) catch |err| {
             const code: errors.Code = mapStorageErr(err);
             errs.append(ctx.allocator, .{
-                .key = k,
+                .key = entry.key,
                 .code = code.awsCode(),
                 .message = code.defaultMessage(),
             }) catch return .{ .err = .internal_error };
             continue;
         };
-        deleted.append(ctx.allocator, .{ .key = k }) catch return .{ .err = .internal_error };
+        // AWS-exact response shape:
+        //  - request set VersionId → echo it back via <VersionId>.
+        //  - delete created a delete marker (no VersionId in request, versioned bucket)
+        //    → <DeleteMarker>true</DeleteMarker> + <DeleteMarkerVersionId>...</DeleteMarkerVersionId>.
+        var entry_result: storage.DeletedKey = .{ .key = entry.key };
+        if (entry.version_id) |v| entry_result.version_id = v;
+        if (out.delete_marker) {
+            entry_result.delete_marker = true;
+            if (out.version_id.len > 0) entry_result.delete_marker_version_id = out.version_id;
+        }
+        deleted.append(ctx.allocator, entry_result) catch return .{ .err = .internal_error };
     }
 
     const result: storage.DeleteResult = .{

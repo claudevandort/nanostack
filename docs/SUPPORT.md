@@ -25,7 +25,7 @@ Behavioural drift surfaced by a 2026-05-14 audit. Distinct from the "accept-stor
 | 2 | Tagging | `PutBucketTagging` returns 200 — AWS returns 204 No Content | done | [`src/services/s3/tagging.zig`](../src/services/s3/tagging.zig) | [`test_tagging.py::test_tagging_bucket_round_trip`](../tests/conformance/python/test_tagging.py) |
 | 3 | Versioning | HEAD on a delete marker returns 404 — AWS returns 405 Method Not Allowed with `Allow: DELETE` | done | [`src/services/s3/mod.zig`](../src/services/s3/mod.zig) | [`test_versioning.py::test_versioning_head_on_delete_marker_returns_405`](../tests/conformance/python/test_versioning.py) |
 | 4 | SigV4 | Payload digest mismatch maps to `BadDigest` — AWS uses distinct `XAmzContentSHA256Mismatch` | done | [`src/server.zig`](../src/server.zig), [`src/wire/errors.zig`](../src/wire/errors.zig) | [`test_sigv4.py::test_content_sha256_mismatch_returns_distinct_code`](../tests/conformance/python/test_sigv4.py) |
-| 5 | Versioning | `DeleteObjects` silently drops `<VersionId>` per object — versioned-bucket batch deletes always hit current version | todo | [`src/wire/delete_objects_parser.zig`](../src/wire/delete_objects_parser.zig) | — |
+| 5 | Versioning | `DeleteObjects` silently drops `<VersionId>` per object — versioned-bucket batch deletes always hit current version | done | [`src/wire/delete_objects_parser.zig`](../src/wire/delete_objects_parser.zig), [`src/services/s3/mod.zig`](../src/services/s3/mod.zig), [`src/wire/object_responses.zig`](../src/wire/object_responses.zig) | [`test_delete_objects.py::test_delete_objects_with_explicit_version_ids`](../tests/conformance/python/test_delete_objects.py) |
 
 ### Medium — response-shape gaps (Wave 2)
 

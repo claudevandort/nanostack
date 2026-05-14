@@ -8,16 +8,24 @@
 //!   </Delete>
 //!
 //! Driven by `ianprime0509/zig-xml` (the only Zig 0.16-compatible
-//! XML parser with a proper build.zig.zon). We ignore `<VersionId>`
-//! for now — versioning is post-v1.
+//! XML parser with a proper build.zig.zon). `<VersionId>` is captured
+//! per `<Object>` and threaded through to the storage call — versioned
+//! batch deletes hit the requested version exactly.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const xml = @import("xml");
 
+pub const Entry = struct {
+    /// Owned key string.
+    key: []const u8,
+    /// Owned version id string (or null when the request omitted it).
+    version_id: ?[]const u8 = null,
+};
+
 pub const Result = struct {
-    /// Caller owns the slice + each element.
-    keys: [][]const u8,
+    /// Caller owns the slice + every string inside each Entry.
+    objects: []Entry,
     quiet: bool,
 };
 
@@ -31,10 +39,13 @@ pub fn parse(allocator: Allocator, body: []const u8) ParseError!Result {
     defer static_reader.deinit();
     const reader = &static_reader.interface;
 
-    var keys: std.ArrayList([]const u8) = .empty;
+    var entries: std.ArrayList(Entry) = .empty;
     errdefer {
-        for (keys.items) |k| allocator.free(k);
-        keys.deinit(allocator);
+        for (entries.items) |e| {
+            allocator.free(e.key);
+            if (e.version_id) |v| allocator.free(v);
+        }
+        entries.deinit(allocator);
     }
     var quiet = false;
 
@@ -44,12 +55,24 @@ pub fn parse(allocator: Allocator, body: []const u8) ParseError!Result {
             .eof => break,
             .element_start => {
                 const name = reader.elementName();
-                if (std.mem.eql(u8, name, "Key")) {
+                if (std.mem.eql(u8, name, "Object")) {
+                    // Reserve a slot the inner <Key>/<VersionId> will populate.
+                    entries.append(allocator, .{ .key = "" }) catch return ParseError.OutOfMemory;
+                } else if (std.mem.eql(u8, name, "Key")) {
                     const owned = reader.readElementTextAlloc(allocator) catch return ParseError.InvalidBody;
-                    keys.append(allocator, owned) catch {
+                    if (entries.items.len == 0) {
+                        // Stray <Key> outside <Object> — malformed.
                         allocator.free(owned);
-                        return ParseError.OutOfMemory;
-                    };
+                        return ParseError.InvalidBody;
+                    }
+                    entries.items[entries.items.len - 1].key = owned;
+                } else if (std.mem.eql(u8, name, "VersionId")) {
+                    const owned = reader.readElementTextAlloc(allocator) catch return ParseError.InvalidBody;
+                    if (entries.items.len == 0) {
+                        allocator.free(owned);
+                        return ParseError.InvalidBody;
+                    }
+                    entries.items[entries.items.len - 1].version_id = owned;
                 } else if (std.mem.eql(u8, name, "Quiet")) {
                     const owned = reader.readElementTextAlloc(allocator) catch return ParseError.InvalidBody;
                     defer allocator.free(owned);
@@ -62,14 +85,17 @@ pub fn parse(allocator: Allocator, body: []const u8) ParseError!Result {
     }
 
     return .{
-        .keys = keys.toOwnedSlice(allocator) catch return ParseError.OutOfMemory,
+        .objects = entries.toOwnedSlice(allocator) catch return ParseError.OutOfMemory,
         .quiet = quiet,
     };
 }
 
 pub fn freeResult(allocator: Allocator, result: Result) void {
-    for (result.keys) |k| allocator.free(k);
-    allocator.free(result.keys);
+    for (result.objects) |e| {
+        allocator.free(e.key);
+        if (e.version_id) |v| allocator.free(v);
+    }
+    allocator.free(result.objects);
 }
 
 // ---------------------------------------------------------------------------
@@ -87,9 +113,10 @@ test "parse: minimal two-key Delete" {
     ;
     const result = try parse(testing.allocator, body);
     defer freeResult(testing.allocator, result);
-    try testing.expectEqual(@as(usize, 2), result.keys.len);
-    try testing.expectEqualStrings("alpha", result.keys[0]);
-    try testing.expectEqualStrings("beta", result.keys[1]);
+    try testing.expectEqual(@as(usize, 2), result.objects.len);
+    try testing.expectEqualStrings("alpha", result.objects[0].key);
+    try testing.expectEqual(@as(?[]const u8, null), result.objects[0].version_id);
+    try testing.expectEqualStrings("beta", result.objects[1].key);
     try testing.expect(!result.quiet);
 }
 
@@ -103,7 +130,7 @@ test "parse: with Quiet=true" {
     const result = try parse(testing.allocator, body);
     defer freeResult(testing.allocator, result);
     try testing.expect(result.quiet);
-    try testing.expectEqual(@as(usize, 1), result.keys.len);
+    try testing.expectEqual(@as(usize, 1), result.objects.len);
 }
 
 test "parse: Quiet=false" {
@@ -118,16 +145,23 @@ test "parse: Quiet=false" {
     try testing.expect(!result.quiet);
 }
 
-test "parse: VersionId is ignored" {
+test "parse: VersionId captured per Object" {
     const body =
         \\<Delete>
         \\  <Object><Key>x</Key><VersionId>v1</VersionId></Object>
+        \\  <Object><Key>y</Key></Object>
+        \\  <Object><Key>z</Key><VersionId>v3</VersionId></Object>
         \\</Delete>
     ;
     const result = try parse(testing.allocator, body);
     defer freeResult(testing.allocator, result);
-    try testing.expectEqual(@as(usize, 1), result.keys.len);
-    try testing.expectEqualStrings("x", result.keys[0]);
+    try testing.expectEqual(@as(usize, 3), result.objects.len);
+    try testing.expectEqualStrings("x", result.objects[0].key);
+    try testing.expectEqualStrings("v1", result.objects[0].version_id.?);
+    try testing.expectEqualStrings("y", result.objects[1].key);
+    try testing.expectEqual(@as(?[]const u8, null), result.objects[1].version_id);
+    try testing.expectEqualStrings("z", result.objects[2].key);
+    try testing.expectEqualStrings("v3", result.objects[2].version_id.?);
 }
 
 test "parse: malformed → InvalidBody" {
@@ -142,6 +176,6 @@ test "parse: keys with entities are decoded" {
     ;
     const result = try parse(testing.allocator, body);
     defer freeResult(testing.allocator, result);
-    try testing.expectEqual(@as(usize, 1), result.keys.len);
-    try testing.expectEqualStrings("a&b", result.keys[0]);
+    try testing.expectEqual(@as(usize, 1), result.objects.len);
+    try testing.expectEqualStrings("a&b", result.objects[0].key);
 }

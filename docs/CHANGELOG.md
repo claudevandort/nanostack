@@ -18,6 +18,12 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ### Changed
 - **Conformance + bench harness ported from Go (`aws-sdk-go-v2`) to Python (`boto3`).** All 162 conformance tests translated 1:1 to pytest; `bench/driver.py` replaces the Go bench driver. Two perf-budget rows recalibrated for boto3's heavier SigV4 path: `put_object_p99_ms` 5 → 10 ms, `put_object_throughput_rps` 500 → 150 req/s. Server unchanged.
+- **Wave 1 AWS-drift fixes (5 status/error-code corrections on routed ops)**, tracked in [`SUPPORT.md` → Known drift](SUPPORT.md#known-drift--to-fix):
+  - `CompleteMultipartUpload` on an unknown upload id now returns `404 NoSuchUpload` (was `400 InvalidPart`). New `storage.Error.InvalidPart` variant disambiguates etag-mismatch from upload-missing.
+  - `PutBucketTagging` returns `204 No Content` (was `200`). `PutObjectTagging` stays at 200 per AWS docs.
+  - HEAD on a delete marker now returns `405 Method Not Allowed` + `Allow: DELETE` (was `404 NoSuchKey`). GET remains `404`.
+  - `x-amz-content-sha256` payload-hash mismatch returns the distinct `XAmzContentSHA256Mismatch` code (was collapsed onto `BadDigest`, the Content-MD5 code).
+  - `DeleteObjects` now threads per-`<Object>` `<VersionId>` through to the storage call and echoes it back in `<Deleted>` (previously silently dropped, so versioned batch deletes always hit current).
 
 ### Removed
 - `tests/conformance/go/` (38 .go files including helpers) and `bench/driver/` (Go module). `setup-go` removed from CI.

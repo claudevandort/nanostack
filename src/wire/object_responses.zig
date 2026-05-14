@@ -24,12 +24,35 @@ pub fn renderDeleteResult(allocator: Allocator, result: storage.DeleteResult) ![
 
     if (!result.quiet) {
         for (result.deleted) |d| {
+            // Build children: Key (always), VersionId (when set), DeleteMarker
+            // (when set), DeleteMarkerVersionId (when set). AWS-exact order.
+            var inner: std.ArrayList(xml.Node) = .empty;
+            defer inner.deinit(arena);
+
             const key_el = try arena.create(xml.Element);
             key_el.* = .{ .name = "Key", .text = d.key };
+            try inner.append(arena, .{ .element = key_el });
+
+            if (d.version_id) |v| {
+                const ver_el = try arena.create(xml.Element);
+                ver_el.* = .{ .name = "VersionId", .text = v };
+                try inner.append(arena, .{ .element = ver_el });
+            }
+            if (d.delete_marker) {
+                const dm_el = try arena.create(xml.Element);
+                dm_el.* = .{ .name = "DeleteMarker", .text = "true" };
+                try inner.append(arena, .{ .element = dm_el });
+                if (d.delete_marker_version_id) |v| {
+                    const dmvid_el = try arena.create(xml.Element);
+                    dmvid_el.* = .{ .name = "DeleteMarkerVersionId", .text = v };
+                    try inner.append(arena, .{ .element = dmvid_el });
+                }
+            }
+
             const wrapper = try arena.create(xml.Element);
             wrapper.* = .{
                 .name = "Deleted",
-                .children = try arena.dupe(xml.Node, &.{.{ .element = key_el }}),
+                .children = try arena.dupe(xml.Node, inner.items),
             };
             children[ci] = .{ .element = wrapper };
             ci += 1;
@@ -126,6 +149,26 @@ test "renderCopyObjectResult: fixed epoch" {
             "<LastModified>2026-05-15T13:00:00.000Z</LastModified>" ++
             "<ETag>\"deadbeef\"</ETag>" ++
             "</CopyObjectResult>",
+        body,
+    );
+}
+
+test "renderDeleteResult: VersionId + DeleteMarker echoed when present" {
+    const result: storage.DeleteResult = .{
+        .deleted = @constCast(&[_]storage.DeletedKey{
+            .{ .key = "a", .version_id = "v1" },
+            .{ .key = "b", .delete_marker = true, .delete_marker_version_id = "dmv1" },
+        }),
+        .errors = &[_]storage.DeleteError{},
+    };
+    const body = try renderDeleteResult(testing.allocator, result);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+            "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" ++
+            "<Deleted><Key>a</Key><VersionId>v1</VersionId></Deleted>" ++
+            "<Deleted><Key>b</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>dmv1</DeleteMarkerVersionId></Deleted>" ++
+            "</DeleteResult>",
         body,
     );
 }
