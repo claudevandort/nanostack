@@ -5,4 +5,4 @@
 //!   minor — one AWS service fully implemented
 //!   major — curated multi-service surface ready for real workflows
 
-pub const string: []const u8 = "0.0.1";
+pub const string: []const u8 = "0.0.2";

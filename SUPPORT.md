@@ -1,6 +1,6 @@
 # nanostack Operation Support Matrix
 
-**Version:** v0.0.2-dev (M10 in progress — ACLs, policies, ownership, public access block)
+**Version:** v0.0.2
 
 **How to read this matrix:** each row is one S3 operation or cross-cutting capability. Status is one of:
 
