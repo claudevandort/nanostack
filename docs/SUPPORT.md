@@ -13,6 +13,47 @@ These are the points where nanostack matches real AWS and LocalStack does not �
 | 3 | Conditional-header split (GET/HEAD: all four; PUT: `If-Match`/`If-None-Match` only; CopyObject: `x-amz-copy-source-if-*`) | Inconsistent — some headers accepted but not enforced | [`test_conditional_get.py`](../tests/conformance/python/test_conditional_get.py), [`test_conditional_put.py`](../tests/conformance/python/test_conditional_put.py), [`test_copy_object.py`](../tests/conformance/python/test_copy_object.py) |
 | 4 | Multipart ETag = `md5(concat(binary-MD5-of-each-part)) + "-" + N`; `EntityTooSmall` when any non-final part < 5 MiB | Format matches but `EntityTooSmall` enforcement inconsistent | [`test_multipart_upload.py`](../tests/conformance/python/test_multipart_upload.py), [`test_multipart_errors.py`](../tests/conformance/python/test_multipart_errors.py) |
 
+## Known drift — to fix
+
+Behavioural drift surfaced by a 2026-05-14 audit. Distinct from the "accept-store-roundtrip" divergences documented per-row in the matrix below: these are bugs we intend to close, not deliberate non-goals. Burndown happens in waves; the **Status** column moves `todo → in-progress → done` as each fix lands.
+
+### High — wrong status / error code on routed ops (Wave 1)
+
+| # | Area | What drifts | Status | Code | Test |
+|---|---|---|---|---|---|
+| 1 | Multipart | `CompleteMultipartUpload` returns `InvalidPart` (400) when the upload id doesn't exist — AWS returns `NoSuchUpload` (404) | todo | [`src/services/s3/multipart.zig:204`](../src/services/s3/multipart.zig), [`src/storage/fs.zig:3508`](../src/storage/fs.zig) | — |
+| 2 | Tagging | `PutBucketTagging` returns 200 — AWS returns 204 No Content | todo | [`src/services/s3/tagging.zig:28`](../src/services/s3/tagging.zig) | — |
+| 3 | Versioning | HEAD on a delete marker returns 404 — AWS returns 405 Method Not Allowed with `Allow: DELETE` | todo | [`src/services/s3/mod.zig:797`](../src/services/s3/mod.zig) | — |
+| 4 | SigV4 | Payload digest mismatch maps to `BadDigest` — AWS uses distinct `XAmzContentSHA256Mismatch` | todo | [`src/server.zig:131`](../src/server.zig) | — |
+| 5 | Versioning | `DeleteObjects` silently drops `<VersionId>` per object — versioned-bucket batch deletes always hit current version | todo | [`src/wire/delete_objects_parser.zig`](../src/wire/delete_objects_parser.zig) | — |
+
+### Medium — response-shape gaps (Wave 2)
+
+| # | Area | What drifts | Status | Code | Test |
+|---|---|---|---|---|---|
+| 6 | Multipart | `ListMultipartUploadsResult` `<Upload>` omits `<Initiator>` and `<Owner>` | todo | [`src/wire/multipart_responses.zig:166`](../src/wire/multipart_responses.zig) | — |
+| 7 | Versioning | `ListVersionsResult` omits `<Owner>` per `<Version>` / `<DeleteMarker>` entry | todo | [`src/wire/list_object_versions.zig:85`](../src/wire/list_object_versions.zig) | — |
+| 8 | Listing | `encoding-type=url` is echoed but keys / prefixes / delimiter rendered raw — clients opting in see un-encoded keys | todo | [`src/wire/list_objects.zig:170`](../src/wire/list_objects.zig) | — |
+| 9 | Multipart | `ListMultipartUploadsResult` drops `<Prefix>` and `<Delimiter>` when empty — AWS emits them empty | todo | [`src/wire/multipart_responses.zig:91`](../src/wire/multipart_responses.zig) | — |
+| 10 | Object attrs | `GetObjectAttributes` response missing `Last-Modified` + `x-amz-delete-marker` headers | todo | [`src/services/s3/object_attributes.zig:40`](../src/services/s3/object_attributes.zig) | — |
+| 11 | Bucket | `ListBuckets` `<Bucket>` entries miss `<BucketRegion>` (AWS 2023 addition) | todo | [`src/wire/s3_responses.zig:38`](../src/wire/s3_responses.zig) | — |
+
+### Medium/Low — validation, SigV4, edge cases (Wave 3)
+
+| # | Area | What drifts | Status | Code | Test |
+|---|---|---|---|---|---|
+| 12 | Validation | Object key UTF-8 well-formedness not checked — length only | todo | [`src/storage/mod.zig:1220`](../src/storage/mod.zig) | — |
+| 13 | Multipart | `CompleteMultipartUpload` doesn't cap part list at 10000 | todo | [`src/services/s3/multipart.zig`](../src/services/s3/multipart.zig) | — |
+| 14 | Multipart | Empty `<Part>` list returns `InvalidRequest` — AWS returns `MalformedXML` | todo | [`src/wire/complete_multipart_parser.zig:97`](../src/wire/complete_multipart_parser.zig) | — |
+| 15 | SigV4 | `parseAmzDate` accepts Feb 30 (no day-in-month check) | todo | [`src/auth/iso8601.zig:13`](../src/auth/iso8601.zig) | — |
+| 16 | SigV4 | Multi-valued same-name headers: `findHeader` returns first match only — AWS joins with commas in canonical form | todo | [`src/auth/canonical.zig:180`](../src/auth/canonical.zig) | — |
+| 17 | SigV4 | Uppercase hex `x-amz-content-sha256` falls through to "opaque" branch — body integrity check silently skipped | todo | [`src/auth/sigv4.zig:340`](../src/auth/sigv4.zig) | — |
+| 18 | Conditional | `parseHttpDate` strict IMF-fixdate only — rejects ISO 8601 in `If-Modified-Since` | todo | [`src/http/date.zig:30`](../src/http/date.zig) | — |
+| 19 | Routing | Virtual-host parser treats any host with a dot as `<bucket>.<rest>` — `s3.amazonaws.com` would set bucket=`s3` | todo | [`src/router.zig:249`](../src/router.zig) | — |
+| 20 | Bucket | `CreateBucket` ignores `<LocationConstraint>` body — AWS rejects mismatched constraint with `IllegalLocationConstraintException` | todo | [`src/storage/fs.zig:1027`](../src/storage/fs.zig) | — |
+| 21 | Restore | `RestoreObject` always returns 202 — AWS returns 200 if already restored | todo | [`src/services/s3/restore.zig:18`](../src/services/s3/restore.zig) | — |
+| 22 | Bucket | `ListBuckets` doesn't honour `?prefix`, `?bucket-region`, `?max-buckets`, `?continuation-token` (2023 pagination) | todo | [`src/services/s3/mod.zig:492`](../src/services/s3/mod.zig) | — |
+
 ## How to read this matrix
 
 Each row below is one S3 operation or cross-cutting capability. Status is one of:
