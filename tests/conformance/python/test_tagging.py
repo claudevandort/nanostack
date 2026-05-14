@@ -12,6 +12,7 @@ from conftest import (
     empty_bucket,
     make_payload,
     seed_object,
+    sign_and_send,
 )
 
 
@@ -22,13 +23,20 @@ def _tags_to_map(tags: list[dict]) -> dict[str, str]:
 def test_tagging_bucket_round_trip(s3, bucket_name):
     s3.create_bucket(Bucket=bucket_name)
     try:
-        s3.put_bucket_tagging(
-            Bucket=bucket_name,
-            Tagging={"TagSet": [
-                {"Key": "env", "Value": "prod"},
-                {"Key": "team", "Value": "alpha"},
-            ]},
+        # AWS-exact: PutBucketTagging returns 204 No Content. boto3 collapses
+        # 2xx into success without surfacing the status, so we sign + send
+        # the raw request to assert the exact code (drift table row 2).
+        body = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b'<Tagging><TagSet>'
+            b'<Tag><Key>env</Key><Value>prod</Value></Tag>'
+            b'<Tag><Key>team</Key><Value>alpha</Value></Tag>'
+            b'</TagSet></Tagging>'
         )
+        resp = sign_and_send("PUT", f"/{bucket_name}?tagging", body=body,
+                             headers={"Content-Type": "application/xml"})
+        assert resp.status_code == 204, \
+            f"PutBucketTagging expected 204, got {resp.status_code}: {resp.text}"
 
         out = s3.get_bucket_tagging(Bucket=bucket_name)
         got = _tags_to_map(out.get("TagSet", []))

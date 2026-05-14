@@ -25,7 +25,7 @@ pub fn putBucketTagging(ctx: Context, bucket: []const u8) Result {
     };
     defer tagging_parser.freeOwned(ctx.allocator, tags);
     ctx.backend.putBucketTagging(bucket, tags) catch |err| return .{ .err = mod.mapStorageErr(err) };
-    return .{ .ok = .{ .status = 200, .body = "" } };
+    return .{ .ok = .{ .status = 204, .body = "" } };
 }
 
 pub fn getBucketTagging(ctx: Context, bucket: []const u8) Result {
