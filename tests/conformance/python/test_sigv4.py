@@ -105,6 +105,33 @@ def test_presigned_custom_header_missing(s3, bucket_name):
         best_effort_delete_bucket(s3, bucket_name)
 
 
+def test_content_sha256_mismatch_returns_distinct_code(s3, bucket_name):
+    """AWS: `x-amz-content-sha256` mismatch → 400 XAmzContentSHA256Mismatch.
+
+    Previously we mapped this onto `BadDigest` (the Content-MD5 error). The
+    two are distinct in real AWS and SDK error-matchers key on the `<Code>`.
+    Drift table row 4.
+    """
+    s3.create_bucket(Bucket=bucket_name)
+    try:
+        body = b"hello"
+        # Sign with a hash that does NOT match the body — server should
+        # detect the mismatch before the signature check (sigv4.zig verifies
+        # the canonical-headers-included digest against the actual body).
+        wrong_hash = "0" * 64
+        resp = sign_and_send(
+            "PUT", f"/{bucket_name}/k",
+            body=body,
+            payload_hash=wrong_hash,
+        )
+        assert resp.status_code == 400, \
+            f"expected 400, got {resp.status_code}: {resp.text}"
+        assert "<Code>XAmzContentSHA256Mismatch</Code>" in resp.text, \
+            f"expected XAmzContentSHA256Mismatch code, got body: {resp.text}"
+    finally:
+        best_effort_delete_bucket(s3, bucket_name)
+
+
 def test_no_auth_flag_accepts_anonymous():
     bin_path = os.environ.get("NANOSTACK_BIN")
     if not bin_path:

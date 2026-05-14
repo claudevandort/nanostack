@@ -128,7 +128,7 @@ fn mapVerifyError(e: sigv4.VerifyError) errors.Code {
         sigv4.VerifyError.PresignedExpired => .access_denied,
         sigv4.VerifyError.MissingSignedHeader => .signature_does_not_match,
         sigv4.VerifyError.StreamingUnsupported => .not_implemented,
-        sigv4.VerifyError.XAmzContentSha256Mismatch => .bad_digest,
+        sigv4.VerifyError.XAmzContentSha256Mismatch => .x_amz_content_sha256_mismatch,
         sigv4.VerifyError.MalformedAuthorization,
         sigv4.VerifyError.MalformedCredentialScope,
         sigv4.VerifyError.MalformedPresignedQuery,
