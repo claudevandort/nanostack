@@ -12,6 +12,7 @@ pub const Error = error{
     NoSuchBucket,
     NoSuchKey,
     NoSuchUpload,
+    InvalidPart,
     NoSuchTagSet,
     NoSuchBucketPolicy,
     OwnershipControlsNotFound,

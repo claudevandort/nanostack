@@ -200,10 +200,7 @@ pub fn completeMultipartUpload(ctx: Context, bucket: []const u8, key: []const u8
         .key = key,
         .upload_id = upload_id,
         .parts = parsed.parts,
-    }) catch |err| switch (err) {
-        storage.Error.NoSuchUpload => return .{ .err = .invalid_part },
-        else => return .{ .err = mod.mapStorageErr(err) },
-    };
+    }) catch |err| return .{ .err = mod.mapStorageErr(err) };
 
     const host_header = mod.findHeader(ctx.request.headers, "host") orelse "localhost";
     const location = std.fmt.allocPrint(ctx.allocator, "http://{s}/{s}/{s}", .{ host_header, bucket, key }) catch

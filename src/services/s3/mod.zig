@@ -435,6 +435,7 @@ pub fn mapStorageErr(e: storage.Error) errors.Code {
         storage.Error.NoSuchBucket => .no_such_bucket,
         storage.Error.NoSuchKey => .no_such_key,
         storage.Error.NoSuchUpload => .no_such_upload,
+        storage.Error.InvalidPart => .invalid_part,
         storage.Error.NoSuchTagSet => .no_such_tag_set,
         storage.Error.NoSuchBucketPolicy => .no_such_bucket_policy,
         storage.Error.OwnershipControlsNotFound => .ownership_controls_not_found,

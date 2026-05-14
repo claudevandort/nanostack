@@ -3508,11 +3508,13 @@ pub fn completeMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Comp
     const entry = slot.uploads.getEntry(in.upload_id) orelse return storage.Error.NoSuchUpload;
     const state = entry.value_ptr;
 
-    // Validate every requested part exists with the claimed etag.
+    // Validate every requested part exists with the claimed etag. Missing
+    // parts or etag mismatch → 400 InvalidPart (AWS-exact); "upload id
+    // unknown" is the only path that surfaces NoSuchUpload (handled above).
     var total_size: usize = 0;
     for (in.parts) |p| {
-        const stored = state.parts.get(p.part_number) orelse return storage.Error.NoSuchUpload;
-        if (!std.mem.eql(u8, stored.etag, p.etag)) return storage.Error.NoSuchUpload;
+        const stored = state.parts.get(p.part_number) orelse return storage.Error.InvalidPart;
+        if (!std.mem.eql(u8, stored.etag, p.etag)) return storage.Error.InvalidPart;
         total_size += stored.size;
     }
 

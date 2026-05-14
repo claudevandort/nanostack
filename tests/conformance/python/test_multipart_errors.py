@@ -108,10 +108,38 @@ def test_multipart_invalid_part_unknown_number(s3, bucket_name):
             )
         assert aws_error_code(ei.value) == "InvalidPart", \
             f"expected InvalidPart, got {aws_error_code(ei.value)}"
+        assert aws_http_status(ei.value) == 400, \
+            f"expected 400, got {aws_http_status(ei.value)}"
     finally:
         if upload_id is not None:
             try:
                 s3.abort_multipart_upload(Bucket=bucket_name, Key="k", UploadId=upload_id)
             except ClientError:
                 pass
+        best_effort_delete_bucket(s3, bucket_name)
+
+
+def test_multipart_complete_with_unknown_upload_id_returns_no_such_upload(s3, bucket_name):
+    """AWS: CompleteMultipartUpload on a dead upload id → 404 NoSuchUpload.
+
+    Regression: previously we collapsed this onto 400 InvalidPart because the
+    storage backend raised NoSuchUpload for both "upload missing" and
+    "part etag mismatch". Drift table row 1.
+    """
+    s3.create_bucket(Bucket=bucket_name)
+    try:
+        init = s3.create_multipart_upload(Bucket=bucket_name, Key="k")
+        upload_id = init["UploadId"]
+        s3.abort_multipart_upload(Bucket=bucket_name, Key="k", UploadId=upload_id)
+
+        with pytest.raises(ClientError) as ei:
+            s3.complete_multipart_upload(
+                Bucket=bucket_name, Key="k", UploadId=upload_id,
+                MultipartUpload={"Parts": [{"ETag": '"deadbeef"', "PartNumber": 1}]},
+            )
+        assert aws_error_code(ei.value) == "NoSuchUpload", \
+            f"expected NoSuchUpload, got {aws_error_code(ei.value)}"
+        assert aws_http_status(ei.value) == 404, \
+            f"expected 404, got {aws_http_status(ei.value)}"
+    finally:
         best_effort_delete_bucket(s3, bucket_name)

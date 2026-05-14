@@ -21,7 +21,7 @@ Behavioural drift surfaced by a 2026-05-14 audit. Distinct from the "accept-stor
 
 | # | Area | What drifts | Status | Code | Test |
 |---|---|---|---|---|---|
-| 1 | Multipart | `CompleteMultipartUpload` returns `InvalidPart` (400) when the upload id doesn't exist — AWS returns `NoSuchUpload` (404) | todo | [`src/services/s3/multipart.zig:204`](../src/services/s3/multipart.zig), [`src/storage/fs.zig:3508`](../src/storage/fs.zig) | — |
+| 1 | Multipart | `CompleteMultipartUpload` returns `InvalidPart` (400) when the upload id doesn't exist — AWS returns `NoSuchUpload` (404) | done | [`src/services/s3/multipart.zig`](../src/services/s3/multipart.zig), [`src/storage/fs.zig`](../src/storage/fs.zig) | [`test_multipart_errors.py::test_multipart_complete_with_unknown_upload_id_returns_no_such_upload`](../tests/conformance/python/test_multipart_errors.py) |
 | 2 | Tagging | `PutBucketTagging` returns 200 — AWS returns 204 No Content | todo | [`src/services/s3/tagging.zig:28`](../src/services/s3/tagging.zig) | — |
 | 3 | Versioning | HEAD on a delete marker returns 404 — AWS returns 405 Method Not Allowed with `Allow: DELETE` | todo | [`src/services/s3/mod.zig:797`](../src/services/s3/mod.zig) | — |
 | 4 | SigV4 | Payload digest mismatch maps to `BadDigest` — AWS uses distinct `XAmzContentSHA256Mismatch` | todo | [`src/server.zig:131`](../src/server.zig) | — |
