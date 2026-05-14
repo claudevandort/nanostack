@@ -61,6 +61,12 @@ pub const Operation = enum {
     get_bucket_website,
     delete_bucket_website,
     get_object_attributes,
+    put_object_lock_config,
+    get_object_lock_config,
+    put_object_retention,
+    get_object_retention,
+    put_object_legal_hold,
+    get_object_legal_hold,
     unknown,
 };
 
@@ -128,6 +134,14 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
             if (eql(method, "GET")) return .get_object_acl;
         }
         if (hasQueryParam(query, "attributes") and eql(method, "GET")) return .get_object_attributes;
+        if (hasQueryParam(query, "retention")) {
+            if (eql(method, "PUT")) return .put_object_retention;
+            if (eql(method, "GET")) return .get_object_retention;
+        }
+        if (hasQueryParam(query, "legal-hold")) {
+            if (eql(method, "PUT")) return .put_object_legal_hold;
+            if (eql(method, "GET")) return .get_object_legal_hold;
+        }
         if (eql(method, "PUT")) return .put_object;
         if (eql(method, "GET")) return .get_object;
         if (eql(method, "HEAD")) return .head_object;
@@ -151,6 +165,7 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
         if (hasQueryParam(query, "lifecycle")) return .get_bucket_lifecycle;
         if (hasQueryParam(query, "notification")) return .get_bucket_notification;
         if (hasQueryParam(query, "website")) return .get_bucket_website;
+        if (hasQueryParam(query, "object-lock")) return .get_object_lock_config;
         if (hasQueryParam(query, "uploads")) return .list_multipart_uploads;
         if (queryParamEquals(query, "list-type", "2")) return .list_objects_v2;
         return .list_objects;
@@ -167,6 +182,7 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
         if (hasQueryParam(query, "lifecycle")) return .put_bucket_lifecycle;
         if (hasQueryParam(query, "notification")) return .put_bucket_notification;
         if (hasQueryParam(query, "website")) return .put_bucket_website;
+        if (hasQueryParam(query, "object-lock")) return .put_object_lock_config;
         return .create_bucket;
     }
     if (eql(method, "DELETE") and has_bucket) {
@@ -520,4 +536,19 @@ test "website: PUT/GET/DELETE /b?website" {
 test "objectAttributes: GET /b/k?attributes → get_object_attributes" {
     const p = parse("GET", "localhost", "/buk/k", "attributes");
     try testing.expectEqual(Operation.get_object_attributes, p.op);
+}
+
+test "object-lock: PUT/GET /b?object-lock" {
+    try testing.expectEqual(Operation.put_object_lock_config, parse("PUT", "localhost", "/buk", "object-lock").op);
+    try testing.expectEqual(Operation.get_object_lock_config, parse("GET", "localhost", "/buk", "object-lock").op);
+}
+
+test "retention: PUT/GET /b/k?retention" {
+    try testing.expectEqual(Operation.put_object_retention, parse("PUT", "localhost", "/buk/k", "retention").op);
+    try testing.expectEqual(Operation.get_object_retention, parse("GET", "localhost", "/buk/k", "retention").op);
+}
+
+test "legal-hold: PUT/GET /b/k?legal-hold" {
+    try testing.expectEqual(Operation.put_object_legal_hold, parse("PUT", "localhost", "/buk/k", "legal-hold").op);
+    try testing.expectEqual(Operation.get_object_legal_hold, parse("GET", "localhost", "/buk/k", "legal-hold").op);
 }

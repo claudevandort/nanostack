@@ -21,6 +21,10 @@ pub const Error = error{
     ServerSideEncryptionConfigurationNotFound,
     NoSuchLifecycleConfiguration,
     NoSuchWebsiteConfiguration,
+    ObjectLockConfigurationNotFound,
+    InvalidBucketState,
+    InvalidRetentionPeriod,
+    AccessDenied,
     BucketAlreadyExists,
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
@@ -487,6 +491,59 @@ pub const WebsiteConfig = struct {
     routing_rules: []const RoutingRule = &.{},
 };
 
+// ---------------------------------------------------------------------------
+// Object Lock + retention + legal hold (M12). Unlike M10/M11, persisted
+// state here actually enforces — deletes are blocked within retention,
+// COMPLIANCE mode is immutable, legal hold supersedes everything.
+
+pub const RetentionMode = enum { GOVERNANCE, COMPLIANCE };
+
+pub fn retentionModeFromString(s: []const u8) error{InvalidRetentionMode}!RetentionMode {
+    inline for (@typeInfo(RetentionMode).@"enum".fields) |f| {
+        if (std.mem.eql(u8, s, f.name)) return @field(RetentionMode, f.name);
+    }
+    return error.InvalidRetentionMode;
+}
+
+pub fn retentionModeToString(m: RetentionMode) []const u8 {
+    return @tagName(m);
+}
+
+pub const LegalHoldStatus = enum { ON, OFF };
+
+pub fn legalHoldFromString(s: []const u8) error{InvalidLegalHoldStatus}!LegalHoldStatus {
+    if (std.mem.eql(u8, s, "ON")) return .ON;
+    if (std.mem.eql(u8, s, "OFF")) return .OFF;
+    return error.InvalidLegalHoldStatus;
+}
+
+pub fn legalHoldToString(s: LegalHoldStatus) []const u8 {
+    return @tagName(s);
+}
+
+pub const DefaultRetention = struct {
+    mode: RetentionMode,
+    days: ?u32 = null,
+    years: ?u32 = null,
+};
+
+pub const ObjectLockRule = struct {
+    default_retention: ?DefaultRetention = null,
+};
+
+pub const ObjectLockConfig = struct {
+    /// AWS-exact: "Enabled" when persisted (we never store a disabled
+    /// state). The field exists for XML round-trip clarity.
+    object_lock_enabled: bool = true,
+    rule: ?ObjectLockRule = null,
+};
+
+pub const ObjectRetention = struct {
+    mode: RetentionMode,
+    /// Unix epoch seconds; 0 = no retention.
+    retain_until_unix: i64,
+};
+
 /// One bucket's persisted metadata. Strings borrow from the backend's
 /// allocator; consumers must not retain past the backend lifetime unless
 /// they dupe. `listBuckets` returns a slice freshly allocated by the
@@ -531,6 +588,10 @@ pub const Object = struct {
     /// Get". An explicit Acl from canned/grant headers / PutObjectAcl
     /// gets persisted as-given.
     acl: ?Acl = null,
+    /// M12. Per-version Object Lock state.
+    retention_mode: ?RetentionMode = null,
+    retain_until_unix: i64 = 0,
+    legal_hold: bool = false,
 };
 
 pub const PutObjectInput = struct {
@@ -543,6 +604,13 @@ pub const PutObjectInput = struct {
     tags: []const Tag = &.{},
     /// M10. Inline ACL from `x-amz-acl` + `x-amz-grant-*` headers.
     acl: ?Acl = null,
+    /// M12. Inline Object Lock headers
+    /// (`x-amz-object-lock-{mode,retain-until-date,legal-hold}`).
+    /// `null`/0/false means "no explicit lock"; the backend may apply
+    /// bucket-default retention if a Rule is set.
+    retention_mode: ?RetentionMode = null,
+    retain_until_unix: i64 = 0,
+    legal_hold: bool = false,
 };
 
 pub const PutObjectOutput = struct {
@@ -571,6 +639,10 @@ pub const DeleteObjectInput = struct {
     /// On a versioned bucket: null creates a delete marker; set
     /// permanently removes that version.
     version_id: ?[]const u8 = null,
+    /// M12. `x-amz-bypass-governance-retention: true`. Allows the
+    /// backend to delete a GOVERNANCE-protected version. Has no effect
+    /// on COMPLIANCE retention or legal hold.
+    bypass_governance: bool = false,
 };
 
 pub const DeleteObjectOutput = struct {
@@ -642,6 +714,19 @@ pub const InitiateMultipartUploadInput = struct {
     tags: []const Tag = &.{},
     /// M10. ACL applied to the final merged object on CompleteMultipartUpload.
     acl: ?Acl = null,
+    /// M12. Object Lock state applied to the final merged object.
+    retention_mode: ?RetentionMode = null,
+    retain_until_unix: i64 = 0,
+    legal_hold: bool = false,
+};
+
+/// M12. Input to `createBucket`. The `object_lock_enabled` flag is set
+/// at creation time via the `x-amz-bucket-object-lock-enabled` header;
+/// AWS does not allow enabling Object Lock after creation in the
+/// standard flow.
+pub const CreateBucketInput = struct {
+    name: []const u8,
+    object_lock_enabled: bool = false,
 };
 
 pub const InitiateMultipartUploadOutput = struct {
@@ -782,7 +867,7 @@ pub const Backend = struct {
 
     pub const VTable = struct {
         // Buckets (M1).
-        createBucket: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
+        createBucket: *const fn (ctx: *anyopaque, in: CreateBucketInput) Error!void,
         deleteBucket: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
         headBucket: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
         listBuckets: *const fn (ctx: *anyopaque, allocator: Allocator) Error![]Bucket,
@@ -849,12 +934,19 @@ pub const Backend = struct {
         putBucketWebsite: *const fn (ctx: *anyopaque, bucket: []const u8, cfg: WebsiteConfig) Error!void,
         getBucketWebsite: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8) Error!WebsiteConfig,
         deleteBucketWebsite: *const fn (ctx: *anyopaque, bucket: []const u8) Error!void,
+        // Object Lock (M12). Object-level entries take optional version_id.
+        putObjectLockConfig: *const fn (ctx: *anyopaque, bucket: []const u8, cfg: ObjectLockConfig) Error!void,
+        getObjectLockConfig: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8) Error!ObjectLockConfig,
+        putObjectRetention: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, retention: ObjectRetention, bypass_governance: bool) Error!void,
+        getObjectRetention: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!ObjectRetention,
+        putObjectLegalHold: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, status: LegalHoldStatus) Error!void,
+        getObjectLegalHold: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!LegalHoldStatus,
     };
 
     // Pass-through helpers so call sites don't dereference the vtable.
 
-    pub fn createBucket(self: Backend, name: []const u8) Error!void {
-        return self.vtable.createBucket(self.ctx, name);
+    pub fn createBucket(self: Backend, in: CreateBucketInput) Error!void {
+        return self.vtable.createBucket(self.ctx, in);
     }
     pub fn deleteBucket(self: Backend, name: []const u8) Error!void {
         return self.vtable.deleteBucket(self.ctx, name);
@@ -1024,6 +1116,25 @@ pub const Backend = struct {
     pub fn deleteBucketWebsite(self: Backend, bucket: []const u8) Error!void {
         return self.vtable.deleteBucketWebsite(self.ctx, bucket);
     }
+
+    pub fn putObjectLockConfig(self: Backend, bucket: []const u8, cfg: ObjectLockConfig) Error!void {
+        return self.vtable.putObjectLockConfig(self.ctx, bucket, cfg);
+    }
+    pub fn getObjectLockConfig(self: Backend, allocator: Allocator, bucket: []const u8) Error!ObjectLockConfig {
+        return self.vtable.getObjectLockConfig(self.ctx, allocator, bucket);
+    }
+    pub fn putObjectRetention(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8, retention: ObjectRetention, bypass_governance: bool) Error!void {
+        return self.vtable.putObjectRetention(self.ctx, bucket, key, version_id, retention, bypass_governance);
+    }
+    pub fn getObjectRetention(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!ObjectRetention {
+        return self.vtable.getObjectRetention(self.ctx, bucket, key, version_id);
+    }
+    pub fn putObjectLegalHold(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8, status: LegalHoldStatus) Error!void {
+        return self.vtable.putObjectLegalHold(self.ctx, bucket, key, version_id, status);
+    }
+    pub fn getObjectLegalHold(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!LegalHoldStatus {
+        return self.vtable.getObjectLegalHold(self.ctx, bucket, key, version_id);
+    }
 };
 
 /// Validate an S3 object key. AWS permits virtually any UTF-8; the only
@@ -1179,4 +1290,20 @@ test "protocolFromString" {
     try testing.expectEqual(Protocol.http, try protocolFromString("http"));
     try testing.expectEqual(Protocol.https, try protocolFromString("https"));
     try testing.expectError(error.InvalidProtocol, protocolFromString("ftp"));
+}
+
+test "retentionModeFromString round-trip" {
+    const testing = std.testing;
+    try testing.expectEqual(RetentionMode.GOVERNANCE, try retentionModeFromString("GOVERNANCE"));
+    try testing.expectEqual(RetentionMode.COMPLIANCE, try retentionModeFromString("COMPLIANCE"));
+    try testing.expectError(error.InvalidRetentionMode, retentionModeFromString("strict"));
+    try testing.expectEqualStrings("COMPLIANCE", retentionModeToString(.COMPLIANCE));
+}
+
+test "legalHoldFromString round-trip" {
+    const testing = std.testing;
+    try testing.expectEqual(LegalHoldStatus.ON, try legalHoldFromString("ON"));
+    try testing.expectEqual(LegalHoldStatus.OFF, try legalHoldFromString("OFF"));
+    try testing.expectError(error.InvalidLegalHoldStatus, legalHoldFromString("on"));
+    try testing.expectEqualStrings("ON", legalHoldToString(.ON));
 }

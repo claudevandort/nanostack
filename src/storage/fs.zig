@@ -43,6 +43,10 @@ const MultipartState = struct {
     tags: []storage.Tag = &.{},
     /// M10. ACL applied to the merged object on Complete.
     acl: ?storage.Acl = null,
+    /// M12. Object Lock state applied to the merged object on Complete.
+    retention_mode: ?storage.RetentionMode = null,
+    retain_until_unix: i64 = 0,
+    legal_hold: bool = false,
 
     fn deinit(self: *MultipartState, gpa: Allocator) void {
         gpa.free(self.key);
@@ -74,6 +78,10 @@ const VersionEntry = struct {
     tags: []storage.Tag = &.{},
     /// M10. Per-version ACL. `null` means "synthesize default on Get".
     acl: ?storage.Acl = null,
+    /// M12. Per-version Object Lock state.
+    retention_mode: ?storage.RetentionMode = null,
+    retain_until_unix: i64 = 0,
+    legal_hold: bool = false,
 
     fn deinit(self: *VersionEntry, gpa: Allocator) void {
         gpa.free(self.version_id);
@@ -132,6 +140,13 @@ const BucketSlot = struct {
     notification: ?storage.NotificationConfig = null,
     /// Website config (M11). `null` → 404 NoSuchWebsiteConfiguration.
     website: ?storage.WebsiteConfig = null,
+    /// Object Lock enabled (M12). Set at CreateBucket via the
+    /// `x-amz-bucket-object-lock-enabled` header; immutable after creation.
+    object_lock_enabled: bool = false,
+    /// Object Lock config (M12). `null` when not yet PutObjectLockConfig'd.
+    /// `getObjectLockConfig` returns the empty-Rule config (Enabled=true,
+    /// no default retention) when locked but unset, and 404 when not locked.
+    object_lock_config: ?storage.ObjectLockConfig = null,
 
     fn deinit(self: *BucketSlot, gpa: Allocator) void {
         gpa.free(self.meta.name);
@@ -161,6 +176,7 @@ const BucketSlot = struct {
         if (self.lifecycle) |c| freeLifecycleConfig(gpa, c);
         if (self.notification) |c| freeNotificationConfig(gpa, c);
         if (self.website) |c| freeWebsiteConfig(gpa, c);
+        if (self.object_lock_config) |_| {}  // No owned strings in this config.
         self.* = undefined;
     }
 };
@@ -732,10 +748,16 @@ const vtable: storage.Backend.VTable = .{
     .putBucketWebsite = vtPutBucketWebsite,
     .getBucketWebsite = vtGetBucketWebsite,
     .deleteBucketWebsite = vtDeleteBucketWebsite,
+    .putObjectLockConfig = vtPutObjectLockConfig,
+    .getObjectLockConfig = vtGetObjectLockConfig,
+    .putObjectRetention = vtPutObjectRetention,
+    .getObjectRetention = vtGetObjectRetention,
+    .putObjectLegalHold = vtPutObjectLegalHold,
+    .getObjectLegalHold = vtGetObjectLegalHold,
 };
 
-fn vtCreateBucket(ctx: *anyopaque, name: []const u8) storage.Error!void {
-    return createBucket(@ptrCast(@alignCast(ctx)), name);
+fn vtCreateBucket(ctx: *anyopaque, in: storage.CreateBucketInput) storage.Error!void {
+    return createBucket(@ptrCast(@alignCast(ctx)), in);
 }
 fn vtDeleteBucket(ctx: *anyopaque, name: []const u8) storage.Error!void {
     return deleteBucket(@ptrCast(@alignCast(ctx)), name);
@@ -887,11 +909,30 @@ fn vtGetBucketWebsite(ctx: *anyopaque, allocator: Allocator, bucket: []const u8)
 fn vtDeleteBucketWebsite(ctx: *anyopaque, bucket: []const u8) storage.Error!void {
     return deleteBucketWebsite(@ptrCast(@alignCast(ctx)), bucket);
 }
+fn vtPutObjectLockConfig(ctx: *anyopaque, bucket: []const u8, cfg: storage.ObjectLockConfig) storage.Error!void {
+    return putObjectLockConfig(@ptrCast(@alignCast(ctx)), bucket, cfg);
+}
+fn vtGetObjectLockConfig(ctx: *anyopaque, allocator: Allocator, bucket: []const u8) storage.Error!storage.ObjectLockConfig {
+    return getObjectLockConfig(@ptrCast(@alignCast(ctx)), allocator, bucket);
+}
+fn vtPutObjectRetention(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, retention: storage.ObjectRetention, bypass: bool) storage.Error!void {
+    return putObjectRetention(@ptrCast(@alignCast(ctx)), bucket, key, version_id, retention, bypass);
+}
+fn vtGetObjectRetention(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error!storage.ObjectRetention {
+    return getObjectRetention(@ptrCast(@alignCast(ctx)), bucket, key, version_id);
+}
+fn vtPutObjectLegalHold(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, status: storage.LegalHoldStatus) storage.Error!void {
+    return putObjectLegalHold(@ptrCast(@alignCast(ctx)), bucket, key, version_id, status);
+}
+fn vtGetObjectLegalHold(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error!storage.LegalHoldStatus {
+    return getObjectLegalHold(@ptrCast(@alignCast(ctx)), bucket, key, version_id);
+}
 
 // ---------------------------------------------------------------------------
 // Bucket ops
 
-pub fn createBucket(self: *Fs, name: []const u8) storage.Error!void {
+pub fn createBucket(self: *Fs, in: storage.CreateBucketInput) storage.Error!void {
+    const name = in.name;
     try util.validateBucketName(name);
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
@@ -909,6 +950,9 @@ pub fn createBucket(self: *Fs, name: []const u8) storage.Error!void {
     const region_owned = self.allocator.dupe(u8, default_region) catch return storage.Error.OutOfMemory;
     errdefer self.allocator.free(region_owned);
 
+    // M12: Object Lock requires versioning enabled (AWS-exact).
+    const initial_versioning: storage.VersioningStatus = if (in.object_lock_enabled) .enabled else .none;
+
     self.buckets.append(self.allocator, .{
         .meta = .{
             .name = name_owned,
@@ -917,8 +961,10 @@ pub fn createBucket(self: *Fs, name: []const u8) storage.Error!void {
         },
         .key_index = .empty,
         .uploads = std.StringHashMap(MultipartState).init(self.allocator),
+        .versioning_status = initial_versioning,
         .versions = std.StringHashMap(VersionChain).init(self.allocator),
         .tags = &.{},
+        .object_lock_enabled = in.object_lock_enabled,
     }) catch return storage.Error.OutOfMemory;
 
     saveRegistry(self) catch return storage.Error.Io;
@@ -997,6 +1043,8 @@ fn putObjectFlat(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput) stora
     const data_path = std.fmt.bufPrint(&data_buf, "{s}/data", .{key_dir}) catch return storage.Error.Io;
     writeAtomic(self.io, data_path, in.body) catch return storage.Error.Io;
 
+    // M12: apply bucket default retention if input has no explicit lock.
+    const effective = applyDefaultRetention(slot, in, nowUnixSeconds(self.io));
     const meta_doc = MetaDoc{
         .key = in.key,
         .size = in.body.len,
@@ -1006,6 +1054,9 @@ fn putObjectFlat(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput) stora
         .user_metadata = in.user_metadata,
         .tags = in.tags,
         .acl = in.acl,
+        .retention_mode = effective.mode,
+        .retain_until_unix = effective.retain_until_unix,
+        .legal_hold = effective.legal_hold,
     };
     var meta_buf: [4096]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{key_dir}) catch return storage.Error.Io;
@@ -1022,6 +1073,54 @@ fn putObjectFlat(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput) stora
     }
 
     return .{ .etag = etag };
+}
+
+/// M12: resolve the effective retention/legal-hold for a new object. If
+/// the input has explicit values, use them; otherwise apply the bucket's
+/// default-retention rule (if any). Days take precedence over Years; if
+/// both are absent the rule has no effect.
+const EffectiveLock = struct {
+    mode: ?storage.RetentionMode = null,
+    retain_until_unix: i64 = 0,
+    legal_hold: bool = false,
+};
+fn applyDefaultRetention(slot: *const BucketSlot, in: storage.PutObjectInput, now: i64) EffectiveLock {
+    var out: EffectiveLock = .{
+        .mode = in.retention_mode,
+        .retain_until_unix = in.retain_until_unix,
+        .legal_hold = in.legal_hold,
+    };
+    if (out.mode != null) return out;
+    const cfg = slot.object_lock_config orelse return out;
+    const rule = cfg.rule orelse return out;
+    const def = rule.default_retention orelse return out;
+    out.mode = def.mode;
+    if (def.days) |d| {
+        out.retain_until_unix = now + @as(i64, @intCast(d)) * 86400;
+    } else if (def.years) |y| {
+        // AWS treats a year as 365 days for retention math.
+        out.retain_until_unix = now + @as(i64, @intCast(y)) * 365 * 86400;
+    }
+    return out;
+}
+
+fn applyDefaultRetentionMpu(slot: *const BucketSlot, state: *const MultipartState, now: i64) EffectiveLock {
+    var out: EffectiveLock = .{
+        .mode = state.retention_mode,
+        .retain_until_unix = state.retain_until_unix,
+        .legal_hold = state.legal_hold,
+    };
+    if (out.mode != null) return out;
+    const cfg = slot.object_lock_config orelse return out;
+    const rule = cfg.rule orelse return out;
+    const def = rule.default_retention orelse return out;
+    out.mode = def.mode;
+    if (def.days) |d| {
+        out.retain_until_unix = now + @as(i64, @intCast(d)) * 86400;
+    } else if (def.years) |y| {
+        out.retain_until_unix = now + @as(i64, @intCast(y)) * 365 * 86400;
+    }
+    return out;
 }
 
 fn putObjectVersioned(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput, suspended: bool) storage.Error!storage.PutObjectOutput {
@@ -1047,6 +1146,7 @@ fn putObjectVersioned(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput, 
 
     // 2. Write meta.json.
     const now = nowUnixSeconds(self.io);
+    const effective = applyDefaultRetention(slot, in, now);
     const meta_doc = VersionedMetaDoc{
         .key = in.key,
         .size = in.body.len,
@@ -1057,6 +1157,9 @@ fn putObjectVersioned(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput, 
         .is_delete_marker = false,
         .tags = in.tags,
         .acl = in.acl,
+        .retention_mode = effective.mode,
+        .retain_until_unix = effective.retain_until_unix,
+        .legal_hold = effective.legal_hold,
     };
     var meta_buf: [4096]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{versions_dir}) catch return storage.Error.Io;
@@ -1087,6 +1190,9 @@ fn putObjectVersioned(self: *Fs, slot: *BucketSlot, in: storage.PutObjectInput, 
         .user_metadata = try dupeHeadersStorage(self.allocator, in.user_metadata),
         .tags = try dupeTagsOwned(self.allocator, in.tags),
         .acl = acl_dup,
+        .retention_mode = effective.mode,
+        .retain_until_unix = effective.retain_until_unix,
+        .legal_hold = effective.legal_hold,
     };
 
     if (slot.versions.getPtr(in.key)) |chain| {
@@ -1230,6 +1336,9 @@ fn cloneVersionedMeta(allocator: Allocator, key: []const u8, v: VersionEntry) st
         .is_delete_marker = v.is_delete_marker,
         .tags = try cloneTagsTo(allocator, v.tags),
         .acl = acl_out,
+        .retention_mode = v.retention_mode,
+        .retain_until_unix = v.retain_until_unix,
+        .legal_hold = v.legal_hold,
     };
 }
 
@@ -1338,8 +1447,10 @@ pub fn deleteObject(self: *Fs, in: storage.DeleteObjectInput) storage.Error!stor
 
     // Versioned bucket.
     if (in.version_id) |vid| {
-        return deleteVersion(self, slot, in.bucket, in.key, vid);
+        return deleteVersion(self, slot, in.bucket, in.key, vid, in.bypass_governance);
     }
+    // Delete marker creation — AWS-exact: never blocked by retention/legal hold
+    // (a delete marker doesn't actually delete any version's data).
     return createDeleteMarker(self, slot, in.bucket, in.key);
 }
 
@@ -1361,7 +1472,7 @@ fn deleteObjectFlat(self: *Fs, slot: *BucketSlot, in: storage.DeleteObjectInput)
 /// Permanently remove one specific version. If it was the current version,
 /// the next-newest version becomes current (or the key is fully removed if
 /// no versions remain).
-fn deleteVersion(self: *Fs, slot: *BucketSlot, bucket: []const u8, key: []const u8, version_id: []const u8) storage.Error!storage.DeleteObjectOutput {
+fn deleteVersion(self: *Fs, slot: *BucketSlot, bucket: []const u8, key: []const u8, version_id: []const u8, bypass_governance: bool) storage.Error!storage.DeleteObjectOutput {
     const chain = slot.versions.getPtr(key) orelse return storage.Error.NoSuchKey;
     var removed_idx: ?usize = null;
     for (chain.items, 0..) |entry, i| {
@@ -1371,7 +1482,24 @@ fn deleteVersion(self: *Fs, slot: *BucketSlot, bucket: []const u8, key: []const 
         }
     }
     const idx = removed_idx orelse return storage.Error.NoSuchKey;
-    const was_delete_marker = chain.items[idx].is_delete_marker;
+    const target = chain.items[idx];
+
+    // M12 WORM enforcement. Delete markers are never protected (they
+    // have no retention/legal-hold themselves).
+    if (!target.is_delete_marker) {
+        if (target.legal_hold) return storage.Error.AccessDenied;
+        if (target.retention_mode) |mode| {
+            const now = nowUnixSeconds(self.io);
+            if (target.retain_until_unix > now) {
+                switch (mode) {
+                    .GOVERNANCE => if (!bypass_governance) return storage.Error.AccessDenied,
+                    .COMPLIANCE => return storage.Error.AccessDenied,
+                }
+            }
+        }
+    }
+
+    const was_delete_marker = target.is_delete_marker;
     var removed = chain.orderedRemove(idx);
     removed.deinit(self.allocator);
 
@@ -1537,6 +1665,11 @@ pub fn putBucketVersioning(self: *Fs, bucket: []const u8, status: storage.Versio
     // layer; we treat it as a no-op here defensively.
     if (status == .none) return;
 
+    // M12: Object-Lock-enabled buckets cannot have versioning suspended.
+    if (slot.object_lock_enabled and status == .suspended) {
+        return storage.Error.InvalidBucketState;
+    }
+
     const prev = slot.versioning_status;
     if (prev == .none and status == .enabled) {
         // Migrate every existing object under this bucket from flat
@@ -1616,6 +1749,9 @@ fn migrateNoneToEnabled(self: *Fs, slot: *BucketSlot) !void {
             .user_metadata = try dupeHeadersStorage(self.allocator, md.user_metadata),
             .tags = try dupeTagsOwned(self.allocator, md.tags),
             .acl = acl_dup,
+            .retention_mode = md.retention_mode,
+            .retain_until_unix = md.retain_until_unix,
+            .legal_hold = md.legal_hold,
         };
         try chain.append(self.allocator, v);
         const key_owned = try self.allocator.dupe(u8, md.key);
@@ -1684,6 +1820,9 @@ fn rebuildVersionIndex(self: *Fs, slot: *BucketSlot) !void {
                 .user_metadata = try dupeHeadersStorage(self.allocator, md.user_metadata),
                 .tags = try dupeTagsOwned(self.allocator, md.tags),
                 .acl = acl_dup,
+                .retention_mode = md.retention_mode,
+                .retain_until_unix = md.retain_until_unix,
+                .legal_hold = md.legal_hold,
             };
             try chain.append(self.allocator, v);
         }
@@ -1717,6 +1856,10 @@ const VersionedMetaDoc = struct {
     tags: []const storage.Tag = &.{},
     /// M10. `null` on older records → synthesize default on Get.
     acl: ?storage.Acl = null,
+    /// M12. Object Lock state.
+    retention_mode: ?storage.RetentionMode = null,
+    retain_until_unix: i64 = 0,
+    legal_hold: bool = false,
 };
 
 // ---------------------------------------------------------------------------
@@ -1853,6 +1996,9 @@ fn writeFlatObjectTags(self: *Fs, bucket: []const u8, key: []const u8, tags: []c
         .user_metadata = meta.user_metadata,
         .tags = tags,
         .acl = meta.acl,
+        .retention_mode = meta.retention_mode,
+        .retain_until_unix = meta.retain_until_unix,
+        .legal_hold = meta.legal_hold,
     };
     const hash = keyHash(key);
     var path_buf: [4096]u8 = undefined;
@@ -1874,6 +2020,9 @@ fn rewriteVersionMeta(self: *Fs, bucket: []const u8, key: []const u8, v: *const 
         .is_delete_marker = v.is_delete_marker,
         .tags = v.tags,
         .acl = v.acl,
+        .retention_mode = v.retention_mode,
+        .retain_until_unix = v.retain_until_unix,
+        .legal_hold = v.legal_hold,
     };
     const hash = keyHash(key);
     var path_buf: [4096]u8 = undefined;
@@ -2235,6 +2384,172 @@ pub fn deleteBucketWebsite(self: *Fs, bucket: []const u8) storage.Error!void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Object Lock + retention + legal hold (M12).
+
+pub fn putObjectLockConfig(self: *Fs, bucket: []const u8, cfg: storage.ObjectLockConfig) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    // AWS-exact: enabling Object Lock after bucket creation requires a
+    // token-based flow we don't support. The bucket must have been
+    // created with Object Lock enabled.
+    if (!slot.object_lock_enabled) return storage.Error.InvalidBucketState;
+    slot.object_lock_config = cfg;
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+pub fn getObjectLockConfig(self: *Fs, allocator: Allocator, bucket: []const u8) storage.Error!storage.ObjectLockConfig {
+    _ = allocator;
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    if (!slot.object_lock_enabled) return storage.Error.ObjectLockConfigurationNotFound;
+    // AWS-exact: when locked but no Put*Config has run, return the
+    // bare "Enabled" config (no rule).
+    return slot.object_lock_config orelse storage.ObjectLockConfig{ .object_lock_enabled = true, .rule = null };
+}
+
+pub fn putObjectRetention(self: *Fs, bucket: []const u8, key: []const u8, version_id: ?[]const u8, retention: storage.ObjectRetention, bypass: bool) storage.Error!void {
+    try storage.validateObjectKey(key);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    // Object Lock must be enabled for retention to be meaningful.
+    if (!slot.object_lock_enabled) return storage.Error.InvalidBucketState;
+    if (slot.versioning_status == .none) return storage.Error.NoSuchKey;
+
+    const chain = slot.versions.getPtr(key) orelse return storage.Error.NoSuchKey;
+    if (chain.items.len == 0) return storage.Error.NoSuchKey;
+    var target_idx: usize = 0;
+    if (version_id) |vid| {
+        var found: ?usize = null;
+        for (chain.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.version_id, vid)) {
+                found = i;
+                break;
+            }
+        }
+        target_idx = found orelse return storage.Error.NoSuchKey;
+    }
+    if (chain.items[target_idx].is_delete_marker) return storage.Error.NoSuchKey;
+
+    // Mode-transition rules (AWS-exact).
+    const now = nowUnixSeconds(self.io);
+    const existing = chain.items[target_idx];
+    if (existing.retention_mode) |existing_mode| {
+        switch (existing_mode) {
+            .COMPLIANCE => {
+                // COMPLIANCE is immutable: only extendable, never weakened
+                // or removed; mode cannot change.
+                if (retention.mode != .COMPLIANCE) return storage.Error.AccessDenied;
+                if (retention.retain_until_unix < existing.retain_until_unix) return storage.Error.AccessDenied;
+            },
+            .GOVERNANCE => {
+                // GOVERNANCE: shortening or weakening requires bypass.
+                const weakening = retention.retain_until_unix < existing.retain_until_unix or
+                    (retention.mode == .GOVERNANCE and retention.retain_until_unix < existing.retain_until_unix);
+                _ = weakening;
+                // Simpler rule: any change that reduces protection while the
+                // current retention is still active needs bypass.
+                if (existing.retain_until_unix > now) {
+                    if (retention.retain_until_unix < existing.retain_until_unix and !bypass) {
+                        return storage.Error.AccessDenied;
+                    }
+                }
+            },
+        }
+    }
+
+    chain.items[target_idx].retention_mode = retention.mode;
+    chain.items[target_idx].retain_until_unix = retention.retain_until_unix;
+    try rewriteVersionMeta(self, bucket, key, &chain.items[target_idx]);
+}
+
+pub fn getObjectRetention(self: *Fs, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error!storage.ObjectRetention {
+    try storage.validateObjectKey(key);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    if (slot.versioning_status == .none) return storage.Error.NoSuchKey;
+    const chain = slot.versions.get(key) orelse return storage.Error.NoSuchKey;
+    if (chain.items.len == 0) return storage.Error.NoSuchKey;
+    var target: VersionEntry = chain.items[0];
+    if (version_id) |vid| {
+        var found = false;
+        for (chain.items) |entry| {
+            if (std.mem.eql(u8, entry.version_id, vid)) {
+                target = entry;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return storage.Error.NoSuchKey;
+    }
+    const mode = target.retention_mode orelse return storage.Error.ObjectLockConfigurationNotFound;
+    return .{ .mode = mode, .retain_until_unix = target.retain_until_unix };
+}
+
+pub fn putObjectLegalHold(self: *Fs, bucket: []const u8, key: []const u8, version_id: ?[]const u8, status: storage.LegalHoldStatus) storage.Error!void {
+    try storage.validateObjectKey(key);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    if (!slot.object_lock_enabled) return storage.Error.InvalidBucketState;
+    if (slot.versioning_status == .none) return storage.Error.NoSuchKey;
+
+    const chain = slot.versions.getPtr(key) orelse return storage.Error.NoSuchKey;
+    if (chain.items.len == 0) return storage.Error.NoSuchKey;
+    var target_idx: usize = 0;
+    if (version_id) |vid| {
+        var found: ?usize = null;
+        for (chain.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.version_id, vid)) {
+                found = i;
+                break;
+            }
+        }
+        target_idx = found orelse return storage.Error.NoSuchKey;
+    }
+    if (chain.items[target_idx].is_delete_marker) return storage.Error.NoSuchKey;
+
+    chain.items[target_idx].legal_hold = (status == .ON);
+    try rewriteVersionMeta(self, bucket, key, &chain.items[target_idx]);
+}
+
+pub fn getObjectLegalHold(self: *Fs, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error!storage.LegalHoldStatus {
+    try storage.validateObjectKey(key);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+
+    if (slot.versioning_status == .none) return storage.Error.NoSuchKey;
+    const chain = slot.versions.get(key) orelse return storage.Error.NoSuchKey;
+    if (chain.items.len == 0) return storage.Error.NoSuchKey;
+    var target: VersionEntry = chain.items[0];
+    if (version_id) |vid| {
+        var found = false;
+        for (chain.items) |entry| {
+            if (std.mem.eql(u8, entry.version_id, vid)) {
+                target = entry;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return storage.Error.NoSuchKey;
+    }
+    return if (target.legal_hold) .ON else .OFF;
+}
+
 fn writeFlatObjectAcl(self: *Fs, bucket: []const u8, key: []const u8, acl: storage.Acl) storage.Error!void {
     var arena_state = std.heap.ArenaAllocator.init(self.allocator);
     defer arena_state.deinit();
@@ -2253,6 +2568,9 @@ fn writeFlatObjectAcl(self: *Fs, bucket: []const u8, key: []const u8, acl: stora
         .user_metadata = meta.user_metadata,
         .tags = meta.tags,
         .acl = acl,
+        .retention_mode = meta.retention_mode,
+        .retain_until_unix = meta.retain_until_unix,
+        .legal_hold = meta.legal_hold,
     };
     const hash = keyHash(key);
     var path_buf: [4096]u8 = undefined;
@@ -2499,6 +2817,9 @@ const BucketRecord = struct {
     lifecycle: ?storage.LifecycleConfig = null,
     notification: ?storage.NotificationConfig = null,
     website: ?storage.WebsiteConfig = null,
+    /// M12. Object Lock state.
+    object_lock_enabled: bool = false,
+    object_lock_config: ?storage.ObjectLockConfig = null,
 };
 
 const MetaDoc = struct {
@@ -2512,6 +2833,10 @@ const MetaDoc = struct {
     tags: []const storage.Tag = &.{},
     /// M10. `null` on older records → synthesize default on Get.
     acl: ?storage.Acl = null,
+    /// M12. Object Lock state.
+    retention_mode: ?storage.RetentionMode = null,
+    retain_until_unix: i64 = 0,
+    legal_hold: bool = false,
 };
 
 fn loadRegistry(self: *Fs) !void {
@@ -2577,6 +2902,8 @@ fn loadRegistry(self: *Fs) !void {
             .lifecycle = lifecycle_owned,
             .notification = notification_owned,
             .website = website_owned,
+            .object_lock_enabled = rec.object_lock_enabled,
+            .object_lock_config = rec.object_lock_config,
         };
         // Walk objects/ to rebuild the in-memory key index from meta.json files.
         try rebuildKeyIndex(self, &slot);
@@ -2653,6 +2980,9 @@ fn readMeta(self: *Fs, allocator: Allocator, bucket: []const u8, key: []const u8
         .user_metadata = headers,
         .tags = tags,
         .acl = acl_out,
+        .retention_mode = value.retention_mode,
+        .retain_until_unix = value.retain_until_unix,
+        .legal_hold = value.legal_hold,
     };
 }
 
@@ -2685,6 +3015,8 @@ fn saveRegistry(self: *Fs) !void {
             .lifecycle = b.lifecycle,
             .notification = b.notification,
             .website = b.website,
+            .object_lock_enabled = b.object_lock_enabled,
+            .object_lock_config = b.object_lock_config,
         };
     }
     const doc: RegistryDoc = .{ .version = registry_version, .buckets = records };
@@ -2714,6 +3046,10 @@ const ManifestDoc = struct {
     tags: []const storage.Tag = &.{},
     /// M10. ACL applied to the merged object on Complete.
     acl: ?storage.Acl = null,
+    /// M12. Object Lock state applied to the merged object on Complete.
+    retention_mode: ?storage.RetentionMode = null,
+    retain_until_unix: i64 = 0,
+    legal_hold: bool = false,
 };
 
 const ManifestPart = struct {
@@ -2762,6 +3098,9 @@ pub fn initiateMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Init
         .parts = std.AutoHashMap(u32, PartMeta).init(self.allocator),
         .tags = tags_owned,
         .acl = acl_owned,
+        .retention_mode = in.retention_mode,
+        .retain_until_unix = in.retain_until_unix,
+        .legal_hold = in.legal_hold,
     };
 
     const id_for_map = self.allocator.dupe(u8, upload_id) catch return storage.Error.OutOfMemory;
@@ -2852,6 +3191,8 @@ pub fn completeMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Comp
     const data_path = std.fmt.bufPrint(&data_buf, "{s}/data", .{key_dir}) catch return storage.Error.Io;
     writeAtomic(self.io, data_path, body) catch return storage.Error.Io;
 
+    // M12: apply bucket default retention if manifest has no explicit lock.
+    const effective_mpu = applyDefaultRetentionMpu(slot, state, nowUnixSeconds(self.io));
     const meta_doc = MetaDoc{
         .key = state.key,
         .size = total_size,
@@ -2861,6 +3202,9 @@ pub fn completeMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Comp
         .user_metadata = state.user_metadata,
         .tags = state.tags,
         .acl = state.acl,
+        .retention_mode = effective_mpu.mode,
+        .retain_until_unix = effective_mpu.retain_until_unix,
+        .legal_hold = effective_mpu.legal_hold,
     };
     var meta_buf: [4096]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_buf, "{s}/meta.json", .{key_dir}) catch return storage.Error.Io;
@@ -3099,6 +3443,9 @@ fn writeManifest(self: *Fs, bucket: []const u8, upload_id: []const u8, state: *c
         .parts = parts,
         .tags = state.tags,
         .acl = state.acl,
+        .retention_mode = state.retention_mode,
+        .retain_until_unix = state.retain_until_unix,
+        .legal_hold = state.legal_hold,
     };
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
     defer aw.deinit();
@@ -3142,6 +3489,9 @@ fn rebuildUploadIndex(self: *Fs, slot: *BucketSlot) !void {
             .parts = std.AutoHashMap(u32, PartMeta).init(self.allocator),
             .tags = try dupeTagsOwned(self.allocator, value.tags),
             .acl = acl_dup,
+            .retention_mode = value.retention_mode,
+            .retain_until_unix = value.retain_until_unix,
+            .legal_hold = value.legal_hold,
         };
         for (value.parts) |p| {
             const etag_owned = try self.allocator.dupe(u8, p.etag);
@@ -3222,7 +3572,7 @@ test "fs: create + head + list + delete" {
     var fs = try newTestFs(&tmp);
     defer fs.deinit();
 
-    try fs.createBucket("alpha");
+    try fs.createBucket(.{ .name = "alpha" });
     try fs.headBucket("alpha");
 
     const buckets = try fs.listBuckets(testing.allocator);
@@ -3246,7 +3596,7 @@ test "fs: createBucket validates name" {
     defer tmp.cleanup();
     var fs = try newTestFs(&tmp);
     defer fs.deinit();
-    try testing.expectError(storage.Error.InvalidBucketName, fs.createBucket("Bad_Name"));
+    try testing.expectError(storage.Error.InvalidBucketName, fs.createBucket(.{ .name = "Bad_Name" }));
 }
 
 test "fs: duplicate create returns BucketAlreadyOwnedByYou" {
@@ -3254,8 +3604,8 @@ test "fs: duplicate create returns BucketAlreadyOwnedByYou" {
     defer tmp.cleanup();
     var fs = try newTestFs(&tmp);
     defer fs.deinit();
-    try fs.createBucket("dupes");
-    try testing.expectError(storage.Error.BucketAlreadyOwnedByYou, fs.createBucket("dupes"));
+    try fs.createBucket(.{ .name = "dupes" });
+    try testing.expectError(storage.Error.BucketAlreadyOwnedByYou, fs.createBucket(.{ .name = "dupes" }));
 }
 
 test "fs: delete missing returns NoSuchBucket" {
@@ -3277,7 +3627,7 @@ test "fs: registry survives reopen + key index rebuild" {
     {
         var fs1 = try Fs.init(testing.allocator, testing.io, path);
         defer fs1.deinit();
-        try fs1.createBucket("persist-me");
+        try fs1.createBucket(.{ .name = "persist-me" });
         const out = try fs1.putObject(.{
             .bucket = "persist-me",
             .key = "alpha",
@@ -3302,7 +3652,7 @@ test "fs: put + head + get + delete object" {
     var fs = try newTestFs(&tmp);
     defer fs.deinit();
 
-    try fs.createBucket("bkt");
+    try fs.createBucket(.{ .name = "bkt" });
     const out = try fs.putObject(.{
         .bucket = "bkt",
         .key = "hello.txt",
@@ -3337,7 +3687,7 @@ test "fs: deleteBucket with object → BucketNotEmpty" {
     defer tmp.cleanup();
     var fs = try newTestFs(&tmp);
     defer fs.deinit();
-    try fs.createBucket("bkt");
+    try fs.createBucket(.{ .name = "bkt" });
     const out = try fs.putObject(.{ .bucket = "bkt", .key = "k", .body = "v", .content_type = "text/plain" });
     testing.allocator.free(out.etag);
     try testing.expectError(storage.Error.BucketNotEmpty, fs.deleteBucket("bkt"));

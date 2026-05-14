@@ -25,6 +25,9 @@ pub const lifecycle_config = @import("wire/lifecycle_config.zig");
 pub const notification_config = @import("wire/notification_config.zig");
 pub const website_config = @import("wire/website_config.zig");
 pub const object_attributes = @import("wire/object_attributes.zig");
+pub const object_lock_config = @import("wire/object_lock_config.zig");
+pub const object_retention = @import("wire/object_retention.zig");
+pub const object_legal_hold = @import("wire/object_legal_hold.zig");
 pub const router = @import("router.zig");
 pub const http_range = @import("http/range.zig");
 pub const http_date = @import("http/date.zig");
@@ -51,6 +54,9 @@ pub const lifecycle_service = @import("services/s3/lifecycle.zig");
 pub const notification_service = @import("services/s3/notification.zig");
 pub const website_service = @import("services/s3/website.zig");
 pub const object_attributes_service = @import("services/s3/object_attributes.zig");
+pub const object_lock_service = @import("services/s3/object_lock.zig");
+pub const object_retention_service = @import("services/s3/object_retention.zig");
+pub const object_legal_hold_service = @import("services/s3/object_legal_hold.zig");
 pub const cli = @import("cli.zig");
 pub const version = @import("version.zig");
 
@@ -79,6 +85,9 @@ test {
     _ = notification_config;
     _ = website_config;
     _ = object_attributes;
+    _ = object_lock_config;
+    _ = object_retention;
+    _ = object_legal_hold;
     _ = router;
     _ = http_range;
     _ = http_date;
@@ -105,6 +114,9 @@ test {
     _ = notification_service;
     _ = website_service;
     _ = object_attributes_service;
+    _ = object_lock_service;
+    _ = object_retention_service;
+    _ = object_legal_hold_service;
     _ = cli;
     _ = version;
 }

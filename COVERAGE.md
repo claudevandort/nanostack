@@ -2,9 +2,9 @@
 
 Generated from `s3.json` and `src/router.zig`.
 
-**Coverage: 56 / 107 operations (52.3%)**
+**Coverage: 62 / 107 operations (57.9%)**
 
-## Covered (56)
+## Covered (62)
 
 - AbortMultipartUpload
 - CompleteMultipartUpload
@@ -36,6 +36,9 @@ Generated from `s3.json` and `src/router.zig`.
 - GetObject
 - GetObjectAcl
 - GetObjectAttributes
+- GetObjectLegalHold
+- GetObjectLockConfiguration
+- GetObjectRetention
 - GetObjectTagging
 - GetPublicAccessBlock
 - HeadBucket
@@ -58,12 +61,15 @@ Generated from `s3.json` and `src/router.zig`.
 - PutBucketWebsite
 - PutObject
 - PutObjectAcl
+- PutObjectLegalHold
+- PutObjectLockConfiguration
+- PutObjectRetention
 - PutObjectTagging
 - PutPublicAccessBlock
 - UploadPart
 - UploadPartCopy — *Dispatched from upload_part when x-amz-copy-source header is present*
 
-## Unrouted (51)
+## Unrouted (45)
 
 Grouped thematically. Most of these are explicit non-goals for v1.x (PRD §15) — kept here as the AWS-side checklist.
 
@@ -130,15 +136,6 @@ Grouped thematically. Most of these are explicit non-goals for v1.x (PRD §15) �
 - GetBucketMetricsConfiguration
 - ListBucketMetricsConfigurations
 - PutBucketMetricsConfiguration
-
-### Object Lock / retention / legal hold (6)
-
-- GetObjectLegalHold
-- GetObjectLockConfiguration
-- GetObjectRetention
-- PutObjectLegalHold
-- PutObjectLockConfiguration
-- PutObjectRetention
 
 ### Object torrent (1)
 

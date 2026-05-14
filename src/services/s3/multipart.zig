@@ -57,6 +57,12 @@ pub fn createMultipartUpload(ctx: Context, bucket: []const u8, key: []const u8) 
         .err => |c| return .{ .err = c },
     };
 
+    // M12 inline Object Lock headers.
+    const lock_info: mod.InlineLockInfo = switch (mod.extractInlineLockInfo(ctx)) {
+        .ok => |i| i,
+        .err => |c| return .{ .err = c },
+    };
+
     const out = ctx.backend.initiateMultipartUpload(ctx.allocator, .{
         .bucket = bucket,
         .key = key,
@@ -64,6 +70,9 @@ pub fn createMultipartUpload(ctx: Context, bucket: []const u8, key: []const u8) 
         .user_metadata = meta_list.items,
         .tags = inline_tags,
         .acl = inline_acl,
+        .retention_mode = lock_info.mode,
+        .retain_until_unix = lock_info.retain_until_unix,
+        .legal_hold = lock_info.legal_hold,
     }) catch |err| return .{ .err = mod.mapStorageErr(err) };
 
     const body = multipart_wire.renderInitiateMultipartUploadResult(ctx.allocator, bucket, key, out.upload_id) catch

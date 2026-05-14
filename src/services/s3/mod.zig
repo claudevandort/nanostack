@@ -31,6 +31,10 @@ const lifecycle_service = @import("lifecycle.zig");
 const notification_service = @import("notification.zig");
 const website_service = @import("website.zig");
 const object_attributes_service = @import("object_attributes.zig");
+const object_lock_service = @import("object_lock.zig");
+const object_retention_service = @import("object_retention.zig");
+const object_legal_hold_service = @import("object_legal_hold.zig");
+const object_retention_wire = @import("../../wire/object_retention.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -260,6 +264,28 @@ pub fn handle(ctx: Context, parsed: router.Parsed) Result {
             parsed.bucket orelse return .{ .err = .invalid_request },
             parsed.key orelse return .{ .err = .invalid_request },
         ),
+        .put_object_lock_config => object_lock_service.putObjectLockConfig(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .get_object_lock_config => object_lock_service.getObjectLockConfig(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .put_object_retention => object_retention_service.putObjectRetention(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .get_object_retention => object_retention_service.getObjectRetention(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .put_object_legal_hold => object_legal_hold_service.putObjectLegalHold(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
+        .get_object_legal_hold => object_legal_hold_service.getObjectLegalHold(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
         .unknown => .{ .err = .not_implemented },
     };
 }
@@ -358,6 +384,34 @@ pub fn extractInlineAcl(ctx: Context) InlineAclOutcome {
 
 const GrantPair = struct { name: []const u8, perm: storage.Permission };
 
+/// M12: parse inline `x-amz-object-lock-*` headers into a triple of
+/// (mode, retain_until_unix, legal_hold). All three fields default to
+/// "no explicit lock" — the backend may apply bucket-default retention.
+pub const InlineLockInfo = struct {
+    mode: ?storage.RetentionMode = null,
+    retain_until_unix: i64 = 0,
+    legal_hold: bool = false,
+};
+
+pub const InlineLockOutcome = union(enum) {
+    ok: InlineLockInfo,
+    err: errors.Code,
+};
+
+pub fn extractInlineLockInfo(ctx: Context) InlineLockOutcome {
+    var info: InlineLockInfo = .{};
+    if (findHeader(ctx.request.headers, "x-amz-object-lock-mode")) |hv| {
+        info.mode = storage.retentionModeFromString(hv) catch return .{ .err = .invalid_argument };
+    }
+    if (findHeader(ctx.request.headers, "x-amz-object-lock-retain-until-date")) |hv| {
+        info.retain_until_unix = object_retention_wire.parseIsoOrUnix(hv) catch return .{ .err = .invalid_retention_period };
+    }
+    if (findHeader(ctx.request.headers, "x-amz-object-lock-legal-hold")) |hv| {
+        info.legal_hold = std.ascii.eqlIgnoreCase(hv, "ON");
+    }
+    return .{ .ok = info };
+}
+
 pub fn mapStorageErr(e: storage.Error) errors.Code {
     return switch (e) {
         storage.Error.NoSuchBucket => .no_such_bucket,
@@ -372,6 +426,10 @@ pub fn mapStorageErr(e: storage.Error) errors.Code {
         storage.Error.ServerSideEncryptionConfigurationNotFound => .server_side_encryption_configuration_not_found_error,
         storage.Error.NoSuchLifecycleConfiguration => .no_such_lifecycle_configuration,
         storage.Error.NoSuchWebsiteConfiguration => .no_such_website_configuration,
+        storage.Error.ObjectLockConfigurationNotFound => .object_lock_configuration_not_found_error,
+        storage.Error.InvalidBucketState => .invalid_bucket_state,
+        storage.Error.InvalidRetentionPeriod => .invalid_retention_period,
+        storage.Error.AccessDenied => .access_denied,
         storage.Error.BucketAlreadyExists => .bucket_already_exists,
         storage.Error.BucketAlreadyOwnedByYou => .bucket_already_owned_by_you,
         storage.Error.BucketNotEmpty => .bucket_not_empty,
@@ -386,7 +444,14 @@ pub fn mapStorageErr(e: storage.Error) errors.Code {
 // Bucket ops
 
 fn createBucket(ctx: Context, name: []const u8) Result {
-    ctx.backend.createBucket(name) catch |err| return .{ .err = mapStorageErr(err) };
+    // M12: x-amz-bucket-object-lock-enabled: true on CreateBucket enables
+    // Object Lock + auto-enables versioning. AWS-exact: enabling Object
+    // Lock after bucket creation requires a separate flow we don't support.
+    const lock_enabled = blk: {
+        const hv = findHeader(ctx.request.headers, "x-amz-bucket-object-lock-enabled") orelse break :blk false;
+        break :blk std.ascii.eqlIgnoreCase(hv, "true");
+    };
+    ctx.backend.createBucket(.{ .name = name, .object_lock_enabled = lock_enabled }) catch |err| return .{ .err = mapStorageErr(err) };
     const location = std.fmt.allocPrint(ctx.allocator, "/{s}", .{name}) catch
         return .{ .err = .internal_error };
     const headers = ctx.allocator.dupe(Header, &.{
@@ -484,6 +549,12 @@ fn putObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
         .err => |c| return .{ .err = c },
     };
 
+    // M12 inline Object Lock headers.
+    const lock_info: InlineLockInfo = switch (extractInlineLockInfo(ctx)) {
+        .ok => |i| i,
+        .err => |c| return .{ .err = c },
+    };
+
     const out = ctx.backend.putObject(.{
         .bucket = bucket,
         .key = key,
@@ -492,6 +563,9 @@ fn putObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
         .user_metadata = meta_list.items,
         .tags = inline_tags,
         .acl = inline_acl,
+        .retention_mode = lock_info.mode,
+        .retain_until_unix = lock_info.retain_until_unix,
+        .legal_hold = lock_info.legal_hold,
     }) catch |err| return .{ .err = mapStorageErr(err) };
 
     var hs: std.ArrayList(Header) = .empty;
@@ -595,6 +669,14 @@ fn copyObject(ctx: Context, dest_bucket: []const u8, dest_key: []const u8) Resul
         .err => |c| return .{ .err = c },
     };
 
+    // ---------- Object Lock ----------
+    // M12: AWS-exact — CopyObject does NOT inherit source retention.
+    // Lock state comes from the request headers (or bucket default).
+    const lock_info: InlineLockInfo = switch (extractInlineLockInfo(ctx)) {
+        .ok => |i| i,
+        .err => |c| return .{ .err = c },
+    };
+
     // ---------- Write destination ----------
     const put_out = ctx.backend.putObject(.{
         .bucket = dest_bucket,
@@ -604,6 +686,9 @@ fn copyObject(ctx: Context, dest_bucket: []const u8, dest_key: []const u8) Resul
         .user_metadata = dest_metadata,
         .tags = dest_tags,
         .acl = dest_acl,
+        .retention_mode = lock_info.mode,
+        .retain_until_unix = lock_info.retain_until_unix,
+        .legal_hold = lock_info.legal_hold,
     }) catch |err| return .{ .err = mapStorageErr(err) };
 
     // ---------- Render response ----------
@@ -725,7 +810,11 @@ fn headObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
 
 fn deleteObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
     const version_id = queryValue(ctx.allocator, ctx.request.query, "versionId") catch return .{ .err = .internal_error };
-    const out = ctx.backend.deleteObject(.{ .bucket = bucket, .key = key, .version_id = version_id }) catch |err|
+    const bypass_governance = blk: {
+        const hv = findHeader(ctx.request.headers, "x-amz-bypass-governance-retention") orelse break :blk false;
+        break :blk std.ascii.eqlIgnoreCase(hv, "true");
+    };
+    const out = ctx.backend.deleteObject(.{ .bucket = bucket, .key = key, .version_id = version_id, .bypass_governance = bypass_governance }) catch |err|
         return .{ .err = mapStorageErr(err) };
 
     // On a versioned bucket the response carries `x-amz-version-id` and
@@ -754,8 +843,12 @@ fn deleteObjects(ctx: Context, bucket: []const u8) Result {
     var errs: std.ArrayList(storage.DeleteError) = .empty;
     defer errs.deinit(ctx.allocator);
 
+    const bypass_governance = blk: {
+        const hv = findHeader(ctx.request.headers, "x-amz-bypass-governance-retention") orelse break :blk false;
+        break :blk std.ascii.eqlIgnoreCase(hv, "true");
+    };
     for (parsed_body.keys) |k| {
-        _ = ctx.backend.deleteObject(.{ .bucket = bucket, .key = k }) catch |err| {
+        _ = ctx.backend.deleteObject(.{ .bucket = bucket, .key = k, .bypass_governance = bypass_governance }) catch |err| {
             const code: errors.Code = mapStorageErr(err);
             errs.append(ctx.allocator, .{
                 .key = k,
@@ -826,9 +919,24 @@ fn buildHeadHeaders(ctx: Context, meta: storage.Object) ![]Header {
     return hs.toOwnedSlice(ctx.allocator);
 }
 
+fn appendLockHeaders(ctx: Context, hs: *std.ArrayList(Header), meta: storage.Object) !void {
+    if (meta.retention_mode) |m| {
+        try hs.append(ctx.allocator, .{ .name = "x-amz-object-lock-mode", .value = storage.retentionModeToString(m) });
+        const date_str = try object_retention_wire.formatIsoUnix(ctx.allocator, meta.retain_until_unix);
+        try hs.append(ctx.allocator, .{ .name = "x-amz-object-lock-retain-until-date", .value = date_str });
+    }
+    // AWS-exact: always emit legal-hold header (ON or OFF) when Object Lock
+    // headers appear. We emit it any time the object has any lock state.
+    if (meta.retention_mode != null or meta.legal_hold) {
+        try hs.append(ctx.allocator, .{
+            .name = "x-amz-object-lock-legal-hold",
+            .value = if (meta.legal_hold) "ON" else "OFF",
+        });
+    }
+}
+
 fn buildObjectHeadersWithVersion(ctx: Context, meta: storage.Object, range_header: ?[]const u8) ![]Header {
     const base = try buildObjectHeaders(ctx, meta, range_header);
-    if (meta.version_id.len == 0 and meta.tags.len == 0) return base;
     var hs: std.ArrayList(Header) = .empty;
     errdefer hs.deinit(ctx.allocator);
     try hs.appendSlice(ctx.allocator, base);
@@ -840,12 +948,12 @@ fn buildObjectHeadersWithVersion(ctx: Context, meta: storage.Object, range_heade
         const count_str = try std.fmt.allocPrint(ctx.allocator, "{d}", .{meta.tags.len});
         try hs.append(ctx.allocator, .{ .name = "x-amz-tagging-count", .value = count_str });
     }
+    try appendLockHeaders(ctx, &hs, meta);
     return hs.toOwnedSlice(ctx.allocator);
 }
 
 fn buildHeadHeadersWithVersion(ctx: Context, meta: storage.Object) ![]Header {
     const base = try buildHeadHeaders(ctx, meta);
-    if (meta.version_id.len == 0 and meta.tags.len == 0) return base;
     var hs: std.ArrayList(Header) = .empty;
     errdefer hs.deinit(ctx.allocator);
     try hs.appendSlice(ctx.allocator, base);
@@ -857,6 +965,7 @@ fn buildHeadHeadersWithVersion(ctx: Context, meta: storage.Object) ![]Header {
         const count_str = try std.fmt.allocPrint(ctx.allocator, "{d}", .{meta.tags.len});
         try hs.append(ctx.allocator, .{ .name = "x-amz-tagging-count", .value = count_str });
     }
+    try appendLockHeaders(ctx, &hs, meta);
     return hs.toOwnedSlice(ctx.allocator);
 }
 

@@ -85,6 +85,8 @@ def snake_to_pascal(name: str) -> str:
         "get_bucket_lifecycle": "GetBucketLifecycleConfiguration",
         "put_bucket_notification": "PutBucketNotificationConfiguration",
         "get_bucket_notification": "GetBucketNotificationConfiguration",
+        "put_object_lock_config": "PutObjectLockConfiguration",
+        "get_object_lock_config": "GetObjectLockConfiguration",
     }
     if name in SPECIAL:
         return SPECIAL[name]

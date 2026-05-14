@@ -1,6 +1,6 @@
 # nanostack Operation Support Matrix
 
-**Version:** v0.0.2 + M11 in progress (bucket setup essentials)
+**Version:** v0.0.2 + M11 + M12 in progress (Object Lock with WORM enforcement)
 
 **How to read this matrix:** each row is one S3 operation or cross-cutting capability. Status is one of:
 
@@ -64,6 +64,9 @@ The "Milestone" column points at the release tag in which the capability landed.
 | PutBucketNotificationConfiguration / GetBucketNotificationConfiguration | supported (Topic / Queue / CloudFunction targets + Filter; empty Get returns 200 empty body, AWS-exact) | M11 |
 | PutBucketWebsite / GetBucketWebsite / DeleteBucketWebsite | supported (IndexDocument, ErrorDocument, RedirectAllRequestsTo, RoutingRules; 404 `NoSuchWebsiteConfiguration`) | M11 |
 | GetObjectAttributes | supported (ETag, ObjectSize, StorageClass, ObjectParts.PartsCount, Checksum-empty; per-version; precondition headers honoured) | M11 |
+| PutObjectLockConfiguration / GetObjectLockConfiguration | supported (XML body + default-retention rule; 409 InvalidBucketState on non-locked bucket; 404 ObjectLockConfigurationNotFoundError) | M12 |
+| PutObjectRetention / GetObjectRetention | supported (per-version; GOVERNANCE/COMPLIANCE mode-transition rules enforced) | M12 |
+| PutObjectLegalHold / GetObjectLegalHold | supported (per-version; legal hold supersedes retention) | M12 |
 
 ### v1 cross-cutting
 
@@ -126,6 +129,26 @@ The "Milestone" column points at the release tag in which the capability landed.
 | Bucket-policy condition-key validation | not supported (well-formed JSON only) | post-v1.1 |
 | Bucket-policy size cap (20 KB) | not enforced (documented divergence) | post-v1.1 |
 | Access Points / MRAP / S3 Access Grants | not supported | post-v1.1 |
+
+### Object Lock + WORM enforcement (M12)
+
+**M12 is the first nanostack milestone where persisted state actually enforces — DeleteObject is rejected within retention; COMPLIANCE mode is immutable; legal hold supersedes everything.** This is a deliberate departure from the M10/M11 accept-store-roundtrip pattern.
+
+| Capability | Status | Milestone |
+|---|---|---|
+| `x-amz-bucket-object-lock-enabled: true` on CreateBucket → auto-enable versioning | supported | M12 |
+| `PutBucketVersioning` Status=Suspended on Object-Lock-enabled bucket | rejected (409 InvalidBucketState, AWS-exact) | M12 |
+| `PutObjectLockConfiguration` on non-Object-Lock-enabled bucket | rejected (409 InvalidBucketState; token-based "enable after creation" out of scope) | M12 |
+| GOVERNANCE retention mode | supported (shortenable with `x-amz-bypass-governance-retention: true`) | M12 |
+| COMPLIANCE retention mode | supported (immutable: only extendable, never weakened or removed; mode change rejected) | M12 |
+| Legal hold (ON / OFF, per-version) | supported (always supersedes retention for delete protection) | M12 |
+| `x-amz-bypass-governance-retention: true` on DeleteObject / DeleteObjects / PutObjectRetention | honoured at face value (no IAM check; documented divergence — real AWS checks `s3:BypassGovernanceRetention` permission) | M12 |
+| Inline `x-amz-object-lock-{mode,retain-until-date,legal-hold}` on PutObject / CopyObject / CreateMultipartUpload | supported | M12 |
+| Default retention from bucket config applied to new writes | supported (Days + Years; inline headers override) | M12 |
+| Response headers `x-amz-object-lock-{mode,retain-until-date,legal-hold}` on GetObject / HeadObject | supported | M12 |
+| CopyObject inheriting source retention | not inherited (AWS-exact; dest gets request headers or bucket default) | M12 |
+| Delete marker creation on locked object (DeleteObject without versionId) | allowed even with retention (AWS-exact; delete marker doesn't actually remove the version's data) | M12 |
+| Token-based "enable Object Lock after bucket creation" flow | not supported (must be set at CreateBucket; documented divergence) | post-v1.x |
 
 ### Bucket configurations (M11)
 
