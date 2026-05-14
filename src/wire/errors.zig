@@ -41,6 +41,11 @@ pub const Code = enum {
     ownership_controls_not_found,
     no_such_public_access_block_configuration,
     access_control_list_not_supported,
+    no_such_cors_configuration,
+    server_side_encryption_configuration_not_found_error,
+    no_such_lifecycle_configuration,
+    no_such_website_configuration,
+    malformed_xml,
     internal_error,
 
     pub fn awsCode(self: Code) []const u8 {
@@ -77,6 +82,11 @@ pub const Code = enum {
             .ownership_controls_not_found => "OwnershipControlsNotFoundError",
             .no_such_public_access_block_configuration => "NoSuchPublicAccessBlockConfiguration",
             .access_control_list_not_supported => "AccessControlListNotSupported",
+            .no_such_cors_configuration => "NoSuchCORSConfiguration",
+            .server_side_encryption_configuration_not_found_error => "ServerSideEncryptionConfigurationNotFoundError",
+            .no_such_lifecycle_configuration => "NoSuchLifecycleConfiguration",
+            .no_such_website_configuration => "NoSuchWebsiteConfiguration",
+            .malformed_xml => "MalformedXML",
             .internal_error => "InternalError",
         };
     }
@@ -115,6 +125,11 @@ pub const Code = enum {
             .ownership_controls_not_found => "The bucket ownership controls were not found",
             .no_such_public_access_block_configuration => "The public access block configuration was not found",
             .access_control_list_not_supported => "The bucket does not allow ACLs.",
+            .no_such_cors_configuration => "The CORS configuration does not exist",
+            .server_side_encryption_configuration_not_found_error => "The server side encryption configuration was not found",
+            .no_such_lifecycle_configuration => "The lifecycle configuration does not exist",
+            .no_such_website_configuration => "The specified bucket does not have a website configuration",
+            .malformed_xml => "The XML you provided was not well-formed or did not validate against our published schema.",
             .internal_error => "We encountered an internal error. Please try again.",
         };
     }
@@ -140,6 +155,11 @@ pub const Code = enum {
             .ownership_controls_not_found => 404,
             .no_such_public_access_block_configuration => 404,
             .access_control_list_not_supported => 400,
+            .no_such_cors_configuration => 404,
+            .server_side_encryption_configuration_not_found_error => 404,
+            .no_such_lifecycle_configuration => 404,
+            .no_such_website_configuration => 404,
+            .malformed_xml => 400,
             .method_not_allowed => 405,
             .internal_error => 500,
         };

@@ -25,6 +25,12 @@ const acl_service = @import("acl.zig");
 const policy = @import("policy.zig");
 const ownership = @import("ownership.zig");
 const public_access_block_service = @import("public_access_block.zig");
+const cors_service = @import("cors.zig");
+const encryption_service = @import("encryption.zig");
+const lifecycle_service = @import("lifecycle.zig");
+const notification_service = @import("notification.zig");
+const website_service = @import("website.zig");
+const object_attributes_service = @import("object_attributes.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -235,6 +241,25 @@ pub fn handle(ctx: Context, parsed: router.Parsed) Result {
             ctx,
             parsed.bucket orelse return .{ .err = .invalid_request },
         ),
+        .put_bucket_cors => cors_service.putBucketCors(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .get_bucket_cors => cors_service.getBucketCors(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .delete_bucket_cors => cors_service.deleteBucketCors(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .put_bucket_encryption => encryption_service.putBucketEncryption(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .get_bucket_encryption => encryption_service.getBucketEncryption(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .delete_bucket_encryption => encryption_service.deleteBucketEncryption(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .put_bucket_lifecycle => lifecycle_service.putBucketLifecycle(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .get_bucket_lifecycle => lifecycle_service.getBucketLifecycle(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .delete_bucket_lifecycle => lifecycle_service.deleteBucketLifecycle(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .put_bucket_notification => notification_service.putBucketNotification(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .get_bucket_notification => notification_service.getBucketNotification(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .put_bucket_website => website_service.putBucketWebsite(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .get_bucket_website => website_service.getBucketWebsite(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .delete_bucket_website => website_service.deleteBucketWebsite(ctx, parsed.bucket orelse return .{ .err = .invalid_request }),
+        .get_object_attributes => object_attributes_service.getObjectAttributes(
+            ctx,
+            parsed.bucket orelse return .{ .err = .invalid_request },
+            parsed.key orelse return .{ .err = .invalid_request },
+        ),
         .unknown => .{ .err = .not_implemented },
     };
 }
@@ -343,6 +368,10 @@ pub fn mapStorageErr(e: storage.Error) errors.Code {
         storage.Error.OwnershipControlsNotFound => .ownership_controls_not_found,
         storage.Error.NoSuchPublicAccessBlockConfiguration => .no_such_public_access_block_configuration,
         storage.Error.AccessControlListNotSupported => .access_control_list_not_supported,
+        storage.Error.NoSuchCorsConfiguration => .no_such_cors_configuration,
+        storage.Error.ServerSideEncryptionConfigurationNotFound => .server_side_encryption_configuration_not_found_error,
+        storage.Error.NoSuchLifecycleConfiguration => .no_such_lifecycle_configuration,
+        storage.Error.NoSuchWebsiteConfiguration => .no_such_website_configuration,
         storage.Error.BucketAlreadyExists => .bucket_already_exists,
         storage.Error.BucketAlreadyOwnedByYou => .bucket_already_owned_by_you,
         storage.Error.BucketNotEmpty => .bucket_not_empty,

@@ -1,6 +1,6 @@
 # nanostack Operation Support Matrix
 
-**Version:** v0.0.2
+**Version:** v0.0.2 + M11 in progress (bucket setup essentials)
 
 **How to read this matrix:** each row is one S3 operation or cross-cutting capability. Status is one of:
 
@@ -58,6 +58,12 @@ The "Milestone" column points at the release tag in which the capability landed.
 | PutPublicAccessBlock | supported (all 4 bool fields) | M10 |
 | GetPublicAccessBlock | supported (404 `NoSuchPublicAccessBlockConfiguration` on unset, AWS-exact) | M10 |
 | DeletePublicAccessBlock | supported (204; idempotent) | M10 |
+| PutBucketCors / GetBucketCors / DeleteBucketCors | supported (404 `NoSuchCORSConfiguration` on untouched; AWS-exact) | M11 |
+| PutBucketEncryption / GetBucketEncryption / DeleteBucketEncryption | supported (AES256, aws:kms, aws:kms:dsse; 404 `ServerSideEncryptionConfigurationNotFoundError`) | M11 |
+| PutBucketLifecycleConfiguration / GetBucketLifecycleConfiguration / DeleteBucketLifecycle | supported (Filter, Transition, Expiration, Noncurrent*, AbortIncompleteMultipartUpload; 404 `NoSuchLifecycleConfiguration`) | M11 |
+| PutBucketNotificationConfiguration / GetBucketNotificationConfiguration | supported (Topic / Queue / CloudFunction targets + Filter; empty Get returns 200 empty body, AWS-exact) | M11 |
+| PutBucketWebsite / GetBucketWebsite / DeleteBucketWebsite | supported (IndexDocument, ErrorDocument, RedirectAllRequestsTo, RoutingRules; 404 `NoSuchWebsiteConfiguration`) | M11 |
+| GetObjectAttributes | supported (ETag, ObjectSize, StorageClass, ObjectParts.PartsCount, Checksum-empty; per-version; precondition headers honoured) | M11 |
 
 ### v1 cross-cutting
 
@@ -120,6 +126,20 @@ The "Milestone" column points at the release tag in which the capability landed.
 | Bucket-policy condition-key validation | not supported (well-formed JSON only) | post-v1.1 |
 | Bucket-policy size cap (20 KB) | not enforced (documented divergence) | post-v1.1 |
 | Access Points / MRAP / S3 Access Grants | not supported | post-v1.1 |
+
+### Bucket configurations (M11)
+
+| Capability | Status | Milestone |
+|---|---|---|
+| CORS XML round-trip (rules: AllowedMethod/AllowedOrigin/AllowedHeader/ExposeHeader/MaxAgeSeconds) | supported (accept-store-roundtrip; no actual cross-origin enforcement) | M11 |
+| Server-side encryption config (AES256 / aws:kms / aws:kms:dsse; KMSMasterKeyID; BucketKeyEnabled) | supported (accept-store-roundtrip; **no actual cipher applied to object data**) | M11 |
+| Lifecycle rules (Filter, Prefix, Transition, Expiration, NoncurrentVersionTransition, NoncurrentVersionExpiration, AbortIncompleteMultipartUpload) | supported (accept-store-roundtrip; **rules never expire / transition objects**) | M11 |
+| Notification targets (TopicConfiguration → SNS, QueueConfiguration → SQS, CloudFunctionConfiguration → Lambda; events + filter rules) | supported (accept-store-roundtrip; **events never fire — no downstream services**) | M11 |
+| Website config (IndexDocument / ErrorDocument / RedirectAllRequestsTo / RoutingRules) | supported (accept-store-roundtrip; **website-mode requests not honoured**) | M11 |
+| `GetObjectAttributes` ObjectParts detail | partial (`PartsCount` only; per-part rows out of scope) | M11 |
+| **Enforcement of any M11 config** | **not enforced** (accept-store-roundtrip only; documented divergence) | M11 |
+| Lifecycle structural validation (Days XOR Date; Filter XOR Prefix) | not enforced (we round-trip whatever the client sends) | post-v1.x |
+| EventBridge notification target | not supported (trivial when needed) | post-v1.x |
 
 ### Tagging-related (M9)
 

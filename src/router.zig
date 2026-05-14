@@ -46,6 +46,21 @@ pub const Operation = enum {
     put_public_access_block,
     get_public_access_block,
     delete_public_access_block,
+    put_bucket_cors,
+    get_bucket_cors,
+    delete_bucket_cors,
+    put_bucket_encryption,
+    get_bucket_encryption,
+    delete_bucket_encryption,
+    put_bucket_lifecycle,
+    get_bucket_lifecycle,
+    delete_bucket_lifecycle,
+    put_bucket_notification,
+    get_bucket_notification,
+    put_bucket_website,
+    get_bucket_website,
+    delete_bucket_website,
+    get_object_attributes,
     unknown,
 };
 
@@ -112,6 +127,7 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
             if (eql(method, "PUT")) return .put_object_acl;
             if (eql(method, "GET")) return .get_object_acl;
         }
+        if (hasQueryParam(query, "attributes") and eql(method, "GET")) return .get_object_attributes;
         if (eql(method, "PUT")) return .put_object;
         if (eql(method, "GET")) return .get_object;
         if (eql(method, "HEAD")) return .head_object;
@@ -130,6 +146,11 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
         if (hasQueryParam(query, "policy")) return .get_bucket_policy;
         if (hasQueryParam(query, "ownershipControls")) return .get_bucket_ownership_controls;
         if (hasQueryParam(query, "publicAccessBlock")) return .get_public_access_block;
+        if (hasQueryParam(query, "cors")) return .get_bucket_cors;
+        if (hasQueryParam(query, "encryption")) return .get_bucket_encryption;
+        if (hasQueryParam(query, "lifecycle")) return .get_bucket_lifecycle;
+        if (hasQueryParam(query, "notification")) return .get_bucket_notification;
+        if (hasQueryParam(query, "website")) return .get_bucket_website;
         if (hasQueryParam(query, "uploads")) return .list_multipart_uploads;
         if (queryParamEquals(query, "list-type", "2")) return .list_objects_v2;
         return .list_objects;
@@ -141,6 +162,11 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
         if (hasQueryParam(query, "policy")) return .put_bucket_policy;
         if (hasQueryParam(query, "ownershipControls")) return .put_bucket_ownership_controls;
         if (hasQueryParam(query, "publicAccessBlock")) return .put_public_access_block;
+        if (hasQueryParam(query, "cors")) return .put_bucket_cors;
+        if (hasQueryParam(query, "encryption")) return .put_bucket_encryption;
+        if (hasQueryParam(query, "lifecycle")) return .put_bucket_lifecycle;
+        if (hasQueryParam(query, "notification")) return .put_bucket_notification;
+        if (hasQueryParam(query, "website")) return .put_bucket_website;
         return .create_bucket;
     }
     if (eql(method, "DELETE") and has_bucket) {
@@ -148,6 +174,10 @@ fn resolveOp(method: []const u8, bucket: ?[]const u8, key: ?[]const u8, query: [
         if (hasQueryParam(query, "policy")) return .delete_bucket_policy;
         if (hasQueryParam(query, "ownershipControls")) return .delete_bucket_ownership_controls;
         if (hasQueryParam(query, "publicAccessBlock")) return .delete_public_access_block;
+        if (hasQueryParam(query, "cors")) return .delete_bucket_cors;
+        if (hasQueryParam(query, "encryption")) return .delete_bucket_encryption;
+        if (hasQueryParam(query, "lifecycle")) return .delete_bucket_lifecycle;
+        if (hasQueryParam(query, "website")) return .delete_bucket_website;
         return .delete_bucket;
     }
     if (eql(method, "HEAD") and has_bucket) return .head_bucket;
@@ -456,4 +486,38 @@ test "publicAccessBlock: GET /b?publicAccessBlock → get_public_access_block" {
 test "publicAccessBlock: DELETE /b?publicAccessBlock → delete_public_access_block" {
     const p = parse("DELETE", "localhost", "/buk", "publicAccessBlock");
     try testing.expectEqual(Operation.delete_public_access_block, p.op);
+}
+
+test "cors: PUT/GET/DELETE /b?cors" {
+    try testing.expectEqual(Operation.put_bucket_cors, parse("PUT", "localhost", "/buk", "cors").op);
+    try testing.expectEqual(Operation.get_bucket_cors, parse("GET", "localhost", "/buk", "cors").op);
+    try testing.expectEqual(Operation.delete_bucket_cors, parse("DELETE", "localhost", "/buk", "cors").op);
+}
+
+test "encryption: PUT/GET/DELETE /b?encryption" {
+    try testing.expectEqual(Operation.put_bucket_encryption, parse("PUT", "localhost", "/buk", "encryption").op);
+    try testing.expectEqual(Operation.get_bucket_encryption, parse("GET", "localhost", "/buk", "encryption").op);
+    try testing.expectEqual(Operation.delete_bucket_encryption, parse("DELETE", "localhost", "/buk", "encryption").op);
+}
+
+test "lifecycle: PUT/GET/DELETE /b?lifecycle" {
+    try testing.expectEqual(Operation.put_bucket_lifecycle, parse("PUT", "localhost", "/buk", "lifecycle").op);
+    try testing.expectEqual(Operation.get_bucket_lifecycle, parse("GET", "localhost", "/buk", "lifecycle").op);
+    try testing.expectEqual(Operation.delete_bucket_lifecycle, parse("DELETE", "localhost", "/buk", "lifecycle").op);
+}
+
+test "notification: PUT/GET /b?notification" {
+    try testing.expectEqual(Operation.put_bucket_notification, parse("PUT", "localhost", "/buk", "notification").op);
+    try testing.expectEqual(Operation.get_bucket_notification, parse("GET", "localhost", "/buk", "notification").op);
+}
+
+test "website: PUT/GET/DELETE /b?website" {
+    try testing.expectEqual(Operation.put_bucket_website, parse("PUT", "localhost", "/buk", "website").op);
+    try testing.expectEqual(Operation.get_bucket_website, parse("GET", "localhost", "/buk", "website").op);
+    try testing.expectEqual(Operation.delete_bucket_website, parse("DELETE", "localhost", "/buk", "website").op);
+}
+
+test "objectAttributes: GET /b/k?attributes → get_object_attributes" {
+    const p = parse("GET", "localhost", "/buk/k", "attributes");
+    try testing.expectEqual(Operation.get_object_attributes, p.op);
 }

@@ -121,6 +121,17 @@ const BucketSlot = struct {
     /// Bucket public access block configuration (M10). `null` → 404
     /// NoSuchPublicAccessBlockConfiguration.
     public_access_block: ?storage.PublicAccessBlockConfig = null,
+    /// CORS config (M11). `null` → 404 NoSuchCORSConfiguration.
+    cors: ?storage.CorsConfig = null,
+    /// Encryption config (M11). `null` → 404 ServerSideEncryptionConfigurationNotFoundError.
+    encryption: ?storage.EncryptionConfig = null,
+    /// Lifecycle config (M11). `null` → 404 NoSuchLifecycleConfiguration.
+    lifecycle: ?storage.LifecycleConfig = null,
+    /// Notification config (M11). `null` → return empty config (AWS-exact);
+    /// no 404 for this one.
+    notification: ?storage.NotificationConfig = null,
+    /// Website config (M11). `null` → 404 NoSuchWebsiteConfiguration.
+    website: ?storage.WebsiteConfig = null,
 
     fn deinit(self: *BucketSlot, gpa: Allocator) void {
         gpa.free(self.meta.name);
@@ -145,6 +156,11 @@ const BucketSlot = struct {
         freeTagsOwned(gpa, self.tags);
         if (self.acl) |a| freeAclOwned(gpa, a);
         if (self.policy_json) |p| gpa.free(p);
+        if (self.cors) |c| freeCorsConfig(gpa, c);
+        if (self.encryption) |c| freeEncryptionConfig(gpa, c);
+        if (self.lifecycle) |c| freeLifecycleConfig(gpa, c);
+        if (self.notification) |c| freeNotificationConfig(gpa, c);
+        if (self.website) |c| freeWebsiteConfig(gpa, c);
         self.* = undefined;
     }
 };
@@ -267,6 +283,358 @@ pub fn defaultAcl(allocator: Allocator) !storage.Acl {
     };
 }
 
+// ---------------------------------------------------------------------------
+// M11 bucket-config dupe/free helpers. Each config gets a deep dupe into
+// `gpa`-owned memory + a matching free routine.
+
+fn dupeStringList(gpa: Allocator, src: []const []const u8) ![]const []const u8 {
+    const out = try gpa.alloc([]const u8, src.len);
+    errdefer gpa.free(out);
+    var made: usize = 0;
+    errdefer for (out[0..made]) |s| gpa.free(s);
+    for (src) |s| {
+        out[made] = try gpa.dupe(u8, s);
+        made += 1;
+    }
+    return out;
+}
+
+fn freeStringList(gpa: Allocator, items: []const []const u8) void {
+    for (items) |s| gpa.free(s);
+    gpa.free(items);
+}
+
+// CORS
+fn dupeCorsConfig(gpa: Allocator, src: storage.CorsConfig) !storage.CorsConfig {
+    const rules = try gpa.alloc(storage.CorsRule, src.rules.len);
+    errdefer gpa.free(rules);
+    var made: usize = 0;
+    errdefer for (rules[0..made]) |r| freeCorsRule(gpa, r);
+    for (src.rules) |r| {
+        const methods = try gpa.dupe(storage.HttpMethod, r.allowed_methods);
+        errdefer gpa.free(methods);
+        const origins = try dupeStringList(gpa, r.allowed_origins);
+        errdefer freeStringList(gpa, origins);
+        const headers = try dupeStringList(gpa, r.allowed_headers);
+        errdefer freeStringList(gpa, headers);
+        const expose = try dupeStringList(gpa, r.expose_headers);
+        errdefer freeStringList(gpa, expose);
+        const id_dup = try gpa.dupe(u8, r.id);
+        rules[made] = .{
+            .id = id_dup,
+            .allowed_methods = methods,
+            .allowed_origins = origins,
+            .allowed_headers = headers,
+            .expose_headers = expose,
+            .max_age_seconds = r.max_age_seconds,
+        };
+        made += 1;
+    }
+    return .{ .rules = rules };
+}
+
+fn freeCorsRule(gpa: Allocator, r: storage.CorsRule) void {
+    gpa.free(r.id);
+    gpa.free(r.allowed_methods);
+    freeStringList(gpa, r.allowed_origins);
+    freeStringList(gpa, r.allowed_headers);
+    freeStringList(gpa, r.expose_headers);
+}
+
+fn freeCorsConfig(gpa: Allocator, cfg: storage.CorsConfig) void {
+    for (cfg.rules) |r| freeCorsRule(gpa, r);
+    gpa.free(cfg.rules);
+}
+
+// Encryption
+fn dupeEncryptionConfig(gpa: Allocator, src: storage.EncryptionConfig) !storage.EncryptionConfig {
+    const rules = try gpa.alloc(storage.EncryptionRule, src.rules.len);
+    errdefer gpa.free(rules);
+    var made: usize = 0;
+    errdefer for (rules[0..made]) |r| freeEncryptionRule(gpa, r);
+    for (src.rules) |r| {
+        var apply_dup: ?storage.SseByDefault = null;
+        if (r.apply) |a| {
+            apply_dup = .{
+                .sse_algorithm = a.sse_algorithm,
+                .kms_master_key_id = try gpa.dupe(u8, a.kms_master_key_id),
+            };
+        }
+        rules[made] = .{
+            .apply = apply_dup,
+            .bucket_key_enabled = r.bucket_key_enabled,
+        };
+        made += 1;
+    }
+    return .{ .rules = rules };
+}
+
+fn freeEncryptionRule(gpa: Allocator, r: storage.EncryptionRule) void {
+    if (r.apply) |a| gpa.free(a.kms_master_key_id);
+}
+
+fn freeEncryptionConfig(gpa: Allocator, cfg: storage.EncryptionConfig) void {
+    for (cfg.rules) |r| freeEncryptionRule(gpa, r);
+    gpa.free(cfg.rules);
+}
+
+// Lifecycle
+fn dupeTransition(gpa: Allocator, t: storage.Transition) !storage.Transition {
+    return .{
+        .days = t.days,
+        .date_iso8601 = try gpa.dupe(u8, t.date_iso8601),
+        .storage_class = t.storage_class,
+    };
+}
+
+fn freeTransition(gpa: Allocator, t: storage.Transition) void {
+    gpa.free(t.date_iso8601);
+}
+
+fn dupeExpiration(gpa: Allocator, e: storage.Expiration) !storage.Expiration {
+    return .{
+        .days = e.days,
+        .date_iso8601 = try gpa.dupe(u8, e.date_iso8601),
+        .expired_object_delete_marker = e.expired_object_delete_marker,
+    };
+}
+
+fn freeExpiration(gpa: Allocator, e: storage.Expiration) void {
+    gpa.free(e.date_iso8601);
+}
+
+fn dupeLifecycleFilter(gpa: Allocator, f: storage.LifecycleFilter) !storage.LifecycleFilter {
+    var tag_dup: ?storage.Tag = null;
+    if (f.tag) |t| {
+        tag_dup = .{
+            .key = try gpa.dupe(u8, t.key),
+            .value = try gpa.dupe(u8, t.value),
+        };
+    }
+    return .{
+        .prefix = try gpa.dupe(u8, f.prefix),
+        .tag = tag_dup,
+        .object_size_greater_than = f.object_size_greater_than,
+        .object_size_less_than = f.object_size_less_than,
+    };
+}
+
+fn freeLifecycleFilter(gpa: Allocator, f: storage.LifecycleFilter) void {
+    gpa.free(f.prefix);
+    if (f.tag) |t| {
+        gpa.free(t.key);
+        gpa.free(t.value);
+    }
+}
+
+fn dupeTransitionList(gpa: Allocator, src: []const storage.Transition) ![]const storage.Transition {
+    const out = try gpa.alloc(storage.Transition, src.len);
+    errdefer gpa.free(out);
+    var made: usize = 0;
+    errdefer for (out[0..made]) |t| freeTransition(gpa, t);
+    for (src) |t| {
+        out[made] = try dupeTransition(gpa, t);
+        made += 1;
+    }
+    return out;
+}
+
+fn freeTransitionList(gpa: Allocator, ts: []const storage.Transition) void {
+    for (ts) |t| freeTransition(gpa, t);
+    gpa.free(ts);
+}
+
+fn dupeLifecycleRule(gpa: Allocator, r: storage.LifecycleRule) !storage.LifecycleRule {
+    var filter_dup: ?storage.LifecycleFilter = null;
+    if (r.filter) |f| filter_dup = try dupeLifecycleFilter(gpa, f);
+    errdefer if (filter_dup) |f| freeLifecycleFilter(gpa, f);
+    var exp_dup: ?storage.Expiration = null;
+    if (r.expiration) |e| exp_dup = try dupeExpiration(gpa, e);
+    errdefer if (exp_dup) |e| freeExpiration(gpa, e);
+    var ncve_dup: ?storage.Expiration = null;
+    if (r.noncurrent_version_expiration) |e| ncve_dup = try dupeExpiration(gpa, e);
+    errdefer if (ncve_dup) |e| freeExpiration(gpa, e);
+    return .{
+        .id = try gpa.dupe(u8, r.id),
+        .status = r.status,
+        .filter = filter_dup,
+        .prefix = try gpa.dupe(u8, r.prefix),
+        .transitions = try dupeTransitionList(gpa, r.transitions),
+        .expiration = exp_dup,
+        .noncurrent_version_transitions = try dupeTransitionList(gpa, r.noncurrent_version_transitions),
+        .noncurrent_version_expiration = ncve_dup,
+        .abort_incomplete_multipart_upload_days = r.abort_incomplete_multipart_upload_days,
+    };
+}
+
+fn freeLifecycleRule(gpa: Allocator, r: storage.LifecycleRule) void {
+    gpa.free(r.id);
+    gpa.free(r.prefix);
+    if (r.filter) |f| freeLifecycleFilter(gpa, f);
+    freeTransitionList(gpa, r.transitions);
+    if (r.expiration) |e| freeExpiration(gpa, e);
+    freeTransitionList(gpa, r.noncurrent_version_transitions);
+    if (r.noncurrent_version_expiration) |e| freeExpiration(gpa, e);
+}
+
+fn dupeLifecycleConfig(gpa: Allocator, src: storage.LifecycleConfig) !storage.LifecycleConfig {
+    const rules = try gpa.alloc(storage.LifecycleRule, src.rules.len);
+    errdefer gpa.free(rules);
+    var made: usize = 0;
+    errdefer for (rules[0..made]) |r| freeLifecycleRule(gpa, r);
+    for (src.rules) |r| {
+        rules[made] = try dupeLifecycleRule(gpa, r);
+        made += 1;
+    }
+    return .{ .rules = rules };
+}
+
+fn freeLifecycleConfig(gpa: Allocator, cfg: storage.LifecycleConfig) void {
+    for (cfg.rules) |r| freeLifecycleRule(gpa, r);
+    gpa.free(cfg.rules);
+}
+
+// Notifications
+fn dupeNotificationFilter(gpa: Allocator, f: storage.NotificationFilter) !storage.NotificationFilter {
+    const rules = try gpa.alloc(storage.NotificationFilterRule, f.filter_rules.len);
+    errdefer gpa.free(rules);
+    var made: usize = 0;
+    errdefer for (rules[0..made]) |r| {
+        gpa.free(r.name);
+        gpa.free(r.value);
+    };
+    for (f.filter_rules) |r| {
+        rules[made] = .{
+            .name = try gpa.dupe(u8, r.name),
+            .value = try gpa.dupe(u8, r.value),
+        };
+        made += 1;
+    }
+    return .{ .filter_rules = rules };
+}
+
+fn freeNotificationFilter(gpa: Allocator, f: storage.NotificationFilter) void {
+    for (f.filter_rules) |r| {
+        gpa.free(r.name);
+        gpa.free(r.value);
+    }
+    gpa.free(f.filter_rules);
+}
+
+fn dupeNotificationEntry(gpa: Allocator, e: storage.NotificationConfigEntry) !storage.NotificationConfigEntry {
+    var filter_dup: ?storage.NotificationFilter = null;
+    if (e.filter) |f| filter_dup = try dupeNotificationFilter(gpa, f);
+    errdefer if (filter_dup) |f| freeNotificationFilter(gpa, f);
+    const events = try gpa.dupe(storage.S3EventName, e.events);
+    errdefer gpa.free(events);
+    return .{
+        .target = e.target,
+        .id = try gpa.dupe(u8, e.id),
+        .arn = try gpa.dupe(u8, e.arn),
+        .events = events,
+        .filter = filter_dup,
+    };
+}
+
+fn freeNotificationEntry(gpa: Allocator, e: storage.NotificationConfigEntry) void {
+    gpa.free(e.id);
+    gpa.free(e.arn);
+    gpa.free(e.events);
+    if (e.filter) |f| freeNotificationFilter(gpa, f);
+}
+
+fn dupeNotificationConfig(gpa: Allocator, src: storage.NotificationConfig) !storage.NotificationConfig {
+    const entries = try gpa.alloc(storage.NotificationConfigEntry, src.entries.len);
+    errdefer gpa.free(entries);
+    var made: usize = 0;
+    errdefer for (entries[0..made]) |e| freeNotificationEntry(gpa, e);
+    for (src.entries) |e| {
+        entries[made] = try dupeNotificationEntry(gpa, e);
+        made += 1;
+    }
+    return .{ .entries = entries };
+}
+
+fn freeNotificationConfig(gpa: Allocator, cfg: storage.NotificationConfig) void {
+    for (cfg.entries) |e| freeNotificationEntry(gpa, e);
+    gpa.free(cfg.entries);
+}
+
+// Website
+fn dupeRoutingRule(gpa: Allocator, r: storage.RoutingRule) !storage.RoutingRule {
+    var cond_dup: ?storage.RoutingCondition = null;
+    if (r.condition) |c| {
+        cond_dup = .{
+            .key_prefix_equals = try gpa.dupe(u8, c.key_prefix_equals),
+            .http_error_code_returned_equals = try gpa.dupe(u8, c.http_error_code_returned_equals),
+        };
+    }
+    errdefer if (cond_dup) |c| {
+        gpa.free(c.key_prefix_equals);
+        gpa.free(c.http_error_code_returned_equals);
+    };
+    return .{
+        .condition = cond_dup,
+        .redirect = .{
+            .host_name = try gpa.dupe(u8, r.redirect.host_name),
+            .http_redirect_code = try gpa.dupe(u8, r.redirect.http_redirect_code),
+            .protocol = r.redirect.protocol,
+            .replace_key_prefix_with = try gpa.dupe(u8, r.redirect.replace_key_prefix_with),
+            .replace_key_with = try gpa.dupe(u8, r.redirect.replace_key_with),
+        },
+    };
+}
+
+fn freeRoutingRule(gpa: Allocator, r: storage.RoutingRule) void {
+    if (r.condition) |c| {
+        gpa.free(c.key_prefix_equals);
+        gpa.free(c.http_error_code_returned_equals);
+    }
+    gpa.free(r.redirect.host_name);
+    gpa.free(r.redirect.http_redirect_code);
+    gpa.free(r.redirect.replace_key_prefix_with);
+    gpa.free(r.redirect.replace_key_with);
+}
+
+fn dupeWebsiteConfig(gpa: Allocator, src: storage.WebsiteConfig) !storage.WebsiteConfig {
+    var redirect_all_dup: ?storage.RedirectAllRequestsTo = null;
+    if (src.redirect_all) |r| {
+        redirect_all_dup = .{
+            .host_name = try gpa.dupe(u8, r.host_name),
+            .protocol = r.protocol,
+        };
+    }
+    errdefer if (redirect_all_dup) |r| gpa.free(r.host_name);
+    var idx_dup: ?storage.IndexDocument = null;
+    if (src.index_document) |i| idx_dup = .{ .suffix = try gpa.dupe(u8, i.suffix) };
+    errdefer if (idx_dup) |i| gpa.free(i.suffix);
+    var err_dup: ?storage.ErrorDocument = null;
+    if (src.error_document) |e| err_dup = .{ .key = try gpa.dupe(u8, e.key) };
+    errdefer if (err_dup) |e| gpa.free(e.key);
+    const rules = try gpa.alloc(storage.RoutingRule, src.routing_rules.len);
+    errdefer gpa.free(rules);
+    var made: usize = 0;
+    errdefer for (rules[0..made]) |r| freeRoutingRule(gpa, r);
+    for (src.routing_rules) |r| {
+        rules[made] = try dupeRoutingRule(gpa, r);
+        made += 1;
+    }
+    return .{
+        .redirect_all = redirect_all_dup,
+        .index_document = idx_dup,
+        .error_document = err_dup,
+        .routing_rules = rules,
+    };
+}
+
+fn freeWebsiteConfig(gpa: Allocator, cfg: storage.WebsiteConfig) void {
+    if (cfg.redirect_all) |r| gpa.free(r.host_name);
+    if (cfg.index_document) |i| gpa.free(i.suffix);
+    if (cfg.error_document) |e| gpa.free(e.key);
+    for (cfg.routing_rules) |r| freeRoutingRule(gpa, r);
+    gpa.free(cfg.routing_rules);
+}
+
 allocator: Allocator,
 io: Io,
 base_dir: []u8,
@@ -350,6 +718,20 @@ const vtable: storage.Backend.VTable = .{
     .putPublicAccessBlock = vtPutPublicAccessBlock,
     .getPublicAccessBlock = vtGetPublicAccessBlock,
     .deletePublicAccessBlock = vtDeletePublicAccessBlock,
+    .putBucketCors = vtPutBucketCors,
+    .getBucketCors = vtGetBucketCors,
+    .deleteBucketCors = vtDeleteBucketCors,
+    .putBucketEncryption = vtPutBucketEncryption,
+    .getBucketEncryption = vtGetBucketEncryption,
+    .deleteBucketEncryption = vtDeleteBucketEncryption,
+    .putBucketLifecycle = vtPutBucketLifecycle,
+    .getBucketLifecycle = vtGetBucketLifecycle,
+    .deleteBucketLifecycle = vtDeleteBucketLifecycle,
+    .putBucketNotification = vtPutBucketNotification,
+    .getBucketNotification = vtGetBucketNotification,
+    .putBucketWebsite = vtPutBucketWebsite,
+    .getBucketWebsite = vtGetBucketWebsite,
+    .deleteBucketWebsite = vtDeleteBucketWebsite,
 };
 
 fn vtCreateBucket(ctx: *anyopaque, name: []const u8) storage.Error!void {
@@ -462,6 +844,48 @@ fn vtGetPublicAccessBlock(ctx: *anyopaque, bucket: []const u8) storage.Error!sto
 }
 fn vtDeletePublicAccessBlock(ctx: *anyopaque, bucket: []const u8) storage.Error!void {
     return deletePublicAccessBlock(@ptrCast(@alignCast(ctx)), bucket);
+}
+fn vtPutBucketCors(ctx: *anyopaque, bucket: []const u8, cfg: storage.CorsConfig) storage.Error!void {
+    return putBucketCors(@ptrCast(@alignCast(ctx)), bucket, cfg);
+}
+fn vtGetBucketCors(ctx: *anyopaque, allocator: Allocator, bucket: []const u8) storage.Error!storage.CorsConfig {
+    return getBucketCors(@ptrCast(@alignCast(ctx)), allocator, bucket);
+}
+fn vtDeleteBucketCors(ctx: *anyopaque, bucket: []const u8) storage.Error!void {
+    return deleteBucketCors(@ptrCast(@alignCast(ctx)), bucket);
+}
+fn vtPutBucketEncryption(ctx: *anyopaque, bucket: []const u8, cfg: storage.EncryptionConfig) storage.Error!void {
+    return putBucketEncryption(@ptrCast(@alignCast(ctx)), bucket, cfg);
+}
+fn vtGetBucketEncryption(ctx: *anyopaque, allocator: Allocator, bucket: []const u8) storage.Error!storage.EncryptionConfig {
+    return getBucketEncryption(@ptrCast(@alignCast(ctx)), allocator, bucket);
+}
+fn vtDeleteBucketEncryption(ctx: *anyopaque, bucket: []const u8) storage.Error!void {
+    return deleteBucketEncryption(@ptrCast(@alignCast(ctx)), bucket);
+}
+fn vtPutBucketLifecycle(ctx: *anyopaque, bucket: []const u8, cfg: storage.LifecycleConfig) storage.Error!void {
+    return putBucketLifecycle(@ptrCast(@alignCast(ctx)), bucket, cfg);
+}
+fn vtGetBucketLifecycle(ctx: *anyopaque, allocator: Allocator, bucket: []const u8) storage.Error!storage.LifecycleConfig {
+    return getBucketLifecycle(@ptrCast(@alignCast(ctx)), allocator, bucket);
+}
+fn vtDeleteBucketLifecycle(ctx: *anyopaque, bucket: []const u8) storage.Error!void {
+    return deleteBucketLifecycle(@ptrCast(@alignCast(ctx)), bucket);
+}
+fn vtPutBucketNotification(ctx: *anyopaque, bucket: []const u8, cfg: storage.NotificationConfig) storage.Error!void {
+    return putBucketNotification(@ptrCast(@alignCast(ctx)), bucket, cfg);
+}
+fn vtGetBucketNotification(ctx: *anyopaque, allocator: Allocator, bucket: []const u8) storage.Error!storage.NotificationConfig {
+    return getBucketNotification(@ptrCast(@alignCast(ctx)), allocator, bucket);
+}
+fn vtPutBucketWebsite(ctx: *anyopaque, bucket: []const u8, cfg: storage.WebsiteConfig) storage.Error!void {
+    return putBucketWebsite(@ptrCast(@alignCast(ctx)), bucket, cfg);
+}
+fn vtGetBucketWebsite(ctx: *anyopaque, allocator: Allocator, bucket: []const u8) storage.Error!storage.WebsiteConfig {
+    return getBucketWebsite(@ptrCast(@alignCast(ctx)), allocator, bucket);
+}
+fn vtDeleteBucketWebsite(ctx: *anyopaque, bucket: []const u8) storage.Error!void {
+    return deleteBucketWebsite(@ptrCast(@alignCast(ctx)), bucket);
 }
 
 // ---------------------------------------------------------------------------
@@ -1650,6 +2074,167 @@ pub fn deletePublicAccessBlock(self: *Fs, bucket: []const u8) storage.Error!void
     }
 }
 
+// ---------------------------------------------------------------------------
+// M11 bucket configurations. Each Put dupes the input into backend-owned
+// memory, swaps in, persists via saveRegistry. Each Get clones into the
+// caller's allocator. Delete clears + persists; idempotent.
+
+pub fn putBucketCors(self: *Fs, bucket: []const u8, cfg: storage.CorsConfig) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    const dup = dupeCorsConfig(self.allocator, cfg) catch return storage.Error.OutOfMemory;
+    if (slot.cors) |old| freeCorsConfig(self.allocator, old);
+    slot.cors = dup;
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+pub fn getBucketCors(self: *Fs, allocator: Allocator, bucket: []const u8) storage.Error!storage.CorsConfig {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    const cfg = slot.cors orelse return storage.Error.NoSuchCorsConfiguration;
+    return dupeCorsConfig(allocator, cfg) catch return storage.Error.OutOfMemory;
+}
+
+pub fn deleteBucketCors(self: *Fs, bucket: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    if (slot.cors) |old| {
+        freeCorsConfig(self.allocator, old);
+        slot.cors = null;
+        saveRegistry(self) catch return storage.Error.Io;
+    }
+}
+
+pub fn putBucketEncryption(self: *Fs, bucket: []const u8, cfg: storage.EncryptionConfig) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    const dup = dupeEncryptionConfig(self.allocator, cfg) catch return storage.Error.OutOfMemory;
+    if (slot.encryption) |old| freeEncryptionConfig(self.allocator, old);
+    slot.encryption = dup;
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+pub fn getBucketEncryption(self: *Fs, allocator: Allocator, bucket: []const u8) storage.Error!storage.EncryptionConfig {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    const cfg = slot.encryption orelse return storage.Error.ServerSideEncryptionConfigurationNotFound;
+    return dupeEncryptionConfig(allocator, cfg) catch return storage.Error.OutOfMemory;
+}
+
+pub fn deleteBucketEncryption(self: *Fs, bucket: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    if (slot.encryption) |old| {
+        freeEncryptionConfig(self.allocator, old);
+        slot.encryption = null;
+        saveRegistry(self) catch return storage.Error.Io;
+    }
+}
+
+pub fn putBucketLifecycle(self: *Fs, bucket: []const u8, cfg: storage.LifecycleConfig) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    const dup = dupeLifecycleConfig(self.allocator, cfg) catch return storage.Error.OutOfMemory;
+    if (slot.lifecycle) |old| freeLifecycleConfig(self.allocator, old);
+    slot.lifecycle = dup;
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+pub fn getBucketLifecycle(self: *Fs, allocator: Allocator, bucket: []const u8) storage.Error!storage.LifecycleConfig {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    const cfg = slot.lifecycle orelse return storage.Error.NoSuchLifecycleConfiguration;
+    return dupeLifecycleConfig(allocator, cfg) catch return storage.Error.OutOfMemory;
+}
+
+pub fn deleteBucketLifecycle(self: *Fs, bucket: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    if (slot.lifecycle) |old| {
+        freeLifecycleConfig(self.allocator, old);
+        slot.lifecycle = null;
+        saveRegistry(self) catch return storage.Error.Io;
+    }
+}
+
+pub fn putBucketNotification(self: *Fs, bucket: []const u8, cfg: storage.NotificationConfig) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    // Empty Put removes; matches AWS-exact behaviour.
+    if (cfg.entries.len == 0) {
+        if (slot.notification) |old| freeNotificationConfig(self.allocator, old);
+        slot.notification = null;
+        saveRegistry(self) catch return storage.Error.Io;
+        return;
+    }
+    const dup = dupeNotificationConfig(self.allocator, cfg) catch return storage.Error.OutOfMemory;
+    if (slot.notification) |old| freeNotificationConfig(self.allocator, old);
+    slot.notification = dup;
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+pub fn getBucketNotification(self: *Fs, allocator: Allocator, bucket: []const u8) storage.Error!storage.NotificationConfig {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    if (slot.notification) |cfg| return dupeNotificationConfig(allocator, cfg) catch return storage.Error.OutOfMemory;
+    // AWS-exact: untouched bucket returns 200 with empty config (no error).
+    return .{ .entries = &.{} };
+}
+
+pub fn putBucketWebsite(self: *Fs, bucket: []const u8, cfg: storage.WebsiteConfig) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    const dup = dupeWebsiteConfig(self.allocator, cfg) catch return storage.Error.OutOfMemory;
+    if (slot.website) |old| freeWebsiteConfig(self.allocator, old);
+    slot.website = dup;
+    saveRegistry(self) catch return storage.Error.Io;
+}
+
+pub fn getBucketWebsite(self: *Fs, allocator: Allocator, bucket: []const u8) storage.Error!storage.WebsiteConfig {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    const slot = &self.buckets.items[idx];
+    const cfg = slot.website orelse return storage.Error.NoSuchWebsiteConfiguration;
+    return dupeWebsiteConfig(allocator, cfg) catch return storage.Error.OutOfMemory;
+}
+
+pub fn deleteBucketWebsite(self: *Fs, bucket: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
+    var slot = &self.buckets.items[idx];
+    if (slot.website) |old| {
+        freeWebsiteConfig(self.allocator, old);
+        slot.website = null;
+        saveRegistry(self) catch return storage.Error.Io;
+    }
+}
+
 fn writeFlatObjectAcl(self: *Fs, bucket: []const u8, key: []const u8, acl: storage.Acl) storage.Error!void {
     var arena_state = std.heap.ArenaAllocator.init(self.allocator);
     defer arena_state.deinit();
@@ -1908,6 +2493,12 @@ const BucketRecord = struct {
     /// M10. PublicAccessBlock config. `null` → 404
     /// NoSuchPublicAccessBlockConfiguration.
     public_access_block: ?storage.PublicAccessBlockConfig = null,
+    /// M11. Bucket configs. All `null` on older records.
+    cors: ?storage.CorsConfig = null,
+    encryption: ?storage.EncryptionConfig = null,
+    lifecycle: ?storage.LifecycleConfig = null,
+    notification: ?storage.NotificationConfig = null,
+    website: ?storage.WebsiteConfig = null,
 };
 
 const MetaDoc = struct {
@@ -1961,6 +2552,11 @@ fn loadRegistry(self: *Fs) !void {
             storage.ownershipControlFromString(s) catch null
         else
             null;
+        const cors_owned: ?storage.CorsConfig = if (rec.cors) |c| try dupeCorsConfig(self.allocator, c) else null;
+        const encryption_owned: ?storage.EncryptionConfig = if (rec.encryption) |c| try dupeEncryptionConfig(self.allocator, c) else null;
+        const lifecycle_owned: ?storage.LifecycleConfig = if (rec.lifecycle) |c| try dupeLifecycleConfig(self.allocator, c) else null;
+        const notification_owned: ?storage.NotificationConfig = if (rec.notification) |c| try dupeNotificationConfig(self.allocator, c) else null;
+        const website_owned: ?storage.WebsiteConfig = if (rec.website) |c| try dupeWebsiteConfig(self.allocator, c) else null;
         var slot: BucketSlot = .{
             .meta = .{
                 .name = name_owned,
@@ -1976,6 +2572,11 @@ fn loadRegistry(self: *Fs) !void {
             .policy_json = policy_owned,
             .ownership_controls = oc_parsed,
             .public_access_block = rec.public_access_block,
+            .cors = cors_owned,
+            .encryption = encryption_owned,
+            .lifecycle = lifecycle_owned,
+            .notification = notification_owned,
+            .website = website_owned,
         };
         // Walk objects/ to rebuild the in-memory key index from meta.json files.
         try rebuildKeyIndex(self, &slot);
@@ -2079,6 +2680,11 @@ fn saveRegistry(self: *Fs) !void {
             .policy_json = b.policy_json,
             .ownership_controls = oc_str,
             .public_access_block = b.public_access_block,
+            .cors = b.cors,
+            .encryption = b.encryption,
+            .lifecycle = b.lifecycle,
+            .notification = b.notification,
+            .website = b.website,
         };
     }
     const doc: RegistryDoc = .{ .version = registry_version, .buckets = records };

@@ -17,6 +17,10 @@ pub const Error = error{
     OwnershipControlsNotFound,
     NoSuchPublicAccessBlockConfiguration,
     AccessControlListNotSupported,
+    NoSuchCorsConfiguration,
+    ServerSideEncryptionConfigurationNotFound,
+    NoSuchLifecycleConfiguration,
+    NoSuchWebsiteConfiguration,
     BucketAlreadyExists,
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
@@ -203,6 +207,285 @@ pub fn ownershipControlFromString(s: []const u8) error{InvalidOwnershipControl}!
 pub fn ownershipControlToString(oc: OwnershipControl) []const u8 {
     return @tagName(oc);
 }
+
+// ---------------------------------------------------------------------------
+// Bucket configurations (M11). Accept-store-roundtrip. No enforcement.
+
+// ----- CORS -----
+
+pub const HttpMethod = enum { GET, PUT, POST, DELETE, HEAD };
+
+pub fn httpMethodFromString(s: []const u8) error{InvalidHttpMethod}!HttpMethod {
+    inline for (@typeInfo(HttpMethod).@"enum".fields) |f| {
+        if (std.mem.eql(u8, s, f.name)) return @field(HttpMethod, f.name);
+    }
+    return error.InvalidHttpMethod;
+}
+
+pub fn httpMethodToString(m: HttpMethod) []const u8 {
+    return @tagName(m);
+}
+
+pub const CorsRule = struct {
+    id: []const u8 = "",
+    allowed_methods: []const HttpMethod,
+    allowed_origins: []const []const u8,
+    allowed_headers: []const []const u8 = &.{},
+    expose_headers: []const []const u8 = &.{},
+    max_age_seconds: ?u32 = null,
+};
+
+pub const CorsConfig = struct {
+    rules: []const CorsRule,
+};
+
+// ----- Encryption -----
+
+pub const SseAlgorithm = enum {
+    @"AES256",
+    @"aws:kms",
+    @"aws:kms:dsse",
+};
+
+pub fn sseAlgorithmFromString(s: []const u8) error{InvalidSseAlgorithm}!SseAlgorithm {
+    if (std.mem.eql(u8, s, "AES256")) return .@"AES256";
+    if (std.mem.eql(u8, s, "aws:kms")) return .@"aws:kms";
+    if (std.mem.eql(u8, s, "aws:kms:dsse")) return .@"aws:kms:dsse";
+    return error.InvalidSseAlgorithm;
+}
+
+pub fn sseAlgorithmToString(a: SseAlgorithm) []const u8 {
+    return switch (a) {
+        .@"AES256" => "AES256",
+        .@"aws:kms" => "aws:kms",
+        .@"aws:kms:dsse" => "aws:kms:dsse",
+    };
+}
+
+pub const SseByDefault = struct {
+    sse_algorithm: SseAlgorithm,
+    kms_master_key_id: []const u8 = "",
+};
+
+pub const EncryptionRule = struct {
+    apply: ?SseByDefault = null,
+    bucket_key_enabled: ?bool = null,
+};
+
+pub const EncryptionConfig = struct {
+    rules: []const EncryptionRule,
+};
+
+// ----- Lifecycle -----
+
+pub const LifecycleStatus = enum { Enabled, Disabled };
+
+pub fn lifecycleStatusFromString(s: []const u8) error{InvalidLifecycleStatus}!LifecycleStatus {
+    inline for (@typeInfo(LifecycleStatus).@"enum".fields) |f| {
+        if (std.mem.eql(u8, s, f.name)) return @field(LifecycleStatus, f.name);
+    }
+    return error.InvalidLifecycleStatus;
+}
+
+pub const StorageClass = enum {
+    STANDARD,
+    STANDARD_IA,
+    ONEZONE_IA,
+    INTELLIGENT_TIERING,
+    GLACIER,
+    DEEP_ARCHIVE,
+    GLACIER_IR,
+    REDUCED_REDUNDANCY,
+};
+
+pub fn storageClassFromString(s: []const u8) error{InvalidStorageClass}!StorageClass {
+    inline for (@typeInfo(StorageClass).@"enum".fields) |f| {
+        if (std.mem.eql(u8, s, f.name)) return @field(StorageClass, f.name);
+    }
+    return error.InvalidStorageClass;
+}
+
+pub const Transition = struct {
+    days: ?u32 = null,
+    date_iso8601: []const u8 = "",
+    storage_class: StorageClass,
+};
+
+pub const Expiration = struct {
+    days: ?u32 = null,
+    date_iso8601: []const u8 = "",
+    expired_object_delete_marker: ?bool = null,
+};
+
+pub const LifecycleFilter = struct {
+    prefix: []const u8 = "",
+    tag: ?Tag = null,
+    object_size_greater_than: ?u64 = null,
+    object_size_less_than: ?u64 = null,
+};
+
+pub const LifecycleRule = struct {
+    id: []const u8 = "",
+    status: LifecycleStatus,
+    filter: ?LifecycleFilter = null,
+    /// Legacy v1 form (pre-Filter).
+    prefix: []const u8 = "",
+    transitions: []const Transition = &.{},
+    expiration: ?Expiration = null,
+    noncurrent_version_transitions: []const Transition = &.{},
+    noncurrent_version_expiration: ?Expiration = null,
+    abort_incomplete_multipart_upload_days: ?u32 = null,
+};
+
+pub const LifecycleConfig = struct {
+    rules: []const LifecycleRule,
+};
+
+// ----- Notifications -----
+
+pub const S3EventName = enum {
+    s3_ObjectCreated_All,
+    s3_ObjectCreated_Put,
+    s3_ObjectCreated_Post,
+    s3_ObjectCreated_Copy,
+    s3_ObjectCreated_CompleteMultipartUpload,
+    s3_ObjectRemoved_All,
+    s3_ObjectRemoved_Delete,
+    s3_ObjectRemoved_DeleteMarkerCreated,
+    s3_ObjectRestore_All,
+    s3_ObjectRestore_Post,
+    s3_ObjectRestore_Completed,
+    s3_ReducedRedundancyLostObject,
+    s3_Replication_All,
+    s3_LifecycleExpiration_All,
+    s3_LifecycleTransition,
+    s3_IntelligentTiering,
+    s3_ObjectTagging_All,
+    s3_ObjectAcl_Put,
+};
+
+/// Translate the over-the-wire event name (`s3:ObjectCreated:Put`) to the
+/// enum (which can't use `:` in identifiers, so we use `_`).
+pub fn s3EventFromString(s: []const u8) error{InvalidS3Event}!S3EventName {
+    const map = .{
+        .{ "s3:ObjectCreated:*", S3EventName.s3_ObjectCreated_All },
+        .{ "s3:ObjectCreated:Put", S3EventName.s3_ObjectCreated_Put },
+        .{ "s3:ObjectCreated:Post", S3EventName.s3_ObjectCreated_Post },
+        .{ "s3:ObjectCreated:Copy", S3EventName.s3_ObjectCreated_Copy },
+        .{ "s3:ObjectCreated:CompleteMultipartUpload", S3EventName.s3_ObjectCreated_CompleteMultipartUpload },
+        .{ "s3:ObjectRemoved:*", S3EventName.s3_ObjectRemoved_All },
+        .{ "s3:ObjectRemoved:Delete", S3EventName.s3_ObjectRemoved_Delete },
+        .{ "s3:ObjectRemoved:DeleteMarkerCreated", S3EventName.s3_ObjectRemoved_DeleteMarkerCreated },
+        .{ "s3:ObjectRestore:*", S3EventName.s3_ObjectRestore_All },
+        .{ "s3:ObjectRestore:Post", S3EventName.s3_ObjectRestore_Post },
+        .{ "s3:ObjectRestore:Completed", S3EventName.s3_ObjectRestore_Completed },
+        .{ "s3:ReducedRedundancyLostObject", S3EventName.s3_ReducedRedundancyLostObject },
+        .{ "s3:Replication:*", S3EventName.s3_Replication_All },
+        .{ "s3:LifecycleExpiration:*", S3EventName.s3_LifecycleExpiration_All },
+        .{ "s3:LifecycleTransition", S3EventName.s3_LifecycleTransition },
+        .{ "s3:IntelligentTiering", S3EventName.s3_IntelligentTiering },
+        .{ "s3:ObjectTagging:*", S3EventName.s3_ObjectTagging_All },
+        .{ "s3:ObjectAcl:Put", S3EventName.s3_ObjectAcl_Put },
+    };
+    inline for (map) |entry| {
+        if (std.mem.eql(u8, s, entry[0])) return entry[1];
+    }
+    return error.InvalidS3Event;
+}
+
+pub fn s3EventToString(e: S3EventName) []const u8 {
+    return switch (e) {
+        .s3_ObjectCreated_All => "s3:ObjectCreated:*",
+        .s3_ObjectCreated_Put => "s3:ObjectCreated:Put",
+        .s3_ObjectCreated_Post => "s3:ObjectCreated:Post",
+        .s3_ObjectCreated_Copy => "s3:ObjectCreated:Copy",
+        .s3_ObjectCreated_CompleteMultipartUpload => "s3:ObjectCreated:CompleteMultipartUpload",
+        .s3_ObjectRemoved_All => "s3:ObjectRemoved:*",
+        .s3_ObjectRemoved_Delete => "s3:ObjectRemoved:Delete",
+        .s3_ObjectRemoved_DeleteMarkerCreated => "s3:ObjectRemoved:DeleteMarkerCreated",
+        .s3_ObjectRestore_All => "s3:ObjectRestore:*",
+        .s3_ObjectRestore_Post => "s3:ObjectRestore:Post",
+        .s3_ObjectRestore_Completed => "s3:ObjectRestore:Completed",
+        .s3_ReducedRedundancyLostObject => "s3:ReducedRedundancyLostObject",
+        .s3_Replication_All => "s3:Replication:*",
+        .s3_LifecycleExpiration_All => "s3:LifecycleExpiration:*",
+        .s3_LifecycleTransition => "s3:LifecycleTransition",
+        .s3_IntelligentTiering => "s3:IntelligentTiering",
+        .s3_ObjectTagging_All => "s3:ObjectTagging:*",
+        .s3_ObjectAcl_Put => "s3:ObjectAcl:Put",
+    };
+}
+
+pub const NotificationFilterRule = struct {
+    /// "prefix" or "suffix" (case-sensitive per AWS).
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const NotificationFilter = struct {
+    filter_rules: []const NotificationFilterRule,
+};
+
+pub const NotificationTarget = enum { topic, queue, lambda };
+
+pub const NotificationConfigEntry = struct {
+    target: NotificationTarget,
+    id: []const u8 = "",
+    arn: []const u8,
+    events: []const S3EventName,
+    filter: ?NotificationFilter = null,
+};
+
+pub const NotificationConfig = struct {
+    entries: []const NotificationConfigEntry,
+};
+
+// ----- Website -----
+
+pub const Protocol = enum { http, https };
+
+pub fn protocolFromString(s: []const u8) error{InvalidProtocol}!Protocol {
+    if (std.mem.eql(u8, s, "http")) return .http;
+    if (std.mem.eql(u8, s, "https")) return .https;
+    return error.InvalidProtocol;
+}
+
+pub fn protocolToString(p: Protocol) []const u8 {
+    return @tagName(p);
+}
+
+pub const RedirectAllRequestsTo = struct {
+    host_name: []const u8,
+    protocol: ?Protocol = null,
+};
+
+pub const IndexDocument = struct { suffix: []const u8 };
+pub const ErrorDocument = struct { key: []const u8 };
+
+pub const RoutingCondition = struct {
+    key_prefix_equals: []const u8 = "",
+    http_error_code_returned_equals: []const u8 = "",
+};
+
+pub const RoutingRedirect = struct {
+    host_name: []const u8 = "",
+    http_redirect_code: []const u8 = "",
+    protocol: ?Protocol = null,
+    replace_key_prefix_with: []const u8 = "",
+    replace_key_with: []const u8 = "",
+};
+
+pub const RoutingRule = struct {
+    condition: ?RoutingCondition = null,
+    redirect: RoutingRedirect,
+};
+
+pub const WebsiteConfig = struct {
+    redirect_all: ?RedirectAllRequestsTo = null,
+    index_document: ?IndexDocument = null,
+    error_document: ?ErrorDocument = null,
+    routing_rules: []const RoutingRule = &.{},
+};
 
 /// One bucket's persisted metadata. Strings borrow from the backend's
 /// allocator; consumers must not retain past the backend lifetime unless
@@ -547,6 +830,25 @@ pub const Backend = struct {
         putPublicAccessBlock: *const fn (ctx: *anyopaque, bucket: []const u8, pab: PublicAccessBlockConfig) Error!void,
         getPublicAccessBlock: *const fn (ctx: *anyopaque, bucket: []const u8) Error!PublicAccessBlockConfig,
         deletePublicAccessBlock: *const fn (ctx: *anyopaque, bucket: []const u8) Error!void,
+        // CORS (M11).
+        putBucketCors: *const fn (ctx: *anyopaque, bucket: []const u8, cfg: CorsConfig) Error!void,
+        getBucketCors: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8) Error!CorsConfig,
+        deleteBucketCors: *const fn (ctx: *anyopaque, bucket: []const u8) Error!void,
+        // Encryption (M11).
+        putBucketEncryption: *const fn (ctx: *anyopaque, bucket: []const u8, cfg: EncryptionConfig) Error!void,
+        getBucketEncryption: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8) Error!EncryptionConfig,
+        deleteBucketEncryption: *const fn (ctx: *anyopaque, bucket: []const u8) Error!void,
+        // Lifecycle (M11).
+        putBucketLifecycle: *const fn (ctx: *anyopaque, bucket: []const u8, cfg: LifecycleConfig) Error!void,
+        getBucketLifecycle: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8) Error!LifecycleConfig,
+        deleteBucketLifecycle: *const fn (ctx: *anyopaque, bucket: []const u8) Error!void,
+        // Notifications (M11). No Delete — empty Put removes.
+        putBucketNotification: *const fn (ctx: *anyopaque, bucket: []const u8, cfg: NotificationConfig) Error!void,
+        getBucketNotification: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8) Error!NotificationConfig,
+        // Website (M11).
+        putBucketWebsite: *const fn (ctx: *anyopaque, bucket: []const u8, cfg: WebsiteConfig) Error!void,
+        getBucketWebsite: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8) Error!WebsiteConfig,
+        deleteBucketWebsite: *const fn (ctx: *anyopaque, bucket: []const u8) Error!void,
     };
 
     // Pass-through helpers so call sites don't dereference the vtable.
@@ -675,6 +977,53 @@ pub const Backend = struct {
     pub fn deletePublicAccessBlock(self: Backend, bucket: []const u8) Error!void {
         return self.vtable.deletePublicAccessBlock(self.ctx, bucket);
     }
+
+    pub fn putBucketCors(self: Backend, bucket: []const u8, cfg: CorsConfig) Error!void {
+        return self.vtable.putBucketCors(self.ctx, bucket, cfg);
+    }
+    pub fn getBucketCors(self: Backend, allocator: Allocator, bucket: []const u8) Error!CorsConfig {
+        return self.vtable.getBucketCors(self.ctx, allocator, bucket);
+    }
+    pub fn deleteBucketCors(self: Backend, bucket: []const u8) Error!void {
+        return self.vtable.deleteBucketCors(self.ctx, bucket);
+    }
+
+    pub fn putBucketEncryption(self: Backend, bucket: []const u8, cfg: EncryptionConfig) Error!void {
+        return self.vtable.putBucketEncryption(self.ctx, bucket, cfg);
+    }
+    pub fn getBucketEncryption(self: Backend, allocator: Allocator, bucket: []const u8) Error!EncryptionConfig {
+        return self.vtable.getBucketEncryption(self.ctx, allocator, bucket);
+    }
+    pub fn deleteBucketEncryption(self: Backend, bucket: []const u8) Error!void {
+        return self.vtable.deleteBucketEncryption(self.ctx, bucket);
+    }
+
+    pub fn putBucketLifecycle(self: Backend, bucket: []const u8, cfg: LifecycleConfig) Error!void {
+        return self.vtable.putBucketLifecycle(self.ctx, bucket, cfg);
+    }
+    pub fn getBucketLifecycle(self: Backend, allocator: Allocator, bucket: []const u8) Error!LifecycleConfig {
+        return self.vtable.getBucketLifecycle(self.ctx, allocator, bucket);
+    }
+    pub fn deleteBucketLifecycle(self: Backend, bucket: []const u8) Error!void {
+        return self.vtable.deleteBucketLifecycle(self.ctx, bucket);
+    }
+
+    pub fn putBucketNotification(self: Backend, bucket: []const u8, cfg: NotificationConfig) Error!void {
+        return self.vtable.putBucketNotification(self.ctx, bucket, cfg);
+    }
+    pub fn getBucketNotification(self: Backend, allocator: Allocator, bucket: []const u8) Error!NotificationConfig {
+        return self.vtable.getBucketNotification(self.ctx, allocator, bucket);
+    }
+
+    pub fn putBucketWebsite(self: Backend, bucket: []const u8, cfg: WebsiteConfig) Error!void {
+        return self.vtable.putBucketWebsite(self.ctx, bucket, cfg);
+    }
+    pub fn getBucketWebsite(self: Backend, allocator: Allocator, bucket: []const u8) Error!WebsiteConfig {
+        return self.vtable.getBucketWebsite(self.ctx, allocator, bucket);
+    }
+    pub fn deleteBucketWebsite(self: Backend, bucket: []const u8) Error!void {
+        return self.vtable.deleteBucketWebsite(self.ctx, bucket);
+    }
 };
 
 /// Validate an S3 object key. AWS permits virtually any UTF-8; the only
@@ -787,4 +1136,47 @@ test "ownershipControlFromString round-trip" {
     try testing.expectEqual(OwnershipControl.ObjectWriter, try ownershipControlFromString("ObjectWriter"));
     try testing.expectError(error.InvalidOwnershipControl, ownershipControlFromString("Whatever"));
     try testing.expectEqualStrings("BucketOwnerPreferred", ownershipControlToString(.BucketOwnerPreferred));
+}
+
+test "httpMethodFromString round-trip" {
+    const testing = std.testing;
+    try testing.expectEqual(HttpMethod.GET, try httpMethodFromString("GET"));
+    try testing.expectEqual(HttpMethod.HEAD, try httpMethodFromString("HEAD"));
+    try testing.expectError(error.InvalidHttpMethod, httpMethodFromString("PATCH"));
+    try testing.expectEqualStrings("DELETE", httpMethodToString(.DELETE));
+}
+
+test "sseAlgorithmFromString round-trip" {
+    const testing = std.testing;
+    try testing.expectEqual(SseAlgorithm.@"AES256", try sseAlgorithmFromString("AES256"));
+    try testing.expectEqual(SseAlgorithm.@"aws:kms", try sseAlgorithmFromString("aws:kms"));
+    try testing.expectError(error.InvalidSseAlgorithm, sseAlgorithmFromString("ROT13"));
+    try testing.expectEqualStrings("AES256", sseAlgorithmToString(.@"AES256"));
+}
+
+test "lifecycleStatusFromString round-trip" {
+    const testing = std.testing;
+    try testing.expectEqual(LifecycleStatus.Enabled, try lifecycleStatusFromString("Enabled"));
+    try testing.expectError(error.InvalidLifecycleStatus, lifecycleStatusFromString("enabled"));
+}
+
+test "storageClassFromString known + unknown" {
+    const testing = std.testing;
+    try testing.expectEqual(StorageClass.GLACIER, try storageClassFromString("GLACIER"));
+    try testing.expectError(error.InvalidStorageClass, storageClassFromString("FROZEN_TUNDRA"));
+}
+
+test "s3Event round-trip" {
+    const testing = std.testing;
+    try testing.expectEqual(S3EventName.s3_ObjectCreated_All, try s3EventFromString("s3:ObjectCreated:*"));
+    try testing.expectEqual(S3EventName.s3_ObjectRemoved_DeleteMarkerCreated, try s3EventFromString("s3:ObjectRemoved:DeleteMarkerCreated"));
+    try testing.expectError(error.InvalidS3Event, s3EventFromString("s3:Frobnicate"));
+    try testing.expectEqualStrings("s3:LifecycleExpiration:*", s3EventToString(.s3_LifecycleExpiration_All));
+}
+
+test "protocolFromString" {
+    const testing = std.testing;
+    try testing.expectEqual(Protocol.http, try protocolFromString("http"));
+    try testing.expectEqual(Protocol.https, try protocolFromString("https"));
+    try testing.expectError(error.InvalidProtocol, protocolFromString("ftp"));
 }
