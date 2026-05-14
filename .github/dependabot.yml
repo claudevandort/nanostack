@@ -1,18 +1,18 @@
 version: 2
 
 updates:
-  # Go conformance suite.
-  - package-ecosystem: gomod
-    directory: /tests/conformance/go
+  # Python conformance suite.
+  - package-ecosystem: pip
+    directory: /tests/conformance/python
     schedule:
       interval: weekly
     groups:
-      go-deps:
+      python-deps:
         patterns: ["*"]
 
-  # Go bench driver.
-  - package-ecosystem: gomod
-    directory: /bench/driver
+  # Python bench driver.
+  - package-ecosystem: pip
+    directory: /bench
     schedule:
       interval: weekly
     groups:

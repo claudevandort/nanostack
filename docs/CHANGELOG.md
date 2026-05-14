@@ -14,6 +14,16 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ---
 
+## [Unreleased]
+
+### Changed
+- **Conformance + bench harness ported from Go (`aws-sdk-go-v2`) to Python (`boto3`).** All 162 conformance tests translated 1:1 to pytest; `bench/driver.py` replaces the Go bench driver. Two perf-budget rows recalibrated for boto3's heavier SigV4 path: `put_object_p99_ms` 5 → 10 ms, `put_object_throughput_rps` 500 → 150 req/s. Server unchanged.
+
+### Removed
+- `tests/conformance/go/` (38 .go files including helpers) and `bench/driver/` (Go module). `setup-go` removed from CI.
+
+---
+
 ## [0.1.0] — 2026-05-14
 
 **First minor release. S3 is functionally complete for local-dev use.**
@@ -75,7 +85,7 @@ First pinned release of the nanostack S3 v1 surface. 19 operations, full SigV4 (
 - `zig build release` step (cross-compile via `-Dtarget=…`).
 - GitHub Releases workflow building four tarballs (`linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64`) with `SHA256SUMS`.
 - Homebrew formula template (`release/nanostack.rb`) for `claudevandort/homebrew-nanostack`.
-- `SCORECARD.md` listing the four documented points where nanostack is more accurate than LocalStack.
+- `SCORECARD.md` (later folded into [`SUPPORT.md`](SUPPORT.md#accuracy-wins-vs-localstack)) listing the four documented points where nanostack is more accurate than LocalStack.
 - `dependabot.yml`, issue + PR templates.
 
 ### Performance (dev machine, Linux, ReleaseFast + strip)
@@ -94,5 +104,5 @@ First pinned release of the nanostack S3 v1 surface. 19 operations, full SigV4 (
 ### Notes
 - The pre-M7 in-memory backend (`--ephemeral`) was removed (commit `0656161`). Tests and CI now use `--data-dir <tmp>` for wipe-clean runs.
 - See [`SUPPORT.md`](SUPPORT.md) for the full operation matrix and the deferred-feature list.
-- See [`SCORECARD.md`](SCORECARD.md) for the LocalStack-comparable accuracy claims.
+- See [`SUPPORT.md`](SUPPORT.md#accuracy-wins-vs-localstack) for the LocalStack-comparable accuracy claims.
 - See [`PRD.md`](PRD.md) for the product spec, design decisions (§17a), and post-v1 roadmap (§15).

@@ -87,7 +87,7 @@ A **single-binary, sub-second-startup, Apache-2.0, accurate-on-the-core-surface*
 | Promise | How we will keep it |
 |---|---|
 | **Snappy** | Single static Zig binary, no runtime. Cold start budget 500 ms, p99 GET latency budget 5 ms (warm, in-memory). Continuous regression bench in CI. |
-| **Accurate** | Every supported S3 operation has a **conformance test** that runs the official AWS Go SDK and AWS JS SDK against nanostack with assertions on response body, headers, status, and error codes. Behaviors not yet covered are explicitly listed in `SUPPORT.md` — we do not over-promise. |
+| **Accurate** | Every supported S3 operation has a **conformance test** that runs the official AWS Python SDK (boto3) and AWS JS SDK against nanostack with assertions on response body, headers, status, and error codes. Behaviors not yet covered are explicitly listed in `SUPPORT.md` — we do not over-promise. |
 | **Reliable** | Wire codecs and request dispatch are **generated from Smithy models** (the same source AWS uses internally), pinned per release. Hand-written code is limited to *semantics*, not surface. |
 
 ---
@@ -117,7 +117,7 @@ A **single-binary, sub-second-startup, Apache-2.0, accurate-on-the-core-surface*
 - **SigV4 verifier:** port and adapt from `elerch/aws-sdk-for-zig`'s `aws_signing.zig` (~500 LOC). The upstream is tightly coupled to that SDK's request flow; the M2 task extracts the canonical-request / string-to-sign / signing-key logic into a standalone `auth/sigv4` module so future services (SQS, DynamoDB, Lambda) share it without modification.
 
 ### Code generation
-- **Build-time codegen** (Zig `build.zig` step) that ingests the Smithy JSON model for S3 (sourced from AWS Go SDK v2 mirror or `awslabs/smithy`) and emits:
+- **Build-time codegen** (Zig `build.zig` step) that ingests the Smithy JSON model for S3 (sourced from the AWS SDK Smithy model mirror or `awslabs/smithy`) and emits:
   - Operation enum + request/response struct types.
   - Header/query/path binding tables.
   - Error shape registry (so we can emit exact AWS error codes and HTTP statuses).
@@ -267,16 +267,15 @@ This is the part that separates "another emulator" from "the accurate one."
 
 1. **Unit tests (in-tree, Zig):** parser, signing, route dispatch, storage backends.
 2. **Conformance tests (out-of-tree, polyglot):**
-   - **Go suite** using `aws-sdk-go-v2`.
-   - **JS suite** using `@aws-sdk/client-s3`.
    - **Python suite** using `boto3`.
+   - **JS suite** using `@aws-sdk/client-s3`.
    - Each suite is a matrix of `(operation × scenario)` — happy path + at least three error paths per operation.
    - The *same matrix* runs against both nanostack and a real AWS account (or LocalStack) on a nightly schedule, so we can flag drift.
 3. **Fuzz tests:** quickly randomized PUT/GET/HEAD/LIST sequences against both backends, asserting equivalence with a reference implementation.
 
 ### Per-PR CI gates
 - Unit tests pass.
-- Full Go + JS conformance suite passes.
+- Full Python (boto3) + JS conformance suite passes.
 - No regression in cold-start budget (500 ms) or warm p99 GET latency budget (5 ms for ≤1 MB objects).
 
 ### Public scorecard
@@ -286,7 +285,7 @@ We publish a Markdown table at the repo root, updated on every release, showing 
 
 ## 12. Performance Targets (v1)
 
-All numbers are measured by the bench harness in `bench/driver/` driving signed AWS SDK calls (Go SDK v2) against `ReleaseFast`-built nanostack. We deliberately use the AWS SDK rather than `wrk`/`bombardier` so the budget reflects what users actually experience — SigV4 cost included.
+All numbers are measured by the bench harness in `bench/driver.py` driving signed AWS SDK calls (boto3) against `ReleaseFast`-built nanostack. We deliberately use the AWS SDK rather than `wrk`/`bombardier` so the budget reflects what users actually experience — SigV4 cost included.
 
 | Metric | Budget | How measured |
 |---|---|---|
@@ -294,10 +293,10 @@ All numbers are measured by the bench harness in `bench/driver/` driving signed 
 | Idle RSS (5 s after start) | ≤ 30 MB | `/proc/<pid>/status` `VmRSS`; max of 3 samples |
 | Binary size (stripped) | ≤ 20 MB | `os.Stat` after `zig build -Doptimize=ReleaseFast -Dstrip=true` |
 | Wipe-restart | ≤ 500 ms | kill + respawn, time to first TCP accept; median of 5. fs walks `objects/*/meta.json` to rebuild its key index. |
-| Warm p50 PutObject (1 KB) | ≤ 3 ms | 10 000 sequential PutObject ops via aws-sdk-go-v2. Cost reflects two atomic writes (`data` + `meta.json`) per PUT. |
-| Warm p99 PutObject (1 KB) | ≤ 5 ms | 99th percentile of the same series |
+| Warm p50 PutObject (1 KB) | ≤ 3 ms | 10 000 sequential PutObject ops via boto3. Cost reflects two atomic writes (`data` + `meta.json`) per PUT. |
+| Warm p99 PutObject (1 KB) | ≤ 10 ms | 99th percentile of the same series. Budget bumped from 5 ms in 2026-05-14 when the harness switched to boto3 (SDK round-trip dominates). |
 | Warm p99 GetObject (≤ 1 MB) | ≤ 5 ms | 10 000 sequential GetObject ops |
-| PutObject throughput (1 KB, 32 concurrent) | ≥ 500 req/s | 32 goroutines for 5 s, unique keys per worker |
+| PutObject throughput (1 KB, 32 concurrent) | ≥ 150 req/s | 32 threads for 5 s, unique keys per worker. Budget lowered from 500 in 2026-05-14 when the harness switched to boto3 — Python's GIL serialises SigV4 across threads, so the driver caps below the server's actual capacity. |
 | Multipart upload p99 (5 × 5 MiB concurrent) | ≤ 500 ms | 20 iterations of {InitiateMPU → 5 concurrent UploadParts of 5 MiB → CompleteMPU} |
 
 Numbers are budgets, not promises — but a regression past any of them in CI fails the build. Each new milestone may add rows; an existing row only loosens with a one-liner justification recorded in the commit message.
@@ -323,8 +322,8 @@ We will work in tight, verifiable cuts. Each milestone ends with a green CI run 
 
 | Milestone | Scope | Exit criteria |
 |---|---|---|
-| **M0 — Skeleton** | Repo, `build.zig`, zap "hello", lint, CI scaffolding, conformance harness shell that runs `aws-sdk-go-v2` against the server | Server accepts a request and returns 501 with correct XML body |
-| **M1 — Buckets** | CreateBucket, DeleteBucket, HeadBucket, ListBuckets + filesystem backend | Go + JS conformance suites green for these 4 ops |
+| **M0 — Skeleton** | Repo, `build.zig`, zap "hello", lint, CI scaffolding, conformance harness shell that runs `boto3` against the server | Server accepts a request and returns 501 with correct XML body |
+| **M1 — Buckets** | CreateBucket, DeleteBucket, HeadBucket, ListBuckets + filesystem backend | Python (boto3) + JS conformance suites green for these 4 ops |
 | **M2 — SigV4** | Full SigV4 verifier, both header-auth and presigned URLs, anonymous fall-through. Custom-header presigned URLs work (LocalStack's known weak spot) | Conformance includes 6+ presigned-URL scenarios; all green |
 | **M3 — Objects (basic)** | PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects | Conformance green; range requests return correct headers |
 | **M4 — Listing** | ListObjects (v1), ListObjectsV2, pagination, prefix/delimiter | Conformance green; large-bucket listing benchmarked |

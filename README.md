@@ -8,7 +8,7 @@ A snappy, accurate AWS emulator for local development, written in Zig.
 
 - **Single static binary** — no Docker, no JVM, no Python. ~0.8 MB stripped.
 - **Sub-second cold start, ~11 MB idle RSS** — designed for tight test loops and CI.
-- **Accurate on the surface it covers** — every supported AWS operation has a conformance test that runs the official AWS Go + JS SDKs against it. See [`docs/SCORECARD.md`](docs/SCORECARD.md) for the four documented points where nanostack matches AWS and LocalStack does not.
+- **Accurate on the surface it covers** — every supported AWS operation has a conformance test that runs the official AWS Python (boto3) + JS SDKs against it. See [`docs/SUPPORT.md`](docs/SUPPORT.md#accuracy-wins-vs-localstack) for the four documented points where nanostack matches AWS and LocalStack does not.
 - **S3 done.** Full v1 surface (bucket lifecycle, object CRUD, copy, listing, multipart, conditional headers, SigV4 + presigned URLs) plus versioning, tagging, ACLs/policies, CORS/encryption/lifecycle/notifications/website, **Object Lock with real WORM enforcement**, restore, replication. More services follow now that the foundation is proven.
 
 ## What it is not
@@ -79,29 +79,29 @@ The default credentials are `test`/`test`; override with `--access-key` and `--s
 
 ## Conformance
 
-Every supported AWS operation is asserted by the Go + JS SDK conformance suites. They run on every push.
+Every supported AWS operation is asserted by the Python (boto3) + JS SDK conformance suites. They run on every push.
 
 ```sh
 # Run a fresh nanostack on a dedicated port, then drive both suites at it.
 ./zig-out/bin/nanostack --port 14566 --data-dir "$(mktemp -d)" &
 
-cd tests/conformance/go && \
+cd tests/conformance/python && \
+  python -m pip install -r requirements.txt && \
   NANOSTACK_ENDPOINT=http://127.0.0.1:14566 \
-  go test -count=1 ./...
+  pytest -v
 
 cd ../js && \
   NANOSTACK_ENDPOINT=http://127.0.0.1:14566 \
   npm test
 ```
 
-See [`docs/SCORECARD.md`](docs/SCORECARD.md) for the four LocalStack regression cases we explicitly fix.
+See [`docs/SUPPORT.md`](docs/SUPPORT.md#accuracy-wins-vs-localstack) for the four LocalStack regression cases we explicitly fix.
 
 ## Docs
 
 All docs live in [`docs/`](docs/):
 
-- [`docs/SUPPORT.md`](docs/SUPPORT.md) — live operation status matrix.
-- [`docs/SCORECARD.md`](docs/SCORECARD.md) — where nanostack beats LocalStack on accuracy.
+- [`docs/SUPPORT.md`](docs/SUPPORT.md) — live operation status matrix; opens with the four accuracy wins vs LocalStack.
 - [`docs/COVERAGE.md`](docs/COVERAGE.md) — Smithy-derived op coverage report (regenerated via `scripts/smithy_coverage.py`).
 - [`docs/BENCH.md`](docs/BENCH.md) — perf budgets + current numbers.
 - [`docs/CHANGELOG.md`](docs/CHANGELOG.md) — release notes + versioning scheme.

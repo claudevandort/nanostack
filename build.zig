@@ -60,8 +60,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
 
     // Perf gate. Runs bench/run.sh which builds ReleaseFast + strip itself,
-    // then drives the Go bench. We don't depend on `exe` here because the
-    // script reproduces the build to guarantee gated binary == measured.
+    // then drives the Python bench. We don't depend on `exe` here because
+    // the script reproduces the build to guarantee gated binary == measured.
     const bench_step = b.step("bench", "Run the perf gate (PRD §12)");
     const bench_cmd = b.addSystemCommand(&.{"bash"});
     bench_cmd.addFileArg(b.path("bench/run.sh"));

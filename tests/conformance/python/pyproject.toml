@@ -1,0 +1,20 @@
+[project]
+name = "nanostack-conformance"
+version = "0.1.0"
+description = "Python (boto3) conformance suite for nanostack."
+requires-python = ">=3.10"
+dependencies = [
+    "boto3>=1.40,<2",
+    "botocore>=1.40,<2",
+    "pytest>=8,<9",
+    "pytest-xdist>=3,<4",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# Quiet output by default; verbose runs use `-v`.
+addopts = "-ra"

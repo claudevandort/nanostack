@@ -2,9 +2,22 @@
 
 **Version:** v0.1.0 (S3 functionally complete for local dev)
 
-**How to read this matrix:** each row is one S3 operation or cross-cutting capability. Status is one of:
+## Accuracy wins vs LocalStack
 
-- **supported** — implemented and asserted by the Go + JS conformance suites on every CI run.
+These are the points where nanostack matches real AWS and LocalStack does not — the PRD §5 "accuracy" wedge. Every row is asserted in CI on every push.
+
+| # | Behaviour | LocalStack | Test |
+|---|---|---|---|
+| 1 | Presigned URL with a custom header — request sent *without* it → clean `403 SignatureDoesNotMatch` | 5xx panic / partial response ([#5269](https://github.com/localstack/localstack/issues/5269), [#4133](https://github.com/localstack/localstack/issues/4133), [#10844](https://github.com/localstack/localstack/issues/10844)) | [`test_sigv4.py::test_presigned_custom_header_missing`](../tests/conformance/python/test_sigv4.py) |
+| 2 | `Accept-Ranges: bytes` on every GetObject / HeadObject response | Missing in many paths ([#1859](https://github.com/localstack/localstack/issues/1859)) | [`test_get_object.py`](../tests/conformance/python/test_get_object.py) |
+| 3 | Conditional-header split (GET/HEAD: all four; PUT: `If-Match`/`If-None-Match` only; CopyObject: `x-amz-copy-source-if-*`) | Inconsistent — some headers accepted but not enforced | [`test_conditional_get.py`](../tests/conformance/python/test_conditional_get.py), [`test_conditional_put.py`](../tests/conformance/python/test_conditional_put.py), [`test_copy_object.py`](../tests/conformance/python/test_copy_object.py) |
+| 4 | Multipart ETag = `md5(concat(binary-MD5-of-each-part)) + "-" + N`; `EntityTooSmall` when any non-final part < 5 MiB | Format matches but `EntityTooSmall` enforcement inconsistent | [`test_multipart_upload.py`](../tests/conformance/python/test_multipart_upload.py), [`test_multipart_errors.py`](../tests/conformance/python/test_multipart_errors.py) |
+
+## How to read this matrix
+
+Each row below is one S3 operation or cross-cutting capability. Status is one of:
+
+- **supported** — implemented and asserted by the Python (boto3) + JS conformance suites on every CI run.
 - **stub** — recognised by the router; returns `NotImplemented` (HTTP 501) with the correct AWS XML body.
 - **deferred** — explicitly out of scope for v1; not yet routed.
 - **planned** — on the roadmap for the indicated milestone.
