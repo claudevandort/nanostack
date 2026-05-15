@@ -79,13 +79,18 @@ The default credentials are `test`/`test`; override with `--access-key` and `--s
 
 ## Conformance
 
-Every supported AWS operation is asserted by the Python (boto3) + JS SDK conformance suites. They run on every push.
+Every supported AWS operation is asserted by **three** conformance suites: Python (boto3) at the low-level op surface, JS (aws-sdk-js v3) as a smoke layer, and **AWS CLI v2** for high-level `aws s3` commands (cp -r, sync idempotency, mv, presign, etc.). All three run on every push.
 
 ```sh
-# Run a fresh nanostack on a dedicated port, then drive both suites at it.
+# Run a fresh nanostack on a dedicated port, then drive all three at it.
 ./zig-out/bin/nanostack --port 14566 --data-dir "$(mktemp -d)" &
 
 cd tests/conformance/python && \
+  python -m pip install -r requirements.txt && \
+  NANOSTACK_ENDPOINT=http://127.0.0.1:14566 \
+  pytest -v
+
+cd ../awscli && \
   python -m pip install -r requirements.txt && \
   NANOSTACK_ENDPOINT=http://127.0.0.1:14566 \
   pytest -v
@@ -94,6 +99,8 @@ cd ../js && \
   NANOSTACK_ENDPOINT=http://127.0.0.1:14566 \
   npm test
 ```
+
+The AWS CLI suite needs `aws --version` to report v2.x on PATH (pre-installed on GitHub-hosted CI runners).
 
 See [`docs/SUPPORT.md`](docs/SUPPORT.md#accuracy-wins-vs-localstack) for the four LocalStack regression cases we explicitly fix.
 
