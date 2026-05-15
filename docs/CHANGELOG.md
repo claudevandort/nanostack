@@ -16,6 +16,9 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+### Added
+- **AWS CLI v2 conformance suite** at `tests/conformance/awscli/` — ~10 pytest-driven tests covering high-level `aws s3` commands (`cp`, `cp --recursive`, `sync` including the idempotency check, `mv`, `ls`, `rm --recursive`, `presign`). These commands add client-side logic (recursion, diffing, composite ops) on top of botocore that the boto3 suite doesn't cover. CI verifies `aws --version` reports v2 on the build-test job (pre-installed on GitHub-hosted runners).
+
 ### Changed
 - **Wave 3 (drift #16): SigV4 canonical-headers join multi-valued same-name headers with comma**, per the AWS SigV4 spec. Previously `findHeader` returned only the first match, causing `SignatureDoesNotMatch (403)` for any client that sent duplicate same-name headers (multi-line `Cache-Control`, multi-attribute `X-Amz-Object-Attributes`, etc.). Fix is scoped to canonicalisation only; service-layer handlers continue to read single-valued headers via first-match.
 - **Conformance + bench harness ported from Go (`aws-sdk-go-v2`) to Python (`boto3`).** All 162 conformance tests translated 1:1 to pytest; `bench/driver.py` replaces the Go bench driver. Two perf-budget rows recalibrated for boto3's heavier SigV4 path: `put_object_p99_ms` 5 → 10 ms, `put_object_throughput_rps` 500 → 150 req/s. Server unchanged.

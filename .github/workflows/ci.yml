@@ -46,11 +46,20 @@ jobs:
       - name: Unit tests
         run: zig build test
 
+      - name: Verify AWS CLI v2
+        run: |
+          aws --version
+          aws --version 2>&1 | grep -q 'aws-cli/2\.' || { echo "AWS CLI v2 required" >&2; exit 1; }
+
       - name: Install Python conformance deps
         working-directory: tests/conformance/python
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt requests
+
+      - name: Install AWS CLI conformance deps
+        working-directory: tests/conformance/awscli
+        run: pip install -r requirements.txt
 
       - name: Install JS conformance deps
         working-directory: tests/conformance/js
@@ -79,6 +88,12 @@ jobs:
         env:
           NANOSTACK_ENDPOINT: 'http://127.0.0.1:14566'
           NANOSTACK_BIN: ${{ github.workspace }}/zig-out/bin/nanostack
+        run: pytest -v -n auto
+
+      - name: AWS CLI conformance
+        working-directory: tests/conformance/awscli
+        env:
+          NANOSTACK_ENDPOINT: 'http://127.0.0.1:14566'
         run: pytest -v -n auto
 
       - name: JS conformance

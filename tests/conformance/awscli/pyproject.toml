@@ -1,0 +1,18 @@
+[project]
+name = "nanostack-awscli-conformance"
+version = "0.1.0"
+description = "AWS CLI v2 conformance suite for nanostack."
+requires-python = ">=3.10"
+dependencies = [
+    "pytest>=8,<9",
+    "pytest-xdist>=3,<4",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# Quiet output by default; verbose runs use `-v`.
+addopts = "-ra"

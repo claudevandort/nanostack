@@ -22,13 +22,13 @@ The wedge is **accuracy beats LocalStack on the surface we cover**. See `docs/PR
 
 ### Conformance suites (CI gate)
 
-Conformance lives in `tests/conformance/{python,js}` and drives **real AWS SDKs** against a running nanostack.
+Conformance lives in `tests/conformance/{python,awscli,js}` and drives **real AWS SDKs + the AWS CLI v2** against a running nanostack.
 
 ```sh
 # Start a server on a dedicated port (use 14566 to match CI):
 ./zig-out/bin/nanostack --port 14566 --data-dir "$(mktemp -d)" &
 
-# Python (boto3) — primary suite, 172 tests:
+# Python (boto3) — primary suite, 173 tests at the low-level op surface:
 cd tests/conformance/python
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -39,9 +39,17 @@ NANOSTACK_ENDPOINT=http://127.0.0.1:14566 \
 # Single test:
 pytest tests/conformance/python/test_versioning.py::test_versioning_head_on_delete_marker_returns_405 -v
 
+# AWS CLI v2 — 10 tests for high-level `aws s3` commands (cp -r, sync idempotency, mv, presign):
+cd tests/conformance/awscli
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+NANOSTACK_ENDPOINT=http://127.0.0.1:14566 pytest -n auto
+
 # JS (aws-sdk-js v3) — smaller smoke suite:
 cd tests/conformance/js && npm ci && NANOSTACK_ENDPOINT=http://127.0.0.1:14566 npm test
 ```
+
+The AWS CLI suite requires `aws --version` to report v2.x on PATH. CI runners ship v2 pre-installed.
 
 `NANOSTACK_BIN` is required by the few Python tests that spawn their own nanostack (e.g. `test_no_auth_flag_accepts_anonymous`). Conformance binds nanostack on `14566`; everyday dev usually uses `4566`.
 

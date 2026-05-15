@@ -19,6 +19,16 @@ updates:
       bench-deps:
         patterns: ["*"]
 
+  # AWS CLI conformance suite (pytest only — the `aws` CLI itself is
+  # pre-installed on GitHub runners and not pip-managed).
+  - package-ecosystem: pip
+    directory: /tests/conformance/awscli
+    schedule:
+      interval: weekly
+    groups:
+      awscli-deps:
+        patterns: ["*"]
+
   # JS conformance suite.
   - package-ecosystem: npm
     directory: /tests/conformance/js
