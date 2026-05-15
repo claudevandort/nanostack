@@ -177,11 +177,38 @@ pub const CanonicalHeaders = struct {
 };
 
 /// Look up a header by case-insensitive name. Returns the FIRST match.
+/// Kept for the SigV4 verifier's one-off lookups (`Authorization`,
+/// `X-Amz-Date`, `x-amz-content-sha256`) — those are unambiguously
+/// single-value per AWS spec. The canonical-headers builder uses
+/// `findHeaderValuesJoined` instead so multi-valued same-name headers
+/// get the AWS-mandated comma-joined treatment.
 pub fn findHeader(headers: []const Header, name: []const u8) ?[]const u8 {
     for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
     }
     return null;
+}
+
+/// Iterate every header with a case-insensitive `name` match, apply
+/// `collapseWhitespace` per value, and return the result joined with `,`
+/// (comma, no spaces) in request order. AWS SigV4 spec mandates this for
+/// canonical-request construction when a header appears multiple times.
+///
+/// Returns an empty slice when no header matches — the caller decides
+/// whether that's `Error.MissingSignedHeader`. Caller owns the slice.
+fn findHeaderValuesJoined(allocator: Allocator, headers: []const Header, name: []const u8) Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var first = true;
+    for (headers) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, name)) continue;
+        const collapsed = try collapseWhitespace(allocator, h.value);
+        defer allocator.free(collapsed);
+        if (!first) try out.append(allocator, ',');
+        try out.appendSlice(allocator, collapsed);
+        first = false;
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Trim leading + trailing ASCII whitespace and collapse internal whitespace
@@ -228,12 +255,14 @@ pub fn canonicalHeaders(allocator: Allocator, signed_names: []const u8, headers:
     errdefer signed_list.deinit(allocator);
 
     for (names.items, 0..) |name, i| {
-        const value = findHeader(headers, name) orelse return Error.MissingSignedHeader;
-        const collapsed = try collapseWhitespace(allocator, value);
-        defer allocator.free(collapsed);
+        // AWS SigV4 spec: when a header appears multiple times, join the
+        // values with `,` after per-value whitespace normalisation. Drift #16.
+        const joined = try findHeaderValuesJoined(allocator, headers, name);
+        defer allocator.free(joined);
+        if (joined.len == 0) return Error.MissingSignedHeader;
         try block.appendSlice(allocator, name);
         try block.append(allocator, ':');
-        try block.appendSlice(allocator, collapsed);
+        try block.appendSlice(allocator, joined);
         try block.append(allocator, '\n');
 
         if (i > 0) try signed_list.append(allocator, ';');
@@ -415,4 +444,45 @@ test "canonicalRequest: SigV4 get-vanilla matches AWS spec" {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         cr,
     );
+}
+
+test "findHeaderValuesJoined: three matches comma-joined with per-value whitespace collapse" {
+    const headers = [_]Header{
+        .{ .name = "cache-control", .value = "  no-cache  " },
+        .{ .name = "Host", .value = "example.com" },
+        .{ .name = "Cache-Control", .value = "max-age=0" },
+        .{ .name = "CACHE-CONTROL", .value = "no-store" },
+    };
+    const got = try findHeaderValuesJoined(testing.allocator, &headers, "cache-control");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("no-cache,max-age=0,no-store", got);
+}
+
+test "findHeaderValuesJoined: no match returns empty slice" {
+    const headers = [_]Header{.{ .name = "host", .value = "x" }};
+    const got = try findHeaderValuesJoined(testing.allocator, &headers, "cache-control");
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "canonicalHeaders: same-name headers join with comma per AWS SigV4 spec" {
+    // Drift #16: two `cache-control` headers must canonicalise as a single
+    // line with the values comma-joined in request order. Pre-fix, the
+    // first match won and signatures diverged from any client that sent
+    // duplicates.
+    const headers = [_]Header{
+        .{ .name = "host", .value = "example.amazonaws.com" },
+        .{ .name = "x-amz-date", .value = "20150830T123600Z" },
+        .{ .name = "cache-control", .value = "no-cache" },
+        .{ .name = "cache-control", .value = "max-age=0" },
+    };
+    var ch = try canonicalHeaders(testing.allocator, "cache-control;host;x-amz-date", &headers);
+    defer ch.deinit(testing.allocator);
+    try testing.expectEqualStrings(
+        "cache-control:no-cache,max-age=0\n" ++
+            "host:example.amazonaws.com\n" ++
+            "x-amz-date:20150830T123600Z\n",
+        ch.block,
+    );
+    try testing.expectEqualStrings("cache-control;host;x-amz-date", ch.signed_list);
 }

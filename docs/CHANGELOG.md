@@ -17,6 +17,7 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 ## [Unreleased]
 
 ### Changed
+- **Wave 3 (drift #16): SigV4 canonical-headers join multi-valued same-name headers with comma**, per the AWS SigV4 spec. Previously `findHeader` returned only the first match, causing `SignatureDoesNotMatch (403)` for any client that sent duplicate same-name headers (multi-line `Cache-Control`, multi-attribute `X-Amz-Object-Attributes`, etc.). Fix is scoped to canonicalisation only; service-layer handlers continue to read single-valued headers via first-match.
 - **Conformance + bench harness ported from Go (`aws-sdk-go-v2`) to Python (`boto3`).** All 162 conformance tests translated 1:1 to pytest; `bench/driver.py` replaces the Go bench driver. Two perf-budget rows recalibrated for boto3's heavier SigV4 path: `put_object_p99_ms` 5 → 10 ms, `put_object_throughput_rps` 500 → 150 req/s. Server unchanged.
 - **Wave 2 AWS-drift fixes (6 XML response-shape gaps in listing responses)**, tracked in [`SUPPORT.md` → Known drift](SUPPORT.md#known-drift--to-fix):
   - `ListMultipartUploads` now emits `<Initiator>` + `<Owner>` per `<Upload>` (persisted requester identity).
