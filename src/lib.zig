@@ -32,6 +32,7 @@ pub const policy_status = @import("wire/policy_status.zig");
 pub const restore_request = @import("wire/restore_request.zig");
 pub const object_encryption_update = @import("wire/object_encryption_update.zig");
 pub const replication_config = @import("wire/replication_config.zig");
+pub const url_encode = @import("wire/url_encode.zig");
 pub const router = @import("router.zig");
 pub const http_range = @import("http/range.zig");
 pub const http_date = @import("http/date.zig");
@@ -100,6 +101,7 @@ test {
     _ = restore_request;
     _ = object_encryption_update;
     _ = replication_config;
+    _ = url_encode;
     _ = router;
     _ = http_range;
     _ = http_date;

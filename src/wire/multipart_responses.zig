@@ -5,8 +5,20 @@ const Allocator = std.mem.Allocator;
 const xml = @import("xml.zig");
 const storage = @import("../storage/mod.zig");
 const s3_responses = @import("s3_responses.zig");
+const url_encode = @import("url_encode.zig");
 
 const xmlns_attr: xml.Attr = .{ .name = "xmlns", .value = "http://s3.amazonaws.com/doc/2006-03-01/" };
+
+/// Percent-encode `raw` when `encoding_type == "url"`. AWS-exact handling
+/// of the listing `encoding-type=url` query param. Drift table row 8.
+fn maybeEncode(arena: Allocator, raw: []const u8, encoding_type: ?[]const u8) ![]const u8 {
+    if (encoding_type) |et| {
+        if (std.mem.eql(u8, et, "url")) {
+            return try url_encode.percentEncode(arena, raw);
+        }
+    }
+    return raw;
+}
 
 pub fn renderInitiateMultipartUploadResult(allocator: Allocator, bucket: []const u8, key: []const u8, upload_id: []const u8) ![]u8 {
     var bucket_el: xml.Element = .{ .name = "Bucket", .text = bucket };
@@ -82,26 +94,27 @@ pub fn renderListMultipartUploadsResult(
     var children: std.ArrayList(xml.Node) = .empty;
 
     try appendText(arena, &children, "Bucket", bucket);
-    try appendText(arena, &children, "KeyMarker", echo.key_marker);
+    try appendText(arena, &children, "KeyMarker", try maybeEncode(arena, echo.key_marker, echo.encoding_type));
+    // UploadIdMarker is server-generated opaque base64-ish — skip encoding.
     try appendText(arena, &children, "UploadIdMarker", echo.upload_id_marker);
     if (result.is_truncated) {
-        try appendText(arena, &children, "NextKeyMarker", result.next_key_marker);
+        try appendText(arena, &children, "NextKeyMarker", try maybeEncode(arena, result.next_key_marker, echo.encoding_type));
         try appendText(arena, &children, "NextUploadIdMarker", result.next_upload_id_marker);
     }
     // AWS-exact: emit Prefix and Delimiter unconditionally, even when empty.
     // Drift table row 9.
-    try appendText(arena, &children, "Delimiter", echo.delimiter);
-    try appendText(arena, &children, "Prefix", echo.prefix);
+    try appendText(arena, &children, "Delimiter", try maybeEncode(arena, echo.delimiter, echo.encoding_type));
+    try appendText(arena, &children, "Prefix", try maybeEncode(arena, echo.prefix, echo.encoding_type));
     const max_str = try std.fmt.allocPrint(arena, "{d}", .{echo.max_uploads});
     try appendText(arena, &children, "MaxUploads", max_str);
     if (echo.encoding_type) |et| try appendText(arena, &children, "EncodingType", et);
     try appendText(arena, &children, "IsTruncated", if (result.is_truncated) "true" else "false");
 
     for (result.uploads) |u| {
-        try children.append(arena, .{ .element = try renderUpload(arena, u) });
+        try children.append(arena, .{ .element = try renderUpload(arena, u, echo.encoding_type) });
     }
     for (result.common_prefixes) |cp| {
-        try children.append(arena, .{ .element = try renderCommonPrefix(arena, cp) });
+        try children.append(arena, .{ .element = try renderCommonPrefix(arena, cp, echo.encoding_type) });
     }
 
     const root: xml.Element = .{
@@ -165,9 +178,9 @@ fn appendText(arena: Allocator, list: *std.ArrayList(xml.Node), name: []const u8
     try list.append(arena, .{ .element = el });
 }
 
-fn renderUpload(arena: Allocator, u: storage.MultipartUploadInfo) !*xml.Element {
+fn renderUpload(arena: Allocator, u: storage.MultipartUploadInfo, encoding_type: ?[]const u8) !*xml.Element {
     const initiated = try s3_responses.formatIso8601(arena, u.initiated_unix);
-    var key_el: xml.Element = .{ .name = "Key", .text = u.key };
+    var key_el: xml.Element = .{ .name = "Key", .text = try maybeEncode(arena, u.key, encoding_type) };
     var id_el: xml.Element = .{ .name = "UploadId", .text = u.upload_id };
     var init_el: xml.Element = .{ .name = "Initiated", .text = initiated };
     var sc_el: xml.Element = .{ .name = "StorageClass", .text = "STANDARD" };
@@ -227,9 +240,9 @@ fn renderPart(arena: Allocator, p: storage.PartInfo) !*xml.Element {
     return wrapper;
 }
 
-fn renderCommonPrefix(arena: Allocator, prefix: []const u8) !*xml.Element {
+fn renderCommonPrefix(arena: Allocator, prefix: []const u8, encoding_type: ?[]const u8) !*xml.Element {
     const text_el = try arena.create(xml.Element);
-    text_el.* = .{ .name = "Prefix", .text = prefix };
+    text_el.* = .{ .name = "Prefix", .text = try maybeEncode(arena, prefix, encoding_type) };
     const wrapper = try arena.create(xml.Element);
     wrapper.* = .{
         .name = "CommonPrefixes",
