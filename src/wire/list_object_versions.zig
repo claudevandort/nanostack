@@ -20,8 +20,23 @@ const Allocator = std.mem.Allocator;
 const xml = @import("xml.zig");
 const storage = @import("../storage/mod.zig");
 const s3_responses = @import("s3_responses.zig");
+const url_encode = @import("url_encode.zig");
+const list_objects = @import("list_objects.zig");
+
+pub const OwnerInfo = list_objects.OwnerInfo;
 
 const xmlns_attr: xml.Attr = .{ .name = "xmlns", .value = "http://s3.amazonaws.com/doc/2006-03-01/" };
+
+/// Percent-encode `raw` when `encoding_type == "url"`. AWS-exact handling
+/// of the listing `encoding-type=url` query param. Drift table row 8.
+fn maybeEncode(arena: Allocator, raw: []const u8, encoding_type: ?[]const u8) ![]const u8 {
+    if (encoding_type) |et| {
+        if (std.mem.eql(u8, et, "url")) {
+            return try url_encode.percentEncode(arena, raw);
+        }
+    }
+    return raw;
+}
 
 pub const Echo = struct {
     prefix: []const u8 = "",
@@ -37,6 +52,7 @@ pub fn renderListVersionsResult(
     bucket: []const u8,
     echo: Echo,
     result: storage.ListObjectVersionsOutput,
+    owner: OwnerInfo,
 ) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -45,24 +61,26 @@ pub fn renderListVersionsResult(
     var children: std.ArrayList(xml.Node) = .empty;
 
     try appendText(arena, &children, "Name", bucket);
-    try appendText(arena, &children, "Prefix", echo.prefix);
-    try appendText(arena, &children, "KeyMarker", echo.key_marker);
+    try appendText(arena, &children, "Prefix", try maybeEncode(arena, echo.prefix, echo.encoding_type));
+    try appendText(arena, &children, "KeyMarker", try maybeEncode(arena, echo.key_marker, echo.encoding_type));
+    // VersionIdMarker is an opaque server token — not user data; skip encoding.
     try appendText(arena, &children, "VersionIdMarker", echo.version_id_marker);
     if (result.is_truncated) {
-        try appendText(arena, &children, "NextKeyMarker", result.next_key_marker);
+        try appendText(arena, &children, "NextKeyMarker", try maybeEncode(arena, result.next_key_marker, echo.encoding_type));
         try appendText(arena, &children, "NextVersionIdMarker", result.next_version_id_marker);
     }
     const max_str = try std.fmt.allocPrint(arena, "{d}", .{echo.max_keys});
     try appendText(arena, &children, "MaxKeys", max_str);
-    if (echo.delimiter.len > 0) try appendText(arena, &children, "Delimiter", echo.delimiter);
+    // AWS-exact: emit Delimiter unconditionally (Prefix already is). Drift row 9.
+    try appendText(arena, &children, "Delimiter", try maybeEncode(arena, echo.delimiter, echo.encoding_type));
     if (echo.encoding_type) |et| try appendText(arena, &children, "EncodingType", et);
     try appendText(arena, &children, "IsTruncated", if (result.is_truncated) "true" else "false");
 
     for (result.versions) |v| {
-        try children.append(arena, .{ .element = try renderVersionEntry(arena, v) });
+        try children.append(arena, .{ .element = try renderVersionEntry(arena, v, echo.encoding_type, owner) });
     }
     for (result.common_prefixes) |cp| {
-        try children.append(arena, .{ .element = try renderCommonPrefix(arena, cp) });
+        try children.append(arena, .{ .element = try renderCommonPrefix(arena, cp, echo.encoding_type) });
     }
 
     const root: xml.Element = .{
@@ -82,18 +100,33 @@ fn appendText(arena: Allocator, list: *std.ArrayList(xml.Node), name: []const u8
     try list.append(arena, .{ .element = el });
 }
 
-fn renderVersionEntry(arena: Allocator, v: storage.ObjectVersion) !*xml.Element {
+fn renderVersionEntry(arena: Allocator, v: storage.ObjectVersion, encoding_type: ?[]const u8, owner: OwnerInfo) !*xml.Element {
     const lm = try s3_responses.formatIso8601(arena, v.last_modified_unix);
     const size_str = try std.fmt.allocPrint(arena, "{d}", .{v.size});
 
     const key_el = try arena.create(xml.Element);
-    key_el.* = .{ .name = "Key", .text = v.key };
+    key_el.* = .{ .name = "Key", .text = try maybeEncode(arena, v.key, encoding_type) };
     const vid_el = try arena.create(xml.Element);
     vid_el.* = .{ .name = "VersionId", .text = v.version_id };
     const latest_el = try arena.create(xml.Element);
     latest_el.* = .{ .name = "IsLatest", .text = if (v.is_latest) "true" else "false" };
     const lm_el = try arena.create(xml.Element);
     lm_el.* = .{ .name = "LastModified", .text = lm };
+
+    // AWS-exact: every <Version> and <DeleteMarker> carries an <Owner> block.
+    // Drift table row 7.
+    const id_el = try arena.create(xml.Element);
+    id_el.* = .{ .name = "ID", .text = owner.id };
+    const dn_el = try arena.create(xml.Element);
+    dn_el.* = .{ .name = "DisplayName", .text = owner.display_name };
+    const owner_el = try arena.create(xml.Element);
+    owner_el.* = .{
+        .name = "Owner",
+        .children = try arena.dupe(xml.Node, &.{
+            .{ .element = id_el },
+            .{ .element = dn_el },
+        }),
+    };
 
     const wrapper = try arena.create(xml.Element);
     if (v.is_delete_marker) {
@@ -104,6 +137,7 @@ fn renderVersionEntry(arena: Allocator, v: storage.ObjectVersion) !*xml.Element 
                 .{ .element = vid_el },
                 .{ .element = latest_el },
                 .{ .element = lm_el },
+                .{ .element = owner_el },
             }),
         };
     } else {
@@ -123,15 +157,16 @@ fn renderVersionEntry(arena: Allocator, v: storage.ObjectVersion) !*xml.Element 
                 .{ .element = etag_el },
                 .{ .element = size_el },
                 .{ .element = sc_el },
+                .{ .element = owner_el },
             }),
         };
     }
     return wrapper;
 }
 
-fn renderCommonPrefix(arena: Allocator, prefix: []const u8) !*xml.Element {
+fn renderCommonPrefix(arena: Allocator, prefix: []const u8, encoding_type: ?[]const u8) !*xml.Element {
     const text_el = try arena.create(xml.Element);
-    text_el.* = .{ .name = "Prefix", .text = prefix };
+    text_el.* = .{ .name = "Prefix", .text = try maybeEncode(arena, prefix, encoding_type) };
     const wrapper = try arena.create(xml.Element);
     wrapper.* = .{
         .name = "CommonPrefixes",
@@ -153,7 +188,7 @@ test "render empty result" {
         .next_key_marker = "",
         .next_version_id_marker = "",
     };
-    const body = try renderListVersionsResult(testing.allocator, "buk", .{}, result);
+    const body = try renderListVersionsResult(testing.allocator, "buk", .{}, result, .{ .id = "test", .display_name = "nanostack" });
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "<Name>buk</Name>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "<IsTruncated>false</IsTruncated>") != null);
@@ -172,11 +207,13 @@ test "render one version + one delete marker" {
         .next_key_marker = "",
         .next_version_id_marker = "",
     };
-    const body = try renderListVersionsResult(testing.allocator, "buk", .{}, result);
+    const body = try renderListVersionsResult(testing.allocator, "buk", .{}, result, .{ .id = "test", .display_name = "nanostack" });
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "<Version>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "<DeleteMarker>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "<VersionId>v1</VersionId>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "<VersionId>v2</VersionId>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "<IsLatest>true</IsLatest>") != null);
+    // Owner must be emitted on both <Version> and <DeleteMarker> (drift row 7).
+    try testing.expect(std.mem.indexOf(u8, body, "<Owner><ID>test</ID><DisplayName>nanostack</DisplayName></Owner>") != null);
 }

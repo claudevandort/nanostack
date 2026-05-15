@@ -34,7 +34,9 @@ pub fn renderListAllMyBucketsResult(
         }),
     };
 
-    // For each bucket build <Bucket><Name>...</Name><CreationDate>...</CreationDate></Bucket>.
+    // For each bucket build <Bucket><Name>...</Name><CreationDate>...</CreationDate><BucketRegion>...</BucketRegion></Bucket>.
+    // AWS 2023 addition: BucketRegion lets newer SDKs route cross-region
+    // requests without an extra HeadBucket. Drift table row 11.
     var bucket_nodes = try arena.alloc(xml.Node, buckets.len);
     for (buckets, 0..) |b, i| {
         const date_str = try formatIso8601(arena, b.created_unix);
@@ -42,12 +44,15 @@ pub fn renderListAllMyBucketsResult(
         name_el.* = .{ .name = "Name", .text = b.name };
         const date_el = try arena.create(xml.Element);
         date_el.* = .{ .name = "CreationDate", .text = date_str };
+        const region_el = try arena.create(xml.Element);
+        region_el.* = .{ .name = "BucketRegion", .text = b.region };
         const bucket_el = try arena.create(xml.Element);
         bucket_el.* = .{
             .name = "Bucket",
             .children = try arena.dupe(xml.Node, &.{
                 .{ .element = name_el },
                 .{ .element = date_el },
+                .{ .element = region_el },
             }),
         };
         bucket_nodes[i] = .{ .element = bucket_el };
@@ -170,7 +175,7 @@ test "renderListAllMyBucketsResult: one bucket" {
             "<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" ++
             "<Owner><ID>test</ID><DisplayName>nanostack</DisplayName></Owner>" ++
             "<Buckets>" ++
-            "<Bucket><Name>alpha</Name><CreationDate>1970-01-01T00:00:00.000Z</CreationDate></Bucket>" ++
+            "<Bucket><Name>alpha</Name><CreationDate>1970-01-01T00:00:00.000Z</CreationDate><BucketRegion>us-east-1</BucketRegion></Bucket>" ++
             "</Buckets>" ++
             "</ListAllMyBucketsResult>",
         got,

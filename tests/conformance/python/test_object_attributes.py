@@ -11,6 +11,7 @@ from conftest import (
     empty_bucket,
     make_payload,
     seed_object,
+    sign_and_send,
 )
 
 
@@ -130,4 +131,27 @@ def test_object_attributes_per_version(s3, bucket_name):
             f"per-version sizes wrong: v1={out1.get('ObjectSize')} v2={out2.get('ObjectSize')}"
     finally:
         drain_versions(s3, bucket_name)
+        best_effort_delete_bucket(s3, bucket_name)
+
+
+def test_object_attributes_surfaces_last_modified_header(s3, bucket_name):
+    """AWS-exact: GetObjectAttributes response carries `Last-Modified` (HTTP
+    RFC 7231). boto3 doesn't surface arbitrary response headers from this
+    op, so we drop to a raw signed request. Drift table row 10.
+    """
+    seed_object(s3, bucket_name, "k", b"hello")
+    try:
+        resp = sign_and_send(
+            "GET", f"/{bucket_name}/k?attributes",
+            headers={"x-amz-object-attributes": "ETag,ObjectSize"},
+        )
+        assert resp.status_code == 200, \
+            f"expected 200, got {resp.status_code}: {resp.text}"
+        lm = resp.headers.get("Last-Modified") or resp.headers.get("last-modified")
+        assert lm, f"expected Last-Modified header, got headers: {dict(resp.headers)!r}"
+        # RFC 7231 IMF-fixdate ends in "GMT" and has 29 characters total.
+        assert lm.endswith("GMT") and len(lm) == 29, \
+            f"Last-Modified not RFC 7231: {lm!r}"
+    finally:
+        empty_bucket(s3, bucket_name)
         best_effort_delete_bucket(s3, bucket_name)

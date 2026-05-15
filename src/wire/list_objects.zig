@@ -13,6 +13,18 @@ const Allocator = std.mem.Allocator;
 const xml = @import("xml.zig");
 const storage = @import("../storage/mod.zig");
 const s3_responses = @import("s3_responses.zig");
+const url_encode = @import("url_encode.zig");
+
+/// Percent-encode `raw` when `encoding_type == "url"`; otherwise return as-is.
+/// AWS-exact handling of the `encoding-type=url` listing query param.
+fn maybeEncode(arena: Allocator, raw: []const u8, encoding_type: ?[]const u8) ![]const u8 {
+    if (encoding_type) |et| {
+        if (std.mem.eql(u8, et, "url")) {
+            return try url_encode.percentEncode(arena, raw);
+        }
+    }
+    return raw;
+}
 
 const xmlns_attr: xml.Attr = .{ .name = "xmlns", .value = "http://s3.amazonaws.com/doc/2006-03-01/" };
 
@@ -51,26 +63,25 @@ pub fn renderListObjectsV1(
     var children: std.ArrayList(xml.Node) = .empty;
 
     try appendTextChild(arena, &children, "Name", bucket);
-    try appendTextChild(arena, &children, "Prefix", echo.prefix);
-    try appendTextChild(arena, &children, "Marker", echo.marker);
+    try appendTextChild(arena, &children, "Prefix", try maybeEncode(arena, echo.prefix, echo.encoding_type));
+    try appendTextChild(arena, &children, "Marker", try maybeEncode(arena, echo.marker, echo.encoding_type));
     if (result.is_truncated and echo.delimiter.len > 0) {
-        try appendTextChild(arena, &children, "NextMarker", result.next_key);
+        try appendTextChild(arena, &children, "NextMarker", try maybeEncode(arena, result.next_key, echo.encoding_type));
     }
     const max_keys_str = try std.fmt.allocPrint(arena, "{d}", .{echo.max_keys});
     try appendTextChild(arena, &children, "MaxKeys", max_keys_str);
-    if (echo.delimiter.len > 0) {
-        try appendTextChild(arena, &children, "Delimiter", echo.delimiter);
-    }
+    // AWS-exact: emit Delimiter unconditionally (even empty). Drift table row 9.
+    try appendTextChild(arena, &children, "Delimiter", try maybeEncode(arena, echo.delimiter, echo.encoding_type));
     if (echo.encoding_type) |et| {
         try appendTextChild(arena, &children, "EncodingType", et);
     }
     try appendTextChild(arena, &children, "IsTruncated", if (result.is_truncated) "true" else "false");
 
     for (result.contents) |obj| {
-        try children.append(arena, .{ .element = try renderContent(arena, obj, null) });
+        try children.append(arena, .{ .element = try renderContent(arena, obj, null, echo.encoding_type) });
     }
     for (result.common_prefixes) |cp| {
-        try children.append(arena, .{ .element = try renderCommonPrefix(arena, cp) });
+        try children.append(arena, .{ .element = try renderCommonPrefix(arena, cp, echo.encoding_type) });
     }
 
     const root: xml.Element = .{
@@ -95,8 +106,10 @@ pub fn renderListObjectsV2(
     var children: std.ArrayList(xml.Node) = .empty;
 
     try appendTextChild(arena, &children, "Name", bucket);
-    try appendTextChild(arena, &children, "Prefix", echo.prefix);
+    try appendTextChild(arena, &children, "Prefix", try maybeEncode(arena, echo.prefix, echo.encoding_type));
     if (echo.continuation_token) |t| {
+        // Continuation tokens are server-generated base64 — already opaque
+        // and URL-safe — skip encoding.
         try appendTextChild(arena, &children, "ContinuationToken", t);
     }
     if (result.is_truncated) {
@@ -104,11 +117,10 @@ pub fn renderListObjectsV2(
         try appendTextChild(arena, &children, "NextContinuationToken", token);
     }
     if (echo.start_after) |sa| {
-        try appendTextChild(arena, &children, "StartAfter", sa);
+        try appendTextChild(arena, &children, "StartAfter", try maybeEncode(arena, sa, echo.encoding_type));
     }
-    if (echo.delimiter.len > 0) {
-        try appendTextChild(arena, &children, "Delimiter", echo.delimiter);
-    }
+    // AWS-exact: emit Delimiter unconditionally (even empty). Drift table row 9.
+    try appendTextChild(arena, &children, "Delimiter", try maybeEncode(arena, echo.delimiter, echo.encoding_type));
     const max_keys_str = try std.fmt.allocPrint(arena, "{d}", .{echo.max_keys});
     try appendTextChild(arena, &children, "MaxKeys", max_keys_str);
     if (echo.encoding_type) |et| {
@@ -122,10 +134,10 @@ pub fn renderListObjectsV2(
 
     const inject_owner: ?OwnerInfo = if (echo.fetch_owner) owner else null;
     for (result.contents) |obj| {
-        try children.append(arena, .{ .element = try renderContent(arena, obj, inject_owner) });
+        try children.append(arena, .{ .element = try renderContent(arena, obj, inject_owner, echo.encoding_type) });
     }
     for (result.common_prefixes) |cp| {
-        try children.append(arena, .{ .element = try renderCommonPrefix(arena, cp) });
+        try children.append(arena, .{ .element = try renderCommonPrefix(arena, cp, echo.encoding_type) });
     }
 
     const root: xml.Element = .{
@@ -164,14 +176,14 @@ fn appendTextChild(arena: Allocator, list: *std.ArrayList(xml.Node), name: []con
     try list.append(arena, .{ .element = el });
 }
 
-fn renderContent(arena: Allocator, obj: storage.Object, owner: ?OwnerInfo) !*xml.Element {
+fn renderContent(arena: Allocator, obj: storage.Object, owner: ?OwnerInfo, encoding_type: ?[]const u8) !*xml.Element {
     const last_modified = try s3_responses.formatIso8601(arena, obj.last_modified_unix);
     const size_str = try std.fmt.allocPrint(arena, "{d}", .{obj.size});
 
     var nodes: std.ArrayList(xml.Node) = .empty;
 
     const key_el = try arena.create(xml.Element);
-    key_el.* = .{ .name = "Key", .text = obj.key };
+    key_el.* = .{ .name = "Key", .text = try maybeEncode(arena, obj.key, encoding_type) };
     try nodes.append(arena, .{ .element = key_el });
 
     const lm_el = try arena.create(xml.Element);
@@ -211,9 +223,9 @@ fn renderContent(arena: Allocator, obj: storage.Object, owner: ?OwnerInfo) !*xml
     return wrapper;
 }
 
-fn renderCommonPrefix(arena: Allocator, prefix: []const u8) !*xml.Element {
+fn renderCommonPrefix(arena: Allocator, prefix: []const u8, encoding_type: ?[]const u8) !*xml.Element {
     const text_el = try arena.create(xml.Element);
-    text_el.* = .{ .name = "Prefix", .text = prefix };
+    text_el.* = .{ .name = "Prefix", .text = try maybeEncode(arena, prefix, encoding_type) };
     const wrapper = try arena.create(xml.Element);
     wrapper.* = .{
         .name = "CommonPrefixes",

@@ -777,6 +777,12 @@ pub const InitiateMultipartUploadInput = struct {
     /// M13. SSE applied to the final merged object.
     sse_algorithm: ?SseAlgorithm = null,
     sse_kms_key_id: []const u8 = "",
+    /// Wave 2 (drift #6). Identity captured at CreateMultipartUpload time —
+    /// surfaced via `<Initiator>` on the eventual ListMultipartUploads response.
+    /// Single-tenant in practice (equals the bucket-owner identity); schema
+    /// supports distinction for future multi-tenant work.
+    initiator_id: []const u8 = "",
+    initiator_display_name: []const u8 = "",
 };
 
 /// M12. Input to `createBucket`. The `object_lock_enabled` flag is set
@@ -835,6 +841,9 @@ pub const MultipartUploadInfo = struct {
     key: []const u8,
     upload_id: []const u8,
     initiated_unix: i64,
+    /// Wave 2 (drift #6). Captured at CreateMultipartUpload time.
+    initiator_id: []const u8 = "",
+    initiator_display_name: []const u8 = "",
 };
 
 /// Metadata for one uploaded part (returned by ListParts).

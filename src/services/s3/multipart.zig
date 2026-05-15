@@ -73,6 +73,11 @@ pub fn createMultipartUpload(ctx: Context, bucket: []const u8, key: []const u8) 
         .retention_mode = lock_info.mode,
         .retain_until_unix = lock_info.retain_until_unix,
         .legal_hold = lock_info.legal_hold,
+        // Drift row 6. Capture the requester identity for the eventual
+        // <Initiator> on ListMultipartUploads. Single-tenant emulator —
+        // equals the bucket-owner identity from server config.
+        .initiator_id = ctx.owner_id,
+        .initiator_display_name = ctx.owner_display_name,
     }) catch |err| return .{ .err = mod.mapStorageErr(err) };
 
     const body = multipart_wire.renderInitiateMultipartUploadResult(ctx.allocator, bucket, key, out.upload_id) catch
@@ -276,7 +281,12 @@ pub fn listMultipartUploads(ctx: Context, bucket: []const u8) Result {
         .max_uploads = echo.max_uploads,
     }) catch |err| return .{ .err = mod.mapStorageErr(err) };
 
-    const body = multipart_wire.renderListMultipartUploadsResult(ctx.allocator, bucket, echo, result) catch
-        return .{ .err = .internal_error };
+    const body = multipart_wire.renderListMultipartUploadsResult(
+        ctx.allocator,
+        bucket,
+        echo,
+        result,
+        .{ .id = ctx.owner_id, .display_name = ctx.owner_display_name },
+    ) catch return .{ .err = .internal_error };
     return .{ .ok = .{ .status = 200, .body = body } };
 }

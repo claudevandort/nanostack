@@ -18,6 +18,14 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ### Changed
 - **Conformance + bench harness ported from Go (`aws-sdk-go-v2`) to Python (`boto3`).** All 162 conformance tests translated 1:1 to pytest; `bench/driver.py` replaces the Go bench driver. Two perf-budget rows recalibrated for boto3's heavier SigV4 path: `put_object_p99_ms` 5 → 10 ms, `put_object_throughput_rps` 500 → 150 req/s. Server unchanged.
+- **Wave 2 AWS-drift fixes (6 XML response-shape gaps in listing responses)**, tracked in [`SUPPORT.md` → Known drift](SUPPORT.md#known-drift--to-fix):
+  - `ListMultipartUploads` now emits `<Initiator>` + `<Owner>` per `<Upload>` (persisted requester identity).
+  - `ListObjectVersions` now emits `<Owner>` per `<Version>` and `<DeleteMarker>` entry.
+  - All three list responses (objects, multipart uploads, versions) honour `encoding-type=url` — keys/prefixes/delimiter/marker fields are percent-encoded per RFC 3986 via new `wire/url_encode.zig`.
+  - `ListMultipartUploads` + `ListObjects` (V1+V2) + `ListObjectVersions` emit `<Prefix>` and `<Delimiter>` unconditionally (even when empty), matching AWS exactly. `wire/xml.zig` now distinguishes `text = null` (self-close `<Foo/>`) from `text = ""` (paired `<Foo></Foo>`).
+  - `GetObjectAttributes` now surfaces `Last-Modified` and `x-amz-delete-marker` HTTP headers.
+  - `ListBuckets` now emits `<BucketRegion>` per `<Bucket>` (AWS 2023 addition).
+
 - **Wave 1 AWS-drift fixes (5 status/error-code corrections on routed ops)**, tracked in [`SUPPORT.md` → Known drift](SUPPORT.md#known-drift--to-fix):
   - `CompleteMultipartUpload` on an unknown upload id now returns `404 NoSuchUpload` (was `400 InvalidPart`). New `storage.Error.InvalidPart` variant disambiguates etag-mismatch from upload-missing.
   - `PutBucketTagging` returns `204 No Content` (was `200`). `PutObjectTagging` stays at 200 per AWS docs.

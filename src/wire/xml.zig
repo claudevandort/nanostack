@@ -43,9 +43,14 @@ pub const Element = struct {
             try writer.writeByte('"');
         }
 
-        const has_text = self.text != null and self.text.?.len > 0;
+        const has_text_intent = self.text != null;
+        const has_text = has_text_intent and self.text.?.len > 0;
         const has_children = self.children.len > 0;
-        if (!has_text and !has_children) {
+        // Self-close only when neither text nor children were attached.
+        // An explicitly-empty text (`text = ""`) yields paired tags
+        // (`<Foo></Foo>`), matching AWS-exact XML responses for fields like
+        // empty `<Prefix>` / `<Delimiter>` / `<KeyMarker>`.
+        if (!has_text_intent and !has_children) {
             try writer.writeAll("/>");
             return;
         }

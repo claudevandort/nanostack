@@ -192,3 +192,31 @@ def test_versioning_head_on_delete_marker_returns_405(s3, bucket_name):
     finally:
         drain_versions(s3, bucket_name)
         best_effort_delete_bucket(s3, bucket_name)
+
+
+def test_versioning_list_versions_surfaces_owner_per_entry(s3, bucket_name):
+    """AWS-exact: every <Version> and <DeleteMarker> in ListVersionsResult
+    carries an <Owner> block. Drift table row 7.
+    """
+    s3.create_bucket(Bucket=bucket_name)
+    _enable_versioning(s3, bucket_name)
+    try:
+        s3.put_object(Bucket=bucket_name, Key="k", Body=b"v1")
+        s3.put_object(Bucket=bucket_name, Key="k", Body=b"v2")
+        s3.delete_object(Bucket=bucket_name, Key="k")  # creates delete marker
+
+        out = s3.list_object_versions(Bucket=bucket_name)
+        versions = out.get("Versions", []) or []
+        markers = out.get("DeleteMarkers", []) or []
+        assert len(versions) == 2, f"expected 2 versions, got {len(versions)}"
+        assert len(markers) == 1, f"expected 1 delete marker, got {len(markers)}"
+
+        for entry in versions + markers:
+            owner = entry.get("Owner") or {}
+            assert owner.get("ID"), \
+                f"missing Owner.ID on entry {entry!r}"
+            assert owner.get("DisplayName"), \
+                f"missing Owner.DisplayName on entry {entry!r}"
+    finally:
+        drain_versions(s3, bucket_name)
+        best_effort_delete_bucket(s3, bucket_name)
