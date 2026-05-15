@@ -2,7 +2,7 @@
 
 A snappy, accurate AWS emulator for local development, written in Zig.
 
-**Status:** `v0.1.0` — S3 is functionally complete for local-dev use (**68 / 107 Smithy ops routed, ~99% of real dev workflows covered**). Pre-`v1.0.0`; expect minor breaking changes between tags. See [`docs/CHANGELOG.md`](docs/CHANGELOG.md) for the versioning scheme.
+**Status:** `v0.1.1` — S3 is functionally complete for local-dev use (**68 / 107 Smithy ops routed, ~99% of real dev workflows covered**); now shipped as a single multi-arch Docker image. Pre-`v1.0.0`; expect minor breaking changes between tags. See [`docs/CHANGELOG.md`](docs/CHANGELOG.md) for the versioning scheme.
 
 ## What it is
 
