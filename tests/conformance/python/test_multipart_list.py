@@ -143,3 +143,32 @@ def test_multipart_list_emits_empty_prefix_and_delimiter(s3, bucket_name):
             except ClientError:
                 pass
         best_effort_delete_bucket(s3, bucket_name)
+
+
+def test_multipart_list_uploads_surfaces_initiator_and_owner(s3, bucket_name):
+    """AWS-exact: every <Upload> in ListMultipartUploadsResult includes
+    `<Initiator>` (requester identity) and `<Owner>` (bucket owner), each
+    with ID + DisplayName. Drift table row 6.
+    """
+    s3.create_bucket(Bucket=bucket_name)
+    init = None
+    try:
+        init = s3.create_multipart_upload(Bucket=bucket_name, Key="k")
+        out = s3.list_multipart_uploads(Bucket=bucket_name)
+        uploads = out.get("Uploads", []) or []
+        assert len(uploads) == 1, f"expected 1 upload, got {len(uploads)}"
+
+        u = uploads[0]
+        initiator = u.get("Initiator") or {}
+        owner = u.get("Owner") or {}
+        assert initiator.get("ID"), f"missing Initiator.ID: {u!r}"
+        assert initiator.get("DisplayName"), f"missing Initiator.DisplayName: {u!r}"
+        assert owner.get("ID"), f"missing Owner.ID: {u!r}"
+        assert owner.get("DisplayName"), f"missing Owner.DisplayName: {u!r}"
+    finally:
+        if init is not None:
+            try:
+                s3.abort_multipart_upload(Bucket=bucket_name, Key="k", UploadId=init["UploadId"])
+            except ClientError:
+                pass
+        best_effort_delete_bucket(s3, bucket_name)

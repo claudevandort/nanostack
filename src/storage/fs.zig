@@ -50,6 +50,9 @@ const MultipartState = struct {
     /// M13. SSE applied to the merged object on Complete.
     sse_algorithm: ?storage.SseAlgorithm = null,
     sse_kms_key_id: []u8 = &.{},
+    /// Wave 2 (drift #6). Identity captured at CreateMultipartUpload.
+    initiator_id: []u8 = &.{},
+    initiator_display_name: []u8 = &.{},
 
     fn deinit(self: *MultipartState, gpa: Allocator) void {
         gpa.free(self.key);
@@ -65,6 +68,8 @@ const MultipartState = struct {
         freeTagsOwned(gpa, self.tags);
         if (self.acl) |a| freeAclOwned(gpa, a);
         if (self.sse_kms_key_id.len > 0) gpa.free(self.sse_kms_key_id);
+        if (self.initiator_id.len > 0) gpa.free(self.initiator_id);
+        if (self.initiator_display_name.len > 0) gpa.free(self.initiator_display_name);
         self.* = undefined;
     }
 };
@@ -3398,6 +3403,9 @@ const ManifestDoc = struct {
     /// M13. SSE applied to the merged object on Complete.
     sse_algorithm: ?storage.SseAlgorithm = null,
     sse_kms_key_id: []const u8 = "",
+    /// Wave 2 (drift #6). Surfaced via <Initiator> on ListMultipartUploads.
+    initiator_id: []const u8 = "",
+    initiator_display_name: []const u8 = "",
 };
 
 const ManifestPart = struct {
@@ -3442,6 +3450,16 @@ pub fn initiateMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Init
         try self.allocator.dupe(u8, in.sse_kms_key_id)
     else
         &.{};
+    const initiator_id_dup: []u8 = if (in.initiator_id.len > 0)
+        try self.allocator.dupe(u8, in.initiator_id)
+    else
+        &.{};
+    errdefer if (initiator_id_dup.len > 0) self.allocator.free(initiator_id_dup);
+    const initiator_dn_dup: []u8 = if (in.initiator_display_name.len > 0)
+        try self.allocator.dupe(u8, in.initiator_display_name)
+    else
+        &.{};
+    errdefer if (initiator_dn_dup.len > 0) self.allocator.free(initiator_dn_dup);
     const state: MultipartState = .{
         .key = key_owned,
         .content_type = ct_owned,
@@ -3455,6 +3473,8 @@ pub fn initiateMultipartUpload(self: *Fs, allocator: Allocator, in: storage.Init
         .legal_hold = in.legal_hold,
         .sse_algorithm = in.sse_algorithm,
         .sse_kms_key_id = sse_kms_dup,
+        .initiator_id = initiator_id_dup,
+        .initiator_display_name = initiator_dn_dup,
     };
 
     const id_for_map = self.allocator.dupe(u8, upload_id) catch return storage.Error.OutOfMemory;
@@ -3621,7 +3641,13 @@ pub fn listMultipartUploads(self: *Fs, allocator: Allocator, in: storage.ListMul
     const slot = &self.buckets.items[idx];
 
     // Snapshot uploads sorted by (key, upload_id).
-    const Row = struct { id: []const u8, key: []const u8, initiated_unix: i64 };
+    const Row = struct {
+        id: []const u8,
+        key: []const u8,
+        initiated_unix: i64,
+        initiator_id: []const u8,
+        initiator_display_name: []const u8,
+    };
     var rows: std.ArrayList(Row) = .empty;
     defer rows.deinit(allocator);
     var it = slot.uploads.iterator();
@@ -3630,6 +3656,8 @@ pub fn listMultipartUploads(self: *Fs, allocator: Allocator, in: storage.ListMul
             .id = entry.key_ptr.*,
             .key = entry.value_ptr.key,
             .initiated_unix = entry.value_ptr.initiated_unix,
+            .initiator_id = entry.value_ptr.initiator_id,
+            .initiator_display_name = entry.value_ptr.initiator_display_name,
         }) catch return storage.Error.OutOfMemory;
     }
     std.mem.sort(Row, rows.items, {}, struct {
@@ -3645,6 +3673,8 @@ pub fn listMultipartUploads(self: *Fs, allocator: Allocator, in: storage.ListMul
         for (uploads.items) |u| {
             allocator.free(u.key);
             allocator.free(u.upload_id);
+            if (u.initiator_id.len > 0) allocator.free(u.initiator_id);
+            if (u.initiator_display_name.len > 0) allocator.free(u.initiator_display_name);
         }
         uploads.deinit(allocator);
     }
@@ -3703,13 +3733,28 @@ pub fn listMultipartUploads(self: *Fs, allocator: Allocator, in: storage.ListMul
             allocator.free(k_dup);
             return storage.Error.OutOfMemory;
         };
+        const init_id_dup = allocator.dupe(u8, row.initiator_id) catch {
+            allocator.free(k_dup);
+            allocator.free(id_dup);
+            return storage.Error.OutOfMemory;
+        };
+        const init_dn_dup = allocator.dupe(u8, row.initiator_display_name) catch {
+            allocator.free(k_dup);
+            allocator.free(id_dup);
+            allocator.free(init_id_dup);
+            return storage.Error.OutOfMemory;
+        };
         uploads.append(allocator, .{
             .key = k_dup,
             .upload_id = id_dup,
             .initiated_unix = row.initiated_unix,
+            .initiator_id = init_id_dup,
+            .initiator_display_name = init_dn_dup,
         }) catch {
             allocator.free(k_dup);
             allocator.free(id_dup);
+            allocator.free(init_id_dup);
+            allocator.free(init_dn_dup);
             return storage.Error.OutOfMemory;
         };
         last_key = row.key;
@@ -3806,6 +3851,8 @@ fn writeManifest(self: *Fs, bucket: []const u8, upload_id: []const u8, state: *c
         .legal_hold = state.legal_hold,
         .sse_algorithm = state.sse_algorithm,
         .sse_kms_key_id = state.sse_kms_key_id,
+        .initiator_id = state.initiator_id,
+        .initiator_display_name = state.initiator_display_name,
     };
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
     defer aw.deinit();
@@ -3854,6 +3901,8 @@ fn rebuildUploadIndex(self: *Fs, slot: *BucketSlot) !void {
             .legal_hold = value.legal_hold,
             .sse_algorithm = value.sse_algorithm,
             .sse_kms_key_id = try self.allocator.dupe(u8, value.sse_kms_key_id),
+            .initiator_id = try self.allocator.dupe(u8, value.initiator_id),
+            .initiator_display_name = try self.allocator.dupe(u8, value.initiator_display_name),
         };
         for (value.parts) |p| {
             const etag_owned = try self.allocator.dupe(u8, p.etag);

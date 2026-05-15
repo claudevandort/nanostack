@@ -6,6 +6,9 @@ const xml = @import("xml.zig");
 const storage = @import("../storage/mod.zig");
 const s3_responses = @import("s3_responses.zig");
 const url_encode = @import("url_encode.zig");
+const list_objects = @import("list_objects.zig");
+
+pub const OwnerInfo = list_objects.OwnerInfo;
 
 const xmlns_attr: xml.Attr = .{ .name = "xmlns", .value = "http://s3.amazonaws.com/doc/2006-03-01/" };
 
@@ -86,6 +89,7 @@ pub fn renderListMultipartUploadsResult(
     bucket: []const u8,
     echo: ListMultipartUploadsEcho,
     result: storage.ListMultipartUploadsOutput,
+    owner: OwnerInfo,
 ) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -111,7 +115,7 @@ pub fn renderListMultipartUploadsResult(
     try appendText(arena, &children, "IsTruncated", if (result.is_truncated) "true" else "false");
 
     for (result.uploads) |u| {
-        try children.append(arena, .{ .element = try renderUpload(arena, u, echo.encoding_type) });
+        try children.append(arena, .{ .element = try renderUpload(arena, u, echo.encoding_type, owner) });
     }
     for (result.common_prefixes) |cp| {
         try children.append(arena, .{ .element = try renderCommonPrefix(arena, cp, echo.encoding_type) });
@@ -178,38 +182,61 @@ fn appendText(arena: Allocator, list: *std.ArrayList(xml.Node), name: []const u8
     try list.append(arena, .{ .element = el });
 }
 
-fn renderUpload(arena: Allocator, u: storage.MultipartUploadInfo, encoding_type: ?[]const u8) !*xml.Element {
+fn renderUpload(arena: Allocator, u: storage.MultipartUploadInfo, encoding_type: ?[]const u8, owner: OwnerInfo) !*xml.Element {
     const initiated = try s3_responses.formatIso8601(arena, u.initiated_unix);
-    var key_el: xml.Element = .{ .name = "Key", .text = try maybeEncode(arena, u.key, encoding_type) };
-    var id_el: xml.Element = .{ .name = "UploadId", .text = u.upload_id };
-    var init_el: xml.Element = .{ .name = "Initiated", .text = initiated };
-    var sc_el: xml.Element = .{ .name = "StorageClass", .text = "STANDARD" };
+
+    const key_el = try arena.create(xml.Element);
+    key_el.* = .{ .name = "Key", .text = try maybeEncode(arena, u.key, encoding_type) };
+    const id_el = try arena.create(xml.Element);
+    id_el.* = .{ .name = "UploadId", .text = u.upload_id };
+
+    // AWS-exact: <Initiator> + <Owner> on every <Upload>. Initiator is the
+    // captured requester identity; Owner is the bucket-owner. Drift row 6.
+    const init_id = if (u.initiator_id.len > 0) u.initiator_id else owner.id;
+    const init_dn = if (u.initiator_display_name.len > 0) u.initiator_display_name else owner.display_name;
+    const initiator_id_el = try arena.create(xml.Element);
+    initiator_id_el.* = .{ .name = "ID", .text = init_id };
+    const initiator_dn_el = try arena.create(xml.Element);
+    initiator_dn_el.* = .{ .name = "DisplayName", .text = init_dn };
+    const initiator_el = try arena.create(xml.Element);
+    initiator_el.* = .{
+        .name = "Initiator",
+        .children = try arena.dupe(xml.Node, &.{
+            .{ .element = initiator_id_el },
+            .{ .element = initiator_dn_el },
+        }),
+    };
+
+    const owner_id_el = try arena.create(xml.Element);
+    owner_id_el.* = .{ .name = "ID", .text = owner.id };
+    const owner_dn_el = try arena.create(xml.Element);
+    owner_dn_el.* = .{ .name = "DisplayName", .text = owner.display_name };
+    const owner_el = try arena.create(xml.Element);
+    owner_el.* = .{
+        .name = "Owner",
+        .children = try arena.dupe(xml.Node, &.{
+            .{ .element = owner_id_el },
+            .{ .element = owner_dn_el },
+        }),
+    };
+
+    const initiated_el = try arena.create(xml.Element);
+    initiated_el.* = .{ .name = "Initiated", .text = initiated };
+    const sc_el = try arena.create(xml.Element);
+    sc_el.* = .{ .name = "StorageClass", .text = "STANDARD" };
+
     const wrapper = try arena.create(xml.Element);
     wrapper.* = .{
         .name = "Upload",
         .children = try arena.dupe(xml.Node, &.{
-            .{ .element = &key_el },
-            .{ .element = &id_el },
-            .{ .element = &init_el },
-            .{ .element = &sc_el },
+            .{ .element = key_el },
+            .{ .element = id_el },
+            .{ .element = initiator_el },
+            .{ .element = owner_el },
+            .{ .element = initiated_el },
+            .{ .element = sc_el },
         }),
     };
-    // Element children point to stack copies — we need to put them on the arena.
-    // Repack with arena-owned children.
-    const key_arena = try arena.create(xml.Element);
-    key_arena.* = key_el;
-    const id_arena = try arena.create(xml.Element);
-    id_arena.* = id_el;
-    const init_arena = try arena.create(xml.Element);
-    init_arena.* = init_el;
-    const sc_arena = try arena.create(xml.Element);
-    sc_arena.* = sc_el;
-    wrapper.children = try arena.dupe(xml.Node, &.{
-        .{ .element = key_arena },
-        .{ .element = id_arena },
-        .{ .element = init_arena },
-        .{ .element = sc_arena },
-    });
     return wrapper;
 }
 
@@ -299,11 +326,14 @@ test "renderListMultipartUploadsResult: one upload" {
         .next_key_marker = "",
         .next_upload_id_marker = "",
     };
-    const body = try renderListMultipartUploadsResult(testing.allocator, "buk", .{}, result);
+    const body = try renderListMultipartUploadsResult(testing.allocator, "buk", .{}, result, .{ .id = "test", .display_name = "nanostack" });
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "<Upload>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "<UploadId>u1</UploadId>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "<IsTruncated>false</IsTruncated>") != null);
+    // Owner + Initiator emitted on every <Upload> (drift row 6).
+    try testing.expect(std.mem.indexOf(u8, body, "<Initiator><ID>test</ID><DisplayName>nanostack</DisplayName></Initiator>") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "<Owner><ID>test</ID><DisplayName>nanostack</DisplayName></Owner>") != null);
 }
 
 test "renderCopyPartResult: fixed values" {
