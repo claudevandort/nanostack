@@ -6,24 +6,12 @@ on:
       - 'v*'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
-    name: build ${{ matrix.target }}
+  docker:
+    name: Build + push Docker image
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-linux-gnu
-            asset: linux-x86_64
-          - target: aarch64-linux-gnu
-            asset: linux-aarch64
-          - target: x86_64-macos-none
-            asset: macos-x86_64
-          - target: aarch64-macos-none
-            asset: macos-aarch64
     steps:
       - uses: actions/checkout@v4
 
@@ -39,148 +27,103 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Cross-compile
-        run: zig build release -Dtarget=${{ matrix.target }}
-
-      - name: Smoke test (linux-x86_64 only)
-        if: matrix.target == 'x86_64-linux-gnu'
+      - name: Cross-compile linux/amd64 (musl-static)
         run: |
-          out="$(./zig-out/release/${{ matrix.target }}/nanostack --version)"
+          zig build release -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast -Dstrip=true
+          mv zig-out/release/x86_64-linux-musl/nanostack ./nanostack-amd64
+
+      - name: Cross-compile linux/arm64 (musl-static)
+        run: |
+          zig build release -Dtarget=aarch64-linux-musl -Doptimize=ReleaseFast -Dstrip=true
+          mv zig-out/release/aarch64-linux-musl/nanostack ./nanostack-arm64
+
+      - name: Verify both binaries are statically linked
+        run: |
+          file ./nanostack-amd64 | grep -q "statically linked" \
+            || { echo "amd64 binary is NOT statically linked"; file ./nanostack-amd64; exit 1; }
+          file ./nanostack-arm64 | grep -q "statically linked" \
+            || { echo "arm64 binary is NOT statically linked"; file ./nanostack-arm64; exit 1; }
+          echo "OK — both statically linked."
+          ls -lh ./nanostack-amd64 ./nanostack-arm64
+
+      - name: Smoke test the amd64 binary
+        run: |
+          out="$(./nanostack-amd64 --version)"
           echo "Output: $out"
           test "$out" = "nanostack v${{ steps.ver.outputs.version }}"
 
-      - name: Package tarball
-        run: |
-          mkdir -p dist
-          stage="$(mktemp -d)/nanostack-${{ steps.ver.outputs.tag }}-${{ matrix.asset }}"
-          mkdir -p "$stage"
-          cp "zig-out/release/${{ matrix.target }}/nanostack" "$stage/"
-          cp LICENSE README.md "$stage/"
-          cp -r docs "$stage/docs"
-          tar -czf "dist/nanostack-${{ steps.ver.outputs.tag }}-${{ matrix.asset }}.tar.gz" \
-            -C "$(dirname "$stage")" "$(basename "$stage")"
-          (cd dist && sha256sum "nanostack-${{ steps.ver.outputs.tag }}-${{ matrix.asset }}.tar.gz" \
-            > "nanostack-${{ steps.ver.outputs.tag }}-${{ matrix.asset }}.tar.gz.sha256")
+      - name: Set up QEMU (for arm64 buildx layer)
+        uses: docker/setup-qemu-action@v3
 
-      - uses: actions/upload-artifact@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
         with:
-          name: nanostack-${{ matrix.asset }}
-          path: dist/*
-          if-no-files-found: error
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-  release:
-    name: GitHub Release
-    runs-on: ubuntu-latest
-    needs: build
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve version
-        id: ver
-        run: |
-          tag="${GITHUB_REF#refs/tags/}"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Download all tarballs
-        uses: actions/download-artifact@v4
+      - name: Extract image metadata (tags)
+        id: meta
+        uses: docker/metadata-action@v5
         with:
-          path: dist
-          merge-multiple: true
+          images: claudevandort/nanostack
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
 
-      - name: Build SHA256SUMS
+      - name: Build + push multi-arch image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Smoke test the published image
         run: |
-          cd dist
-          ls *.tar.gz
-          sha256sum *.tar.gz > SHA256SUMS
-          cat SHA256SUMS
+          tag="${{ steps.ver.outputs.tag }}"
+          docker pull "claudevandort/nanostack:${tag}"
+          out="$(docker run --rm "claudevandort/nanostack:${tag}" --version)"
+          echo "Output: $out"
+          test "$out" = "nanostack v${{ steps.ver.outputs.version }}"
+
+      - name: Inspect multi-arch manifest
+        run: docker buildx imagetools inspect "claudevandort/nanostack:${{ steps.ver.outputs.tag }}"
 
       - name: Extract changelog section
         id: notes
         run: |
           version="${{ steps.ver.outputs.version }}"
           if grep -q "^## \[$version\]" docs/CHANGELOG.md; then
-            awk "/^## \[$version\]/{flag=1; next} /^## \[/{flag=0} flag" docs/CHANGELOG.md > release-notes.md
+            awk "/^## \[$version\]/{flag=1; next} /^## \[/{flag=0} flag" docs/CHANGELOG.md > release-notes-body.md
           else
-            echo "No CHANGELOG entry for $version. See docs/CHANGELOG.md." > release-notes.md
+            echo "No CHANGELOG entry for $version. See docs/CHANGELOG.md." > release-notes-body.md
           fi
+          # Append the Docker pull pointer so the Release page tells users
+          # exactly how to consume this version.
+          cat >> release-notes-body.md <<EOF
+
+          ## Docker
+
+          \`\`\`sh
+          docker pull claudevandort/nanostack:${{ steps.ver.outputs.tag }}
+          docker run --rm -p 4566:4566 claudevandort/nanostack:${{ steps.ver.outputs.tag }}
+          \`\`\`
+
+          Multi-arch image (linux/amd64 + linux/arm64) on Docker Hub.
+          Also available as \`:${{ steps.ver.outputs.version }}\`-prefixed and \`:latest\` tags.
+          EOF
           echo "----- release notes -----"
-          cat release-notes.md
+          cat release-notes-body.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: nanostack ${{ steps.ver.outputs.tag }}
-          body_path: release-notes.md
-          files: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
-            dist/SHA256SUMS
-          fail_on_unmatched_files: true
-
-  brew-bump:
-    name: Bump Homebrew tap (soft-fail)
-    runs-on: ubuntu-latest
-    needs: release
-    # Don't fail the whole release if the tap update has trouble.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve version + checksums
-        id: ver
-        run: |
-          tag="${GITHUB_REF#refs/tags/}"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Download tarballs
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Render formula
-        run: |
-          version="${{ steps.ver.outputs.version }}"
-          url_base="https://github.com/${{ github.repository }}/releases/download/${{ steps.ver.outputs.tag }}"
-          sha_linux_x86_64="$(cd dist && sha256sum "nanostack-${{ steps.ver.outputs.tag }}-linux-x86_64.tar.gz" | awk '{print $1}')"
-          sha_linux_aarch64="$(cd dist && sha256sum "nanostack-${{ steps.ver.outputs.tag }}-linux-aarch64.tar.gz" | awk '{print $1}')"
-          sha_macos_x86_64="$(cd dist && sha256sum "nanostack-${{ steps.ver.outputs.tag }}-macos-x86_64.tar.gz" | awk '{print $1}')"
-          sha_macos_aarch64="$(cd dist && sha256sum "nanostack-${{ steps.ver.outputs.tag }}-macos-aarch64.tar.gz" | awk '{print $1}')"
-          sed -e "s|{{VERSION}}|$version|g" \
-              -e "s|{{URL_BASE}}|$url_base|g" \
-              -e "s|{{SHA256_LINUX_X86_64}}|$sha_linux_x86_64|g" \
-              -e "s|{{SHA256_LINUX_AARCH64}}|$sha_linux_aarch64|g" \
-              -e "s|{{SHA256_MACOS_X86_64}}|$sha_macos_x86_64|g" \
-              -e "s|{{SHA256_MACOS_AARCH64}}|$sha_macos_aarch64|g" \
-              release/nanostack.rb > /tmp/nanostack.rb
-          echo "----- rendered formula -----"
-          cat /tmp/nanostack.rb
-
-      - name: Open PR against homebrew tap
-        env:
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          if [ -z "$TAP_TOKEN" ]; then
-            echo "HOMEBREW_TAP_TOKEN not configured; skipping tap PR."
-            exit 0
-          fi
-          git clone "https://x-access-token:$TAP_TOKEN@github.com/claudevandort/homebrew-nanostack.git" tap
-          cp /tmp/nanostack.rb tap/Formula/nanostack.rb
-          cd tap
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          branch="bump-${{ steps.ver.outputs.tag }}"
-          git checkout -b "$branch"
-          git add Formula/nanostack.rb
-          git commit -m "nanostack ${{ steps.ver.outputs.tag }}"
-          git push origin "$branch"
-          # Best-effort PR via the GitHub CLI; soft-fails if gh isn't authenticated for the tap.
-          gh pr create --repo claudevandort/homebrew-nanostack \
-            --title "nanostack ${{ steps.ver.outputs.tag }}" \
-            --body "Auto-generated by the nanostack release workflow." \
-            --head "$branch" || true
+          body_path: release-notes-body.md

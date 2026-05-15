@@ -1,0 +1,7 @@
+# The Docker build only needs the pre-compiled binaries (dropped in by CI)
+# and the Dockerfile itself. Everything else is excluded for a fast,
+# minimal build context.
+*
+!nanostack-amd64
+!nanostack-arm64
+!Dockerfile
