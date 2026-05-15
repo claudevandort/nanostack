@@ -7,21 +7,38 @@ HEAD/ListObjectsV2 responses drift from AWS, the second sync will
 re-transfer files and the stdout assertion will catch it.
 """
 
+import os
+import time
 from pathlib import Path
 
 from conftest import run_aws
 
 
 def _seed_dir(root: Path) -> dict[str, bytes]:
-    """Three files of varying size under `root`. Returns name → bytes map."""
+    """Three files of varying size under `root`. Returns name → bytes map.
+
+    Each file's mtime is explicitly stamped to a whole-second value 60 s in
+    the past. AWS S3 `LastModified` is second-precision (matches real AWS,
+    which always emits `.000Z`). If we let the OS pick the source mtime
+    naturally, macOS APFS gives sub-second precision, and on a fast
+    localhost loop the upload happens in the same wall-clock second as the
+    file write — `sync`'s diff then sees `src=N.123 > dest=N.000` and
+    re-uploads, breaking idempotency. Real AWS users don't hit this because
+    network latency always pushes the upload to a later whole second. We
+    sidestep the artifact by forcing source mtimes to integer seconds
+    safely in the past.
+    """
     files = {
         "alpha.txt": b"a" * 10,
         "beta.bin": b"\x00\x01\x02\x03" * 8,
         "gamma.md": b"# header\n" * 4,
     }
     root.mkdir(parents=True, exist_ok=True)
+    past = int(time.time()) - 60
     for name, body in files.items():
-        (root / name).write_bytes(body)
+        path = root / name
+        path.write_bytes(body)
+        os.utime(path, (past, past))
     return files
 
 
