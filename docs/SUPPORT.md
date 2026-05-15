@@ -36,7 +36,7 @@ Behavioural drift surfaced by a 2026-05-14 audit. Distinct from the "accept-stor
 | 8 | Listing | `encoding-type=url` is echoed but keys / prefixes / delimiter rendered raw — clients opting in see un-encoded keys | todo | [`src/wire/list_objects.zig:170`](../src/wire/list_objects.zig) | — |
 | 9 | Multipart | `ListMultipartUploadsResult` drops `<Prefix>` and `<Delimiter>` when empty — AWS emits them empty | todo | [`src/wire/multipart_responses.zig:91`](../src/wire/multipart_responses.zig) | — |
 | 10 | Object attrs | `GetObjectAttributes` response missing `Last-Modified` + `x-amz-delete-marker` headers | done | [`src/services/s3/object_attributes.zig`](../src/services/s3/object_attributes.zig) | [`test_object_attributes.py::test_object_attributes_surfaces_last_modified_header`](../tests/conformance/python/test_object_attributes.py) |
-| 11 | Bucket | `ListBuckets` `<Bucket>` entries miss `<BucketRegion>` (AWS 2023 addition) | todo | [`src/wire/s3_responses.zig:38`](../src/wire/s3_responses.zig) | — |
+| 11 | Bucket | `ListBuckets` `<Bucket>` entries miss `<BucketRegion>` (AWS 2023 addition) | done | [`src/wire/s3_responses.zig`](../src/wire/s3_responses.zig) | [`test_list_buckets.py::test_list_buckets_emits_bucket_region`](../tests/conformance/python/test_list_buckets.py) |
 
 ### Medium/Low — validation, SigV4, edge cases (Wave 3)
 
