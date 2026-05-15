@@ -6,7 +6,7 @@ A snappy, accurate AWS emulator for local development, written in Zig.
 
 ## What it is
 
-- **Single static binary** — no Docker, no JVM, no Python. ~0.8 MB stripped.
+- **Single static binary, shipped as a tiny Docker image** — ~1.5 MB on a `scratch` base, no JVM, no Python, no userland.
 - **Sub-second cold start, ~11 MB idle RSS** — designed for tight test loops and CI.
 - **Accurate on the surface it covers** — every supported AWS operation has a conformance test that runs the official AWS Python (boto3) + JS SDKs against it. See [`docs/SUPPORT.md`](docs/SUPPORT.md#accuracy-wins-vs-localstack) for the four documented points where nanostack matches AWS and LocalStack does not.
 - **S3 done.** Full v1 surface (bucket lifecycle, object CRUD, copy, listing, multipart, conditional headers, SigV4 + presigned URLs) plus versioning, tagging, ACLs/policies, CORS/encryption/lifecycle/notifications/website, **Object Lock with real WORM enforcement**, restore, replication. More services follow now that the foundation is proven.
@@ -18,30 +18,19 @@ A snappy, accurate AWS emulator for local development, written in Zig.
 
 ## Install
 
-### Homebrew (macOS, Linux)
+### Docker (recommended)
 
 ```sh
-brew tap claudevandort/nanostack
-brew install nanostack
+docker run --rm -p 4566:4566 claudevandort/nanostack:latest
 ```
 
-### Prebuilt tarball
-
-Download from the [GitHub Releases page](https://github.com/claudevandort/nanostack/releases). Available builds:
-
-- `nanostack-v0.1.0-linux-x86_64.tar.gz`
-- `nanostack-v0.1.0-linux-aarch64.tar.gz`
-- `nanostack-v0.1.0-macos-x86_64.tar.gz`
-- `nanostack-v0.1.0-macos-aarch64.tar.gz`
-
-Verify with the published `SHA256SUMS`, then extract:
+To persist buckets across runs, mount a volume on `/data`:
 
 ```sh
-tar -xzf nanostack-v0.1.0-linux-x86_64.tar.gz
-./nanostack --version
+docker run --rm -p 4566:4566 -v "$(mktemp -d):/data" claudevandort/nanostack:latest
 ```
 
-> macOS binaries are unsigned at v0.1.0. Gatekeeper will warn on first launch; right-click → Open, or `xattr -d com.apple.quarantine ./nanostack`. Apple Developer ID notarisation is planned for the next patch.
+Available tags: `:latest`, `:vX.Y.Z` (immutable per release), `:X.Y` (latest patch on this minor). Multi-arch image (`linux/amd64` + `linux/arm64`). Image size: ~1.5 MB (`scratch`-based, fully-static musl binary, no shell or libc inside).
 
 ### Build from source
 

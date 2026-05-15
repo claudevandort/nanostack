@@ -17,7 +17,15 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 ## [Unreleased]
 
 ### Added
+- **Docker-first releases.** `claudevandort/nanostack` is now the primary distribution channel on Docker Hub (multi-arch `linux/amd64` + `linux/arm64`, `scratch` base, ~1.5 MB image). Tags: `:vX.Y.Z` (immutable), `:X.Y`, `:latest`. The release workflow cross-compiles a fully-static musl binary for each arch and pushes via `docker buildx`.
 - **AWS CLI v2 conformance suite** at `tests/conformance/awscli/` — ~10 pytest-driven tests covering high-level `aws s3` commands (`cp`, `cp --recursive`, `sync` including the idempotency check, `mv`, `ls`, `rm --recursive`, `presign`). These commands add client-side logic (recursion, diffing, composite ops) on top of botocore that the boto3 suite doesn't cover. CI verifies `aws --version` reports v2 on the build-test job (pre-installed on GitHub-hosted runners).
+
+### Changed
+- **Linux binaries are now genuinely statically linked** (musl, not glibc). The previous v0.1.0 release shipped glibc-linked binaries despite the README claiming "static". This is the precondition that made the `scratch`-based Docker image possible.
+
+### Removed
+- Per-platform tarballs from the GitHub Release page. The 4 cross-platform `.tar.gz` + `.sha256` + combined `SHA256SUMS` machinery is replaced by the single Docker image.
+- Homebrew tap formula and the `brew-bump` release job. macOS users use Docker Desktop or `zig build` from source.
 
 ### Changed
 - **Wave 3 (drift #16): SigV4 canonical-headers join multi-valued same-name headers with comma**, per the AWS SigV4 spec. Previously `findHeader` returned only the first match, causing `SignatureDoesNotMatch (403)` for any client that sent duplicate same-name headers (multi-line `Cache-Control`, multi-attribute `X-Amz-Object-Attributes`, etc.). Fix is scoped to canonicalisation only; service-layer handlers continue to read single-valued headers via first-match.
