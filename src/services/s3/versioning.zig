@@ -58,7 +58,12 @@ pub fn listObjectVersions(ctx: Context, bucket: []const u8) Result {
         .max_keys = echo.max_keys,
     }) catch |err| return .{ .err = mod.mapStorageErr(err) };
 
-    const body = list_object_versions.renderListVersionsResult(ctx.allocator, bucket, echo, result) catch
-        return .{ .err = .internal_error };
+    const body = list_object_versions.renderListVersionsResult(
+        ctx.allocator,
+        bucket,
+        echo,
+        result,
+        .{ .id = ctx.owner_id, .display_name = ctx.owner_display_name },
+    ) catch return .{ .err = .internal_error };
     return .{ .ok = .{ .status = 200, .body = body } };
 }

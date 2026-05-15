@@ -21,6 +21,9 @@ const xml = @import("xml.zig");
 const storage = @import("../storage/mod.zig");
 const s3_responses = @import("s3_responses.zig");
 const url_encode = @import("url_encode.zig");
+const list_objects = @import("list_objects.zig");
+
+pub const OwnerInfo = list_objects.OwnerInfo;
 
 const xmlns_attr: xml.Attr = .{ .name = "xmlns", .value = "http://s3.amazonaws.com/doc/2006-03-01/" };
 
@@ -49,6 +52,7 @@ pub fn renderListVersionsResult(
     bucket: []const u8,
     echo: Echo,
     result: storage.ListObjectVersionsOutput,
+    owner: OwnerInfo,
 ) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -73,7 +77,7 @@ pub fn renderListVersionsResult(
     try appendText(arena, &children, "IsTruncated", if (result.is_truncated) "true" else "false");
 
     for (result.versions) |v| {
-        try children.append(arena, .{ .element = try renderVersionEntry(arena, v, echo.encoding_type) });
+        try children.append(arena, .{ .element = try renderVersionEntry(arena, v, echo.encoding_type, owner) });
     }
     for (result.common_prefixes) |cp| {
         try children.append(arena, .{ .element = try renderCommonPrefix(arena, cp, echo.encoding_type) });
@@ -96,7 +100,7 @@ fn appendText(arena: Allocator, list: *std.ArrayList(xml.Node), name: []const u8
     try list.append(arena, .{ .element = el });
 }
 
-fn renderVersionEntry(arena: Allocator, v: storage.ObjectVersion, encoding_type: ?[]const u8) !*xml.Element {
+fn renderVersionEntry(arena: Allocator, v: storage.ObjectVersion, encoding_type: ?[]const u8, owner: OwnerInfo) !*xml.Element {
     const lm = try s3_responses.formatIso8601(arena, v.last_modified_unix);
     const size_str = try std.fmt.allocPrint(arena, "{d}", .{v.size});
 
@@ -109,6 +113,21 @@ fn renderVersionEntry(arena: Allocator, v: storage.ObjectVersion, encoding_type:
     const lm_el = try arena.create(xml.Element);
     lm_el.* = .{ .name = "LastModified", .text = lm };
 
+    // AWS-exact: every <Version> and <DeleteMarker> carries an <Owner> block.
+    // Drift table row 7.
+    const id_el = try arena.create(xml.Element);
+    id_el.* = .{ .name = "ID", .text = owner.id };
+    const dn_el = try arena.create(xml.Element);
+    dn_el.* = .{ .name = "DisplayName", .text = owner.display_name };
+    const owner_el = try arena.create(xml.Element);
+    owner_el.* = .{
+        .name = "Owner",
+        .children = try arena.dupe(xml.Node, &.{
+            .{ .element = id_el },
+            .{ .element = dn_el },
+        }),
+    };
+
     const wrapper = try arena.create(xml.Element);
     if (v.is_delete_marker) {
         wrapper.* = .{
@@ -118,6 +137,7 @@ fn renderVersionEntry(arena: Allocator, v: storage.ObjectVersion, encoding_type:
                 .{ .element = vid_el },
                 .{ .element = latest_el },
                 .{ .element = lm_el },
+                .{ .element = owner_el },
             }),
         };
     } else {
@@ -137,6 +157,7 @@ fn renderVersionEntry(arena: Allocator, v: storage.ObjectVersion, encoding_type:
                 .{ .element = etag_el },
                 .{ .element = size_el },
                 .{ .element = sc_el },
+                .{ .element = owner_el },
             }),
         };
     }
@@ -167,7 +188,7 @@ test "render empty result" {
         .next_key_marker = "",
         .next_version_id_marker = "",
     };
-    const body = try renderListVersionsResult(testing.allocator, "buk", .{}, result);
+    const body = try renderListVersionsResult(testing.allocator, "buk", .{}, result, .{ .id = "test", .display_name = "nanostack" });
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "<Name>buk</Name>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "<IsTruncated>false</IsTruncated>") != null);
@@ -186,11 +207,13 @@ test "render one version + one delete marker" {
         .next_key_marker = "",
         .next_version_id_marker = "",
     };
-    const body = try renderListVersionsResult(testing.allocator, "buk", .{}, result);
+    const body = try renderListVersionsResult(testing.allocator, "buk", .{}, result, .{ .id = "test", .display_name = "nanostack" });
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "<Version>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "<DeleteMarker>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "<VersionId>v1</VersionId>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "<VersionId>v2</VersionId>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "<IsLatest>true</IsLatest>") != null);
+    // Owner must be emitted on both <Version> and <DeleteMarker> (drift row 7).
+    try testing.expect(std.mem.indexOf(u8, body, "<Owner><ID>test</ID><DisplayName>nanostack</DisplayName></Owner>") != null);
 }
