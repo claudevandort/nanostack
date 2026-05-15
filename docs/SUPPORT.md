@@ -46,7 +46,7 @@ Behavioural drift surfaced by a 2026-05-14 audit. Distinct from the "accept-stor
 | 13 | Multipart | `CompleteMultipartUpload` doesn't cap part list at 10000 | todo | [`src/services/s3/multipart.zig`](../src/services/s3/multipart.zig) | — |
 | 14 | Multipart | Empty `<Part>` list returns `InvalidRequest` — AWS returns `MalformedXML` | todo | [`src/wire/complete_multipart_parser.zig:97`](../src/wire/complete_multipart_parser.zig) | — |
 | 15 | SigV4 | `parseAmzDate` accepts Feb 30 (no day-in-month check) | todo | [`src/auth/iso8601.zig:13`](../src/auth/iso8601.zig) | — |
-| 16 | SigV4 | Multi-valued same-name headers: `findHeader` returns first match only — AWS joins with commas in canonical form | todo | [`src/auth/canonical.zig:180`](../src/auth/canonical.zig) | — |
+| 16 | SigV4 | Multi-valued same-name headers: `findHeader` returns first match only — AWS joins with commas in canonical form | done | [`src/auth/canonical.zig`](../src/auth/canonical.zig) | [`test_sigv4.py::test_sigv4_multi_value_header_signs_and_authenticates`](../tests/conformance/python/test_sigv4.py) |
 | 17 | SigV4 | Uppercase hex `x-amz-content-sha256` falls through to "opaque" branch — body integrity check silently skipped | todo | [`src/auth/sigv4.zig:340`](../src/auth/sigv4.zig) | — |
 | 18 | Conditional | `parseHttpDate` strict IMF-fixdate only — rejects ISO 8601 in `If-Modified-Since` | todo | [`src/http/date.zig:30`](../src/http/date.zig) | — |
 | 19 | Routing | Virtual-host parser treats any host with a dot as `<bucket>.<rest>` — `s3.amazonaws.com` would set bucket=`s3` | todo | [`src/router.zig:249`](../src/router.zig) | — |

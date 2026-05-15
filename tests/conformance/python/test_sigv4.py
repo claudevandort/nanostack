@@ -167,3 +167,65 @@ def test_no_auth_flag_accepts_anonymous():
         except subprocess.TimeoutExpired:
             pass
         shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def test_sigv4_multi_value_header_signs_and_authenticates():
+    """AWS SigV4 spec: when a request has multiple headers with the same
+    name, the canonical-headers form joins their values with `,` before
+    hashing. Clients sign the joined form; servers must compute the same.
+
+    Pre-fix, nanostack's `findHeader` returned the first match only —
+    canonical strings diverged → 403 SignatureDoesNotMatch. Drift #16.
+
+    `requests` / `urllib3` dedupe same-name headers, so we drop to
+    `http.client.HTTPConnection.putheader` (preserves duplicates over the
+    wire). Sign with the joined form via botocore's SigV4Auth, then send
+    two separate header lines + Authorization.
+    """
+    import http.client
+    import datetime as _dt
+    from urllib.parse import urlparse
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    parsed = urlparse(endpoint())
+    host = parsed.hostname
+    port = parsed.port or 80
+
+    # Build the signed request with cache-control in the AWS-canonical
+    # joined form ("no-cache,max-age=0" — no space after the comma).
+    now = _dt.datetime.now(_dt.timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    req = AWSRequest(
+        method="GET",
+        url=endpoint() + "/",
+        data=b"",
+        headers={
+            "host": endpoint_host(),
+            "x-amz-date": amz_date,
+            "x-amz-content-sha256": SHA256_EMPTY,
+            "cache-control": "no-cache,max-age=0",
+        },
+    )
+    SigV4Auth(aws_test_credentials(), "s3", "us-east-1").add_auth(req)
+    auth_header = req.headers["Authorization"]
+
+    # Send over the wire with two SEPARATE cache-control header lines.
+    # Server must canonicalise as `cache-control:no-cache,max-age=0` and
+    # verify the signature.
+    conn = http.client.HTTPConnection(host, port, timeout=10)
+    try:
+        conn.putrequest("GET", "/", skip_host=True, skip_accept_encoding=True)
+        conn.putheader("host", endpoint_host())
+        conn.putheader("x-amz-date", amz_date)
+        conn.putheader("x-amz-content-sha256", SHA256_EMPTY)
+        conn.putheader("cache-control", "no-cache")
+        conn.putheader("cache-control", "max-age=0")
+        conn.putheader("authorization", auth_header)
+        conn.endheaders()
+        resp = conn.getresponse()
+        body = resp.read()
+        assert resp.status == 200, \
+            f"expected 200 (signature verified after comma-joining cache-control), got {resp.status}: {body!r}"
+    finally:
+        conn.close()
