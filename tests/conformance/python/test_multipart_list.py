@@ -5,6 +5,7 @@ from botocore.exceptions import ClientError
 from conftest import (
     best_effort_delete_bucket,
     empty_bucket,
+    sign_and_send,
 )
 
 
@@ -116,4 +117,29 @@ def test_multipart_list_parts_pagination(s3, bucket_name):
             except ClientError:
                 pass
         empty_bucket(s3, bucket_name)
+        best_effort_delete_bucket(s3, bucket_name)
+
+
+def test_multipart_list_emits_empty_prefix_and_delimiter(s3, bucket_name):
+    """AWS-exact: ListMultipartUploads emits <Prefix></Prefix> and
+    <Delimiter></Delimiter> even when neither query param is set. boto3
+    swallows empty XML elements, so we sign + send raw to inspect the body.
+    Drift table row 9.
+    """
+    s3.create_bucket(Bucket=bucket_name)
+    init = None
+    try:
+        init = s3.create_multipart_upload(Bucket=bucket_name, Key="k")
+        resp = sign_and_send("GET", f"/{bucket_name}?uploads")
+        assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+        assert "<Prefix></Prefix>" in resp.text, \
+            f"expected empty <Prefix></Prefix> in body, got: {resp.text}"
+        assert "<Delimiter></Delimiter>" in resp.text, \
+            f"expected empty <Delimiter></Delimiter> in body, got: {resp.text}"
+    finally:
+        if init is not None:
+            try:
+                s3.abort_multipart_upload(Bucket=bucket_name, Key="k", UploadId=init["UploadId"])
+            except ClientError:
+                pass
         best_effort_delete_bucket(s3, bucket_name)

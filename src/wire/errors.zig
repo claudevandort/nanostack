@@ -271,7 +271,7 @@ test "renders NoSuchBucket body with resource and override message" {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
             "<Error><Code>NoSuchBucket</Code><Message>custom</Message>" ++
             "<Resource>/mybucket</Resource>" ++
-            "<RequestId>RID</RequestId><HostId/></Error>",
+            "<RequestId>RID</RequestId><HostId></HostId></Error>",
         body,
     );
 }
@@ -288,7 +288,7 @@ test "escapes special chars in resource" {
             "<Error><Code>NoSuchKey</Code>" ++
             "<Message>The specified key does not exist.</Message>" ++
             "<Resource>/b/key&amp;&lt;&gt;</Resource>" ++
-            "<RequestId>R</RequestId><HostId/></Error>",
+            "<RequestId>R</RequestId><HostId></HostId></Error>",
         body,
     );
 }

@@ -58,9 +58,8 @@ pub fn renderListObjectsV1(
     }
     const max_keys_str = try std.fmt.allocPrint(arena, "{d}", .{echo.max_keys});
     try appendTextChild(arena, &children, "MaxKeys", max_keys_str);
-    if (echo.delimiter.len > 0) {
-        try appendTextChild(arena, &children, "Delimiter", echo.delimiter);
-    }
+    // AWS-exact: emit Delimiter unconditionally (even empty). Drift table row 9.
+    try appendTextChild(arena, &children, "Delimiter", echo.delimiter);
     if (echo.encoding_type) |et| {
         try appendTextChild(arena, &children, "EncodingType", et);
     }
@@ -106,9 +105,8 @@ pub fn renderListObjectsV2(
     if (echo.start_after) |sa| {
         try appendTextChild(arena, &children, "StartAfter", sa);
     }
-    if (echo.delimiter.len > 0) {
-        try appendTextChild(arena, &children, "Delimiter", echo.delimiter);
-    }
+    // AWS-exact: emit Delimiter unconditionally (even empty). Drift table row 9.
+    try appendTextChild(arena, &children, "Delimiter", echo.delimiter);
     const max_keys_str = try std.fmt.allocPrint(arena, "{d}", .{echo.max_keys});
     try appendTextChild(arena, &children, "MaxKeys", max_keys_str);
     if (echo.encoding_type) |et| {

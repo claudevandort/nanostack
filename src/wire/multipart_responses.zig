@@ -88,8 +88,10 @@ pub fn renderListMultipartUploadsResult(
         try appendText(arena, &children, "NextKeyMarker", result.next_key_marker);
         try appendText(arena, &children, "NextUploadIdMarker", result.next_upload_id_marker);
     }
-    if (echo.delimiter.len > 0) try appendText(arena, &children, "Delimiter", echo.delimiter);
-    if (echo.prefix.len > 0) try appendText(arena, &children, "Prefix", echo.prefix);
+    // AWS-exact: emit Prefix and Delimiter unconditionally, even when empty.
+    // Drift table row 9.
+    try appendText(arena, &children, "Delimiter", echo.delimiter);
+    try appendText(arena, &children, "Prefix", echo.prefix);
     const max_str = try std.fmt.allocPrint(arena, "{d}", .{echo.max_uploads});
     try appendText(arena, &children, "MaxUploads", max_str);
     if (echo.encoding_type) |et| try appendText(arena, &children, "EncodingType", et);

@@ -54,7 +54,8 @@ pub fn renderListVersionsResult(
     }
     const max_str = try std.fmt.allocPrint(arena, "{d}", .{echo.max_keys});
     try appendText(arena, &children, "MaxKeys", max_str);
-    if (echo.delimiter.len > 0) try appendText(arena, &children, "Delimiter", echo.delimiter);
+    // AWS-exact: emit Delimiter unconditionally (Prefix already is). Drift row 9.
+    try appendText(arena, &children, "Delimiter", echo.delimiter);
     if (echo.encoding_type) |et| try appendText(arena, &children, "EncodingType", et);
     try appendText(arena, &children, "IsTruncated", if (result.is_truncated) "true" else "false");
 
