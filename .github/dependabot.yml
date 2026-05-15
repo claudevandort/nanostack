@@ -1,44 +1,11 @@
 version: 2
 
+# Dev/CI dependencies (pip, npm) aren't shipped to users — they only affect
+# our own test pipeline, and CI catches breakage if any bump actually
+# regresses something. The cost/benefit of weekly PRs for those didn't pay
+# off (PRs piled up, no one merged them). We keep only GitHub Actions
+# version bumps, where deprecation breaks CI silently if ignored.
 updates:
-  # Python conformance suite.
-  - package-ecosystem: pip
-    directory: /tests/conformance/python
-    schedule:
-      interval: weekly
-    groups:
-      python-deps:
-        patterns: ["*"]
-
-  # Python bench driver.
-  - package-ecosystem: pip
-    directory: /bench
-    schedule:
-      interval: weekly
-    groups:
-      bench-deps:
-        patterns: ["*"]
-
-  # AWS CLI conformance suite (pytest only — the `aws` CLI itself is
-  # pre-installed on GitHub runners and not pip-managed).
-  - package-ecosystem: pip
-    directory: /tests/conformance/awscli
-    schedule:
-      interval: weekly
-    groups:
-      awscli-deps:
-        patterns: ["*"]
-
-  # JS conformance suite.
-  - package-ecosystem: npm
-    directory: /tests/conformance/js
-    schedule:
-      interval: weekly
-    groups:
-      js-deps:
-        patterns: ["*"]
-
-  # GitHub Actions used by .github/workflows/*.yml.
   - package-ecosystem: github-actions
     directory: /
     schedule:
