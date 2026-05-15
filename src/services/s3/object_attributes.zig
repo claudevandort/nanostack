@@ -4,6 +4,7 @@
 const std = @import("std");
 const storage = @import("../../storage/mod.zig");
 const oa_wire = @import("../../wire/object_attributes.zig");
+const s3_responses = @import("../../wire/s3_responses.zig");
 const preconditions = @import("preconditions.zig");
 const mod = @import("mod.zig");
 
@@ -38,8 +39,17 @@ pub fn getObjectAttributes(ctx: Context, bucket: []const u8, key: []const u8) Re
     const body = oa_wire.render(ctx.allocator, sel, attrs) catch return .{ .err = .internal_error };
 
     var hs: std.ArrayList(mod.Header) = .empty;
+    // AWS-exact: GetObjectAttributes surfaces Last-Modified (HTTP-date) on every
+    // response, plus x-amz-delete-marker when the targeted version is a delete
+    // marker. Drift table row 10.
+    const last_modified = s3_responses.formatHttpDate(ctx.allocator, meta.last_modified_unix) catch
+        return .{ .err = .internal_error };
+    hs.append(ctx.allocator, .{ .name = "Last-Modified", .value = last_modified }) catch return .{ .err = .internal_error };
     if (meta.version_id.len > 0) {
         hs.append(ctx.allocator, .{ .name = "x-amz-version-id", .value = meta.version_id }) catch return .{ .err = .internal_error };
+    }
+    if (meta.is_delete_marker) {
+        hs.append(ctx.allocator, .{ .name = "x-amz-delete-marker", .value = "true" }) catch return .{ .err = .internal_error };
     }
     const extras = hs.toOwnedSlice(ctx.allocator) catch return .{ .err = .internal_error };
     return .{ .ok = .{ .status = 200, .body = body, .extra_headers = extras } };
