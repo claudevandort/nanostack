@@ -11,12 +11,8 @@ permissions:
 
 jobs:
   build-test:
-    name: build + test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: build + test
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -115,11 +111,9 @@ jobs:
             echo "::endgroup::"
           fi
 
-      # PR-level smoke check for the Docker release path. ubuntu-latest only —
-      # the release workflow that actually publishes only targets linux/amd64
-      # + linux/arm64, so verifying the build on macOS adds little signal.
-      - name: Verify Dockerfile builds + binary runs (ubuntu-latest only)
-        if: runner.os == 'Linux'
+      # PR-level smoke check for the Docker release path. The release
+      # workflow only targets linux/amd64 + linux/arm64.
+      - name: Verify Dockerfile builds + binary runs
         run: |
           zig build release -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast -Dstrip=true
           mv zig-out/release/x86_64-linux-musl/nanostack ./nanostack-amd64
