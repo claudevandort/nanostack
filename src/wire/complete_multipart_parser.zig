@@ -23,6 +23,10 @@ pub const Result = struct {
 
 pub const ParseError = error{
     InvalidBody,
+    /// Body is well-formed XML but the structural rule fails (e.g. empty
+    /// `<Part>` list). AWS uses `MalformedXML` for these — distinct from
+    /// `InvalidRequest` (malformed XML *parse*).
+    MalformedXml,
     InvalidPartOrder,
     OutOfMemory,
 };
@@ -94,7 +98,7 @@ pub fn parse(allocator: Allocator, body: []const u8) ParseError!Result {
         }
     }
 
-    if (parts.items.len == 0) return ParseError.InvalidBody;
+    if (parts.items.len == 0) return ParseError.MalformedXml;
     return .{ .parts = parts.toOwnedSlice(allocator) catch return ParseError.OutOfMemory };
 }
 
@@ -145,9 +149,9 @@ test "parse: duplicate part number → InvalidPartOrder" {
     try testing.expectError(ParseError.InvalidPartOrder, parse(testing.allocator, body));
 }
 
-test "parse: empty body → InvalidBody" {
+test "parse: empty <Part> list → MalformedXml" {
     const body = "<CompleteMultipartUpload></CompleteMultipartUpload>";
-    try testing.expectError(ParseError.InvalidBody, parse(testing.allocator, body));
+    try testing.expectError(ParseError.MalformedXml, parse(testing.allocator, body));
 }
 
 test "parse: malformed → InvalidBody" {

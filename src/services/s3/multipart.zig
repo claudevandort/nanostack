@@ -176,6 +176,7 @@ pub fn completeMultipartUpload(ctx: Context, bucket: []const u8, key: []const u8
     // Parse XML body.
     const parsed = complete_parser.parse(ctx.allocator, ctx.request.body) catch |err| switch (err) {
         complete_parser.ParseError.InvalidBody => return .{ .err = .invalid_request },
+        complete_parser.ParseError.MalformedXml => return .{ .err = .malformed_xml },
         complete_parser.ParseError.InvalidPartOrder => return .{ .err = .invalid_part_order },
         complete_parser.ParseError.OutOfMemory => return .{ .err = .internal_error },
     };

@@ -147,6 +147,33 @@ def test_multipart_complete_with_unknown_upload_id_returns_no_such_upload(s3, bu
         best_effort_delete_bucket(s3, bucket_name)
 
 
+def test_multipart_complete_empty_part_list_returns_malformed_xml(s3, bucket_name):
+    """AWS: CompleteMultipartUpload with empty <Part> list → MalformedXML (400).
+    Drift table row 14. Previously surfaced as InvalidRequest (wrong code).
+    """
+    s3.create_bucket(Bucket=bucket_name)
+    upload_id = None
+    try:
+        init = s3.create_multipart_upload(Bucket=bucket_name, Key="k")
+        upload_id = init["UploadId"]
+
+        body = b"<CompleteMultipartUpload></CompleteMultipartUpload>"
+        resp = sign_and_send(
+            "POST", f"/{bucket_name}/k?uploadId={upload_id}",
+            body=body,
+            headers={"content-type": "application/xml"},
+        )
+        assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text}"
+        assert "<Code>MalformedXML</Code>" in resp.text
+    finally:
+        if upload_id is not None:
+            try:
+                s3.abort_multipart_upload(Bucket=bucket_name, Key="k", UploadId=upload_id)
+            except ClientError:
+                pass
+        best_effort_delete_bucket(s3, bucket_name)
+
+
 def test_multipart_complete_part_list_over_10000_returns_invalid_request(s3, bucket_name):
     """AWS caps the part list at 10000. Drift table row 13.
 
