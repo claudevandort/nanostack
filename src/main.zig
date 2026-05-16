@@ -31,7 +31,15 @@ pub fn main(init: std.process.Init) !void {
     const profile_root = try std.fmt.allocPrint(arena, "{s}/profiles/{s}", .{ data_dir, config.profile });
     const fs = try FsBackend.init(arena, init.io, profile_root);
     defer fs.deinit();
-    try server.run(arena, &config, init, fs.backend());
+
+    // DynamoDB backend is opt-in via --services. Default `s3` keeps the
+    // M15 surface invisible until the user asks for it.
+    const dynamo_backend: ?storage.DynamoBackend = if (config.hasService("dynamodb"))
+        fs.dynamoBackend()
+    else
+        null;
+
+    try server.run(arena, &config, init, fs.backend(), dynamo_backend);
 }
 
 fn resolveDataDir(

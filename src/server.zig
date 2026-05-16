@@ -15,11 +15,15 @@ const authz = @import("auth/authz.zig");
 const storage = @import("storage/mod.zig");
 const fs_backend = @import("storage/fs.zig");
 const s3 = @import("services/s3/mod.zig");
+const dynamodb = @import("services/dynamodb/mod.zig");
+const ddb_errors = @import("wire/dynamodb/errors.zig");
 
 pub const App = struct {
     config: *const cli.Config,
     io: std.Io,
     backend: storage.Backend,
+    /// DynamoDB backend, present when `--services` includes `dynamodb`.
+    dynamo_backend: ?storage.DynamoBackend = null,
 
     /// `handle` takeover circumvents httpz's pattern router so our service
     /// layer sees every request. AWS APIs are not a fit for path-pattern
@@ -54,7 +58,26 @@ pub const App = struct {
             (req.body() orelse @as([]const u8, "")).len,
         });
 
-        // ---------- SigV4 verification ----------
+        // ---------- Service detection ----------
+        //
+        // DynamoDB requests carry an `X-Amz-Target` header; S3 doesn't.
+        // That single signal is reliable across boto3, aws-cli, and every
+        // SDK we've seen. The SigV4 service-name validation (below) then
+        // catches mismatched-credential-scope attacks.
+        const target_header = req.header("x-amz-target") orelse req.header("X-Amz-Target");
+        const is_ddb = target_header != null;
+
+        if (is_ddb) {
+            if (!self.config.hasService("dynamodb")) {
+                return respondDdbError(res, request_id, host_id, .{
+                    .code = .validation_exception,
+                    .message = "DynamoDB is not enabled. Restart nanostack with --services s3,dynamodb.",
+                });
+            }
+            return handleDynamo(self, req, res, arena, request_id, host_id, target_header.?);
+        }
+
+        // ---------- SigV4 verification (S3) ----------
         //
         // Returns a `Principal` (anonymous when no auth headers present,
         // aws_account when SigV4 verification passed). All other failure
@@ -150,6 +173,119 @@ pub const App = struct {
         }
     }
 };
+
+fn handleDynamo(
+    self: *App,
+    req: *httpz.Request,
+    res: *httpz.Response,
+    arena: Allocator,
+    request_id: []const u8,
+    host_id: []const u8,
+    target_header: []const u8,
+) void {
+    // SigV4 with service="dynamodb". DDB doesn't have an anonymous path;
+    // unsigned requests fail at the verify step. `--no-auth` still
+    // bypasses everything.
+    if (!self.config.no_auth) {
+        const verify_headers = collectHeaders(arena, req) catch {
+            return respondDdbError(res, request_id, host_id, .{ .code = .internal_server_error });
+        };
+        _ = sigv4.verify(arena, .{
+            .method = if (req.method == .OTHER) req.method_string else @tagName(req.method),
+            .path = req.url.path,
+            .query = req.url.query,
+            .headers = verify_headers,
+            .body = req.body() orelse "",
+        }, .{
+            .access_key = self.config.access_key,
+            .secret_key = self.config.secret_key,
+        }, .{
+            .region = self.config.region,
+            .service = "dynamodb",
+            .now_unix = fs_backend.nowUnixSeconds(self.io),
+            .skew_tolerance_seconds = self.config.skew_seconds,
+        }) catch {
+            // DDB collapses all auth-time failures onto a flat 400
+            // ValidationException — there's no SignatureDoesNotMatch JSON
+            // shape published in the official Smithy. Match observed AWS.
+            return respondDdbError(res, request_id, host_id, .{
+                .code = .validation_exception,
+                .message = "The security token included in the request is invalid.",
+            });
+        };
+    }
+
+    // Strip the `DynamoDB_20120810.` prefix. Anything else (e.g. the
+    // Streams sub-service `DynamoDBStreams_20120810.*`) is rejected with
+    // ValidationException — Phase 1 only handles the core service.
+    if (!std.mem.startsWith(u8, target_header, dynamodb.target_prefix)) {
+        return respondDdbError(res, request_id, host_id, .{
+            .code = .validation_exception,
+            .message = "Only DynamoDB_20120810 targets are supported.",
+        });
+    }
+    const target = target_header[dynamodb.target_prefix.len..];
+
+    const all_headers = collectHeaders(arena, req) catch {
+        return respondDdbError(res, request_id, host_id, .{ .code = .internal_server_error });
+    };
+    const svc_headers = arena.alloc(storage.Header, all_headers.len) catch {
+        return respondDdbError(res, request_id, host_id, .{ .code = .internal_server_error });
+    };
+    for (all_headers, 0..) |h, i| svc_headers[i] = .{ .name = h.name, .value = h.value };
+
+    const result = dynamodb.handle(.{
+        .backend = self.dynamo_backend orelse unreachable, // gated by --services check upstream
+        .allocator = arena,
+        .region = self.config.region,
+        .request = .{
+            .headers = svc_headers,
+            .body = req.body() orelse "",
+            .target = target,
+        },
+    });
+
+    switch (result) {
+        .ok => |out| respondDdbOk(res, request_id, host_id, out),
+        .err => |e| respondDdbError(res, request_id, host_id, e),
+    }
+}
+
+fn respondDdbOk(
+    res: *httpz.Response,
+    request_id: []const u8,
+    host_id: []const u8,
+    out: dynamodb.Output,
+) void {
+    res.status = out.status;
+    res.header("x-amz-request-id", request_id);
+    res.header("x-amzn-RequestId", request_id);
+    res.header("x-amz-id-2", host_id);
+    for (out.extra_headers) |h| res.header(h.name, h.value);
+    res.header("Content-Type", "application/x-amz-json-1.0");
+    res.content_type = null;
+    res.body = out.body;
+}
+
+fn respondDdbError(
+    res: *httpz.Response,
+    request_id: []const u8,
+    host_id: []const u8,
+    e: dynamodb.ErrorBody,
+) void {
+    const body = ddb_errors.render(res.arena, e.code, e.message) catch {
+        res.status = 500;
+        res.body = "";
+        return;
+    };
+    res.status = e.code.httpStatus();
+    res.header("x-amz-request-id", request_id);
+    res.header("x-amzn-RequestId", request_id);
+    res.header("x-amz-id-2", host_id);
+    res.header("Content-Type", "application/x-amz-json-1.0");
+    res.content_type = null;
+    res.body = body;
+}
 
 fn mapVerifyError(e: sigv4.VerifyError) errors.Code {
     return switch (e) {
@@ -270,6 +406,7 @@ pub fn run(
     config: *const cli.Config,
     init: std.process.Init,
     backend: storage.Backend,
+    dynamo_backend: ?storage.DynamoBackend,
 ) !void {
     const address = try std.Io.net.IpAddress.parse(config.bind, config.port);
 
@@ -288,7 +425,7 @@ pub fn run(
         return;
     }
 
-    var app: App = .{ .config = config, .io = init.io, .backend = backend };
+    var app: App = .{ .config = config, .io = init.io, .backend = backend, .dynamo_backend = dynamo_backend };
     // Allow up to 64 MiB request bodies. AWS S3 caps single-PUT and
     // per-part uploads at 5 GiB, but httpz preallocates a per-worker pool
     // sized by `max_body_size` — anything close to AWS's ceiling OOMs the

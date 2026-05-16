@@ -65,6 +65,28 @@ Each row below is one S3 operation or cross-cutting capability. Status is one of
 
 The "Milestone" column points at the release tag in which the capability landed. If you need a behaviour that's not on this matrix, file an issue — we'd rather be honest about gaps than over-promise. The source of truth for the v1 scope (the surface we aim to cover by `v0.0.1`) is [`PRD.md`](PRD.md) §8.
 
+## DynamoDB
+
+DynamoDB is the second AWS service nanostack covers, opt-in via `--services s3,dynamodb`. The v0.2.0 (M15) scope is 18 ops covering table CRUD, item CRUD with full expression-evaluation, Query (incl. queryable GSI/LSI), Scan, batch ops, and transactions. See the M15 plan for the full IN/OUT matrix and rationale.
+
+| Operation | Status | Milestone |
+|---|---|---|
+| ListTables | supported (stub — empty list only) | M15-scaffold |
+| CreateTable / DescribeTable / DeleteTable / UpdateTable | planned | M15-tables |
+| GetItem / PutItem / DeleteItem | planned | M15-items |
+| UpdateItem (with UpdateExpression) | planned | M15-expressions |
+| Query (incl. GSI/LSI) | planned | M15-query / M15-gsi |
+| Scan | planned | M15-scan |
+| BatchGetItem / BatchWriteItem | planned | M15-batch |
+| TransactGetItems / TransactWriteItems | planned | M15-tx |
+| TagResource / UntagResource / ListTagsOfResource / DescribeLimits | planned | M15-polish |
+
+Documented divergences (intentional, won't change in v0.2.0):
+- **Bucket-policy-style `Condition` blocks are skipped** in IAM policies (same caveat as S3 M14). Not applicable to DynamoDB resource policies since we don't model IAM at all.
+- **Streams, PartiQL, Backups/PITR, Global Tables, DAX, Imports/Exports** — out of v0.2.0 scope. Returned as `ValidationException` (unknown target) for now.
+- **Parallel scan (`TotalSegments > 1`)** will return `ValidationException`.
+- **GSI auto-fetch-from-base-table** for non-projected attrs is a client-SDK behavior; nanostack returns only the projected attrs.
+
 ## S3
 
 ### v1 — must-have
