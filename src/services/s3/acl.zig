@@ -1,15 +1,14 @@
-//! S3 ACL service handlers (M10).
+//! S3 ACL service handlers.
 //!
 //! 4 handlers: Put/Get on bucket and object. AWS has no DeleteAcl op;
 //! the canned `private` value resets an ACL.
-//!
-//! Accept-store-roundtrip — no enforcement.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const storage = @import("../../storage/mod.zig");
 const acl_parser = @import("../../wire/acl_parser.zig");
 const acl_responses = @import("../../wire/acl_responses.zig");
+const pab_gate = @import("../../auth/pab_gate.zig");
 const mod = @import("mod.zig");
 
 const Context = mod.Context;
@@ -66,6 +65,7 @@ pub fn putBucketAcl(ctx: Context, bucket: []const u8) Result {
         .err => |c| return .{ .err = c },
         .ok => |acl| {
             defer acl_parser.freeAclOwned(ctx.allocator, acl);
+            if (pabGate(ctx, bucket, acl)) |code| return .{ .err = code };
             ctx.backend.putBucketAcl(bucket, acl) catch |err| return .{ .err = mod.mapStorageErr(err) };
             return .{ .ok = .{ .status = 200, .body = "" } };
         },
@@ -85,6 +85,7 @@ pub fn putObjectAcl(ctx: Context, bucket: []const u8, key: []const u8) Result {
         .err => |c| return .{ .err = c },
         .ok => |acl| {
             defer acl_parser.freeAclOwned(ctx.allocator, acl);
+            if (pabGate(ctx, bucket, acl)) |code| return .{ .err = code };
             ctx.backend.putObjectAcl(bucket, key, version_id, acl) catch |err| return .{ .err = mod.mapStorageErr(err) };
             if (version_id) |vid| {
                 const hs = ctx.allocator.dupe(mod.Header, &.{
@@ -109,4 +110,18 @@ pub fn getObjectAcl(ctx: Context, bucket: []const u8, key: []const u8) Result {
         return .{ .ok = .{ .status = 200, .body = body, .extra_headers = hs } };
     }
     return .{ .ok = .{ .status = 200, .body = body } };
+}
+
+/// Returns an error code if this ACL is "public-granting" and the bucket's
+/// PAB has BlockPublicAcls on. Otherwise null. Bucket lookup errors are
+/// treated as "no PAB" — the put proceeds and the storage layer surfaces
+/// any real NoSuchBucket from the actual write.
+fn pabGate(ctx: Context, bucket: []const u8, acl: storage.Acl) ?mod.errors.Code {
+    const pab = ctx.backend.getPublicAccessBlock(bucket) catch |err| switch (err) {
+        storage.Error.NoSuchPublicAccessBlockConfiguration, storage.Error.NoSuchBucket => return null,
+        else => return mod.mapStorageErr(err),
+    };
+    if (!pab.block_public_acls) return null;
+    if (!pab_gate.aclIsPublicGranting(acl)) return null;
+    return .access_denied;
 }
