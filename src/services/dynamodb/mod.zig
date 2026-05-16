@@ -16,6 +16,7 @@ const tables = @import("tables.zig");
 const items_handler = @import("items.zig");
 const query_handler = @import("query.zig");
 const scan_handler = @import("scan.zig");
+const batch_handler = @import("batch.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -85,6 +86,10 @@ pub fn handle(ctx: Context) Result {
 
     // Scan (M15-scan, Phase 6).
     if (std.mem.eql(u8, target, "Scan")) return scan_handler.scan(ctx);
+
+    // Batch ops (M15-batch, Phase 7).
+    if (std.mem.eql(u8, target, "BatchGetItem")) return batch_handler.batchGetItem(ctx);
+    if (std.mem.eql(u8, target, "BatchWriteItem")) return batch_handler.batchWriteItem(ctx);
 
     // Anything else gets 400 ValidationException with a message that
     // names the unsupported target. AWS-correct: unknown targets return
