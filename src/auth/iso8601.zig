@@ -23,7 +23,7 @@ pub fn parseAmzDate(s: []const u8) Error!i64 {
 
     if (year < 1970 or year > 9999) return Error.Malformed;
     if (month < 1 or month > 12) return Error.Malformed;
-    if (day < 1 or day > 31) return Error.Malformed;
+    if (day < 1 or day > daysInMonth(year, month)) return Error.Malformed;
     if (hour > 23 or min > 59 or sec > 60) return Error.Malformed;
 
     const days = daysFromCivil(year, month, day);
@@ -65,6 +65,21 @@ pub fn formatScopeDate(buf: *[8]u8, unix_seconds: i64) void {
 
 fn parseUnsigned(comptime T: type, s: []const u8) !T {
     return std.fmt.parseInt(T, s, 10);
+}
+
+fn isLeapYear(year: i32) bool {
+    if (@mod(year, 4) != 0) return false;
+    if (@mod(year, 100) != 0) return true;
+    return @mod(year, 400) == 0;
+}
+
+fn daysInMonth(year: i32, month: u32) u32 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) @as(u32, 29) else @as(u32, 28),
+        else => 0,
+    };
 }
 
 /// Howard Hinnant's days_from_civil — returns days since 1970-01-01 for
@@ -111,6 +126,28 @@ test "parseAmzDate: malformed separators" {
 
 test "parseAmzDate: out-of-range month" {
     try testing.expectError(Error.Malformed, parseAmzDate("20150030T123600Z"));
+}
+
+test "parseAmzDate: Feb 30 → Malformed" {
+    // Day-in-month must be honoured per the AWS spec.
+    try testing.expectError(Error.Malformed, parseAmzDate("20260230T000000Z"));
+}
+
+test "parseAmzDate: Feb 29 in non-leap year → Malformed" {
+    // 2023 is not a leap year.
+    try testing.expectError(Error.Malformed, parseAmzDate("20230229T000000Z"));
+}
+
+test "parseAmzDate: Apr 31 → Malformed" {
+    try testing.expectError(Error.Malformed, parseAmzDate("20240431T000000Z"));
+}
+
+test "parseAmzDate: leap-year edge — 2000 (div by 400) is leap" {
+    try testing.expectEqual(@as(i64, 951782400), try parseAmzDate("20000229T000000Z"));
+}
+
+test "parseAmzDate: leap-year edge — 2100 (div by 100, not 400) is not leap" {
+    try testing.expectError(Error.Malformed, parseAmzDate("21000229T000000Z"));
 }
 
 test "formatAmzDate: round trip" {
