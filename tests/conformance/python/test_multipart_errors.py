@@ -1,6 +1,7 @@
 """Multipart upload error-path conformance."""
 
 import pytest
+import requests
 from botocore.exceptions import ClientError
 
 from conftest import (
@@ -10,6 +11,7 @@ from conftest import (
     best_effort_delete_bucket,
     empty_bucket,
     make_payload,
+    sign_and_send,
 )
 
 
@@ -142,4 +144,40 @@ def test_multipart_complete_with_unknown_upload_id_returns_no_such_upload(s3, bu
         assert aws_http_status(ei.value) == 404, \
             f"expected 404, got {aws_http_status(ei.value)}"
     finally:
+        best_effort_delete_bucket(s3, bucket_name)
+
+
+def test_multipart_complete_part_list_over_10000_returns_invalid_request(s3, bucket_name):
+    """AWS caps the part list at 10000. Drift table row 13.
+
+    Build a fabricated CompleteMultipartUpload body with 10001 <Part> entries
+    and send it directly (boto3 would happily forward the oversized list).
+    The cap check fires before nanostack tries to look up actual part sizes,
+    so the fake ETags don't matter.
+    """
+    s3.create_bucket(Bucket=bucket_name)
+    upload_id = None
+    try:
+        init = s3.create_multipart_upload(Bucket=bucket_name, Key="k")
+        upload_id = init["UploadId"]
+
+        parts_xml = "".join(
+            f"<Part><PartNumber>{n}</PartNumber><ETag>\"deadbeef\"</ETag></Part>"
+            for n in range(1, 10002)
+        )
+        body = f"<CompleteMultipartUpload>{parts_xml}</CompleteMultipartUpload>".encode()
+
+        resp = sign_and_send(
+            "POST", f"/{bucket_name}/k?uploadId={upload_id}",
+            body=body,
+            headers={"content-type": "application/xml"},
+        )
+        assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text}"
+        assert "<Code>InvalidRequest</Code>" in resp.text
+    finally:
+        if upload_id is not None:
+            try:
+                s3.abort_multipart_upload(Bucket=bucket_name, Key="k", UploadId=upload_id)
+            except ClientError:
+                pass
         best_effort_delete_bucket(s3, bucket_name)

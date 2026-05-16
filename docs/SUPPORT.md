@@ -43,7 +43,7 @@ Behavioural drift surfaced by a 2026-05-14 audit. Distinct from the "accept-stor
 | # | Area | What drifts | Status | Code | Test |
 |---|---|---|---|---|---|
 | 12 | Validation | Object key UTF-8 well-formedness not checked — length only | done | [`src/storage/mod.zig`](../src/storage/mod.zig) | unit: `validateObjectKey: rejects invalid UTF-8` in [`src/storage/mod.zig`](../src/storage/mod.zig) |
-| 13 | Multipart | `CompleteMultipartUpload` doesn't cap part list at 10000 | todo | [`src/services/s3/multipart.zig`](../src/services/s3/multipart.zig) | — |
+| 13 | Multipart | `CompleteMultipartUpload` doesn't cap part list at 10000 | done | [`src/services/s3/multipart.zig`](../src/services/s3/multipart.zig) | [`test_multipart_errors.py::test_multipart_complete_part_list_over_10000_returns_invalid_request`](../tests/conformance/python/test_multipart_errors.py) |
 | 14 | Multipart | Empty `<Part>` list returns `InvalidRequest` — AWS returns `MalformedXML` | todo | [`src/wire/complete_multipart_parser.zig:97`](../src/wire/complete_multipart_parser.zig) | — |
 | 15 | SigV4 | `parseAmzDate` accepts Feb 30 (no day-in-month check) | todo | [`src/auth/iso8601.zig:13`](../src/auth/iso8601.zig) | — |
 | 16 | SigV4 | Multi-valued same-name headers: `findHeader` returns first match only — AWS joins with commas in canonical form | done | [`src/auth/canonical.zig`](../src/auth/canonical.zig) | [`test_sigv4.py::test_sigv4_multi_value_header_signs_and_authenticates`](../tests/conformance/python/test_sigv4.py) |
