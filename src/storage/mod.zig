@@ -1233,6 +1233,27 @@ pub const Backend = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// DynamoDB backend (M15, v0.2.0).
+//
+// Separate vtable from S3's `Backend` to keep each surface focused and
+// readable. `Fs` implements both — one struct, two backend views. The
+// Phase-1 stub only carries `listTables`; subsequent phases (M15-tables,
+// M15-items, ...) add the rest.
+
+pub const DynamoBackend = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        listTables: *const fn (ctx: *anyopaque, allocator: Allocator) Error![]const []const u8,
+    };
+
+    pub fn listTables(self: DynamoBackend, allocator: Allocator) Error![]const []const u8 {
+        return self.vtable.listTables(self.ctx, allocator);
+    }
+};
+
 /// Validate an S3 object key. AWS permits virtually any UTF-8; the rules
 /// we enforce are non-empty, ≤ 1024 bytes, and well-formed UTF-8.
 pub fn validateObjectKey(key: []const u8) Error!void {

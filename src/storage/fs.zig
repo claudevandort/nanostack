@@ -762,6 +762,29 @@ pub fn backend(self: *Fs) storage.Backend {
     return .{ .ctx = self, .vtable = &vtable };
 }
 
+/// DynamoDB-flavoured view of the same `Fs` (M15). Persistence path is
+/// `<data_dir>/profiles/<profile>/dynamodb/...`, parallel to S3's
+/// `s3/...`. Phase-1 stub returns an empty table list.
+pub fn dynamoBackend(self: *Fs) storage.DynamoBackend {
+    return .{ .ctx = self, .vtable = &dynamo_vtable };
+}
+
+const dynamo_vtable: storage.DynamoBackend.VTable = .{
+    .listTables = vtDdbListTables,
+};
+
+fn vtDdbListTables(ctx: *anyopaque, allocator: Allocator) storage.Error![]const []const u8 {
+    return ddbListTables(@ptrCast(@alignCast(ctx)), allocator);
+}
+
+pub fn ddbListTables(self: *Fs, allocator: Allocator) storage.Error![]const []const u8 {
+    _ = self;
+    _ = allocator;
+    // Phase-1 stub: no tables exist yet. M15-tables (Phase 2) wires this
+    // up against a real in-memory `dynamo.tables` map + disk persistence.
+    return &.{};
+}
+
 // ---------------------------------------------------------------------------
 // VTable thunks
 
