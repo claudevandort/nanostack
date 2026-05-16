@@ -20,6 +20,7 @@ pub const policy_parser = @import("wire/policy_parser.zig");
 pub const policy_doc = @import("wire/policy_doc.zig");
 pub const ddb_attribute_value = @import("wire/dynamodb/attribute_value.zig");
 pub const ddb_errors = @import("wire/dynamodb/errors.zig");
+pub const dynamodb = @import("services/dynamodb/mod.zig");
 pub const ownership_controls_wire = @import("wire/ownership_controls.zig");
 pub const public_access_block_wire = @import("wire/public_access_block.zig");
 pub const cors_config = @import("wire/cors_config.zig");
@@ -98,6 +99,7 @@ test {
     _ = policy_doc;
     _ = ddb_attribute_value;
     _ = ddb_errors;
+    _ = dynamodb;
     _ = ownership_controls_wire;
     _ = public_access_block_wire;
     _ = cors_config;
