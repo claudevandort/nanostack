@@ -86,14 +86,18 @@ jobs:
 
       - name: Smoke test the published image
         run: |
-          tag="${{ steps.ver.outputs.tag }}"
-          docker pull "claudevandort/nanostack:${tag}"
-          out="$(docker run --rm "claudevandort/nanostack:${tag}" --version)"
+          # docker/metadata-action's `{{version}}` pattern strips the `v`
+          # prefix from the git tag — matching the Docker convention
+          # (postgres:15, redis:7, etc.), not the git ref form. Image tag
+          # here uses `version` (e.g. 0.1.1), not `tag` (v0.1.1).
+          image_tag="${{ steps.ver.outputs.version }}"
+          docker pull "claudevandort/nanostack:${image_tag}"
+          out="$(docker run --rm "claudevandort/nanostack:${image_tag}" --version)"
           echo "Output: $out"
           test "$out" = "nanostack v${{ steps.ver.outputs.version }}"
 
       - name: Inspect multi-arch manifest
-        run: docker buildx imagetools inspect "claudevandort/nanostack:${{ steps.ver.outputs.tag }}"
+        run: docker buildx imagetools inspect "claudevandort/nanostack:${{ steps.ver.outputs.version }}"
 
       - name: Extract changelog section
         id: notes
@@ -105,18 +109,18 @@ jobs:
             echo "No CHANGELOG entry for $version. See docs/CHANGELOG.md." > release-notes-body.md
           fi
           # Append the Docker pull pointer so the Release page tells users
-          # exactly how to consume this version.
+          # exactly how to consume this version. Image tags follow the
+          # Docker convention (no `v` prefix).
           cat >> release-notes-body.md <<EOF
 
           ## Docker
 
           \`\`\`sh
-          docker pull claudevandort/nanostack:${{ steps.ver.outputs.tag }}
-          docker run --rm -p 4566:4566 claudevandort/nanostack:${{ steps.ver.outputs.tag }}
+          docker pull claudevandort/nanostack:${{ steps.ver.outputs.version }}
+          docker run --rm -p 4566:4566 claudevandort/nanostack:${{ steps.ver.outputs.version }}
           \`\`\`
 
-          Multi-arch image (linux/amd64 + linux/arm64) on Docker Hub.
-          Also available as \`:${{ steps.ver.outputs.version }}\`-prefixed and \`:latest\` tags.
+          Multi-arch image (linux/amd64 + linux/arm64) on Docker Hub. Also available as the major-minor tag (e.g. \`:0.1\`) and \`:latest\`.
           EOF
           echo "----- release notes -----"
           cat release-notes-body.md

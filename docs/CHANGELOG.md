@@ -23,7 +23,7 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 Per the [versioning scheme](#versioning-scheme), patch releases mark "significant pinned cuts of work". This release reshapes release engineering (single Docker image instead of 4 tarballs + Homebrew), closes 12 of the 22 AWS-drift items, and adds a third conformance suite.
 
 ### Added
-- **Docker-first releases.** `claudevandort/nanostack` is now the primary distribution channel on Docker Hub (multi-arch `linux/amd64` + `linux/arm64`, `scratch` base, ~1.5 MB image). Tags: `:vX.Y.Z` (immutable), `:X.Y`, `:latest`. The release workflow cross-compiles a fully-static musl binary for each arch and pushes via `docker buildx`.
+- **Docker-first releases.** `claudevandort/nanostack` is now the primary distribution channel on Docker Hub (multi-arch `linux/amd64` + `linux/arm64`, `scratch` base, ~1.5 MB image). Tags: `:X.Y.Z` (immutable, e.g. `:0.1.1`), `:X.Y`, `:latest`. The release workflow cross-compiles a fully-static musl binary for each arch and pushes via `docker buildx`.
 - **AWS CLI v2 conformance suite** at `tests/conformance/awscli/` — ~10 pytest-driven tests covering high-level `aws s3` commands (`cp`, `cp --recursive`, `sync` including the idempotency check, `mv`, `ls`, `rm --recursive`, `presign`). These commands add client-side logic (recursion, diffing, composite ops) on top of botocore that the boto3 suite doesn't cover. CI verifies `aws --version` reports v2 on the build-test job (pre-installed on GitHub-hosted runners).
 
 ### Changed
