@@ -127,6 +127,7 @@ pub const App = struct {
             .allocator = arena,
             .owner_id = self.config.access_key,
             .owner_display_name = "nanostack",
+            .region = self.config.region,
             .request = .{
                 .headers = svc_headers,
                 .body = req.body() orelse "",
