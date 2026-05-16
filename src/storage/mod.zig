@@ -595,6 +595,12 @@ pub const Bucket = struct {
 /// `enabled` AWS forbids returning to `none` (only `suspended`).
 pub const VersioningStatus = enum { none, enabled, suspended };
 
+/// RestoreObject result — surfaces the AWS 200-vs-202 distinction.
+/// `initiated`: a fresh restore request was accepted → 202 Accepted.
+/// `already_in_progress`: an earlier RestoreObject already initiated
+///   a restore on this object → 200 OK (idempotent).
+pub const RestoreOutcome = enum { initiated, already_in_progress };
+
 /// One stored object's metadata. Strings are owned by either the backend
 /// (when surfaced through `headObject`) or the caller's allocator (when
 /// surfaced through `getObject`). The variant that owns is documented at
@@ -1010,7 +1016,7 @@ pub const Backend = struct {
         putObjectLegalHold: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, status: LegalHoldStatus) Error!void,
         getObjectLegalHold: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!LegalHoldStatus,
         // M13.
-        restoreObject: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) Error!void,
+        restoreObject: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) Error!RestoreOutcome,
         updateObjectEncryption: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, algorithm: SseAlgorithm, kms_key_id: []const u8) Error!void,
         putBucketReplication: *const fn (ctx: *anyopaque, bucket: []const u8, cfg: ReplicationConfig) Error!void,
         getBucketReplication: *const fn (ctx: *anyopaque, allocator: Allocator, bucket: []const u8) Error!ReplicationConfig,
@@ -1210,7 +1216,7 @@ pub const Backend = struct {
         return self.vtable.getObjectLegalHold(self.ctx, bucket, key, version_id);
     }
 
-    pub fn restoreObject(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) Error!void {
+    pub fn restoreObject(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) Error!RestoreOutcome {
         return self.vtable.restoreObject(self.ctx, bucket, key, version_id, days);
     }
     pub fn updateObjectEncryption(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8, algorithm: SseAlgorithm, kms_key_id: []const u8) Error!void {

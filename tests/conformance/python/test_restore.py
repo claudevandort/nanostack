@@ -5,6 +5,7 @@ from conftest import (
     drain_versions,
     empty_bucket,
     seed_object,
+    sign_and_send,
 )
 
 
@@ -60,4 +61,32 @@ def test_restore_object_per_version(s3, bucket_name):
             f"v2 should NOT have x-amz-restore, got: {head2.get('Restore')!r}"
     finally:
         drain_versions(s3, bucket_name)
+        best_effort_delete_bucket(s3, bucket_name)
+
+
+def test_restore_object_first_202_second_200(s3, bucket_name):
+    """AWS: first RestoreObject → 202 Accepted; repeat → 200 OK.
+    Drift table row 21. boto3 doesn't surface the status code on the
+    success path, so we send the requests via sign_and_send.
+    """
+    seed_object(s3, bucket_name, "k", b"cold")
+    try:
+        body = b"<RestoreRequest><Days>1</Days></RestoreRequest>"
+        # First restore → 202.
+        r1 = sign_and_send(
+            "POST", f"/{bucket_name}/k?restore",
+            body=body,
+            headers={"content-type": "application/xml"},
+        )
+        assert r1.status_code == 202, f"first restore: expected 202, got {r1.status_code}: {r1.text}"
+
+        # Second restore on the same object → 200 (idempotent).
+        r2 = sign_and_send(
+            "POST", f"/{bucket_name}/k?restore",
+            body=body,
+            headers={"content-type": "application/xml"},
+        )
+        assert r2.status_code == 200, f"repeat restore: expected 200, got {r2.status_code}: {r2.text}"
+    finally:
+        empty_bucket(s3, bucket_name)
         best_effort_delete_bucket(s3, bucket_name)
