@@ -795,6 +795,7 @@ const dynamo_vtable: storage.DynamoBackend.VTable = .{
     .getItem = vtDdbGetItem,
     .deleteItem = vtDdbDeleteItem,
     .updateItem = vtDdbUpdateItem,
+    .query = vtDdbQuery,
 };
 
 fn vtDdbListTables(ctx: *anyopaque, allocator: Allocator) storage.Error![]const []const u8 {
@@ -823,6 +824,9 @@ fn vtDdbDeleteItem(ctx: *anyopaque, allocator: Allocator, in: storage.DeleteItem
 }
 fn vtDdbUpdateItem(ctx: *anyopaque, allocator: Allocator, in: storage.UpdateItemInput) storage.Error!storage.UpdateItemResult {
     return ddbUpdateItem(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtDdbQuery(ctx: *anyopaque, allocator: Allocator, in: storage.QueryInput) storage.Error!storage.QueryResult {
+    return ddbQuery(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 
 // ---------------------------------------------------------------------------
@@ -3751,6 +3755,101 @@ pub fn ddbUpdateItem(self: *Fs, allocator: Allocator, in: storage.UpdateItemInpu
     }
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
     return result;
+}
+
+/// Query: walk all items, apply key_predicate (must match PK + optional
+/// sort-key predicate), sort by sort key, apply optional filter, slice
+/// by limit + cursor. Phase 5 walks the whole table; Phase 8 (GSI) adds
+/// per-partition indexing for O(K) reads.
+pub fn ddbQuery(self: *Fs, allocator: Allocator, in: storage.QueryInput) storage.Error!storage.QueryResult {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.dynamo_tables.get(in.table) orelse return storage.Error.TableNotFound;
+
+    // Collect all matching items + their composite keys.
+    const MatchEntry = struct { item: *const storage.Item, key: []const u8 };
+    var matches: std.ArrayList(MatchEntry) = .empty;
+    defer matches.deinit(allocator);
+
+    var it = slot.items.iterator();
+    while (it.next()) |entry| {
+        const item = entry.value_ptr.*;
+        if (!in.key_predicate.match(item)) continue;
+        try matches.append(allocator, .{ .item = item, .key = entry.key_ptr.* });
+    }
+
+    // Sort by composite key (which embeds PK + SK). Forward vs reverse.
+    const ctx_struct = struct {
+        fn lt(_: void, a: MatchEntry, b: MatchEntry) bool {
+            return std.mem.lessThan(u8, a.key, b.key);
+        }
+        fn gt(_: void, a: MatchEntry, b: MatchEntry) bool {
+            return std.mem.lessThan(u8, b.key, a.key);
+        }
+    };
+    if (in.forward) {
+        std.mem.sort(MatchEntry, matches.items, {}, ctx_struct.lt);
+    } else {
+        std.mem.sort(MatchEntry, matches.items, {}, ctx_struct.gt);
+    }
+
+    // Apply ExclusiveStartKey cursor.
+    var start_idx: usize = 0;
+    if (in.exclusive_start_key) |cursor| {
+        for (matches.items, 0..) |m, i| {
+            const after_cursor = if (in.forward)
+                std.mem.lessThan(u8, cursor, m.key)
+            else
+                std.mem.lessThan(u8, m.key, cursor);
+            if (after_cursor) {
+                start_idx = i;
+                break;
+            }
+        } else start_idx = matches.items.len;
+    }
+
+    // Apply filter predicate + limit while collecting output.
+    var out: std.ArrayList(storage.Item) = .empty;
+    errdefer {
+        for (out.items) |*item_to_free| {
+            var copy = item_to_free.*;
+            copy.deinit(allocator);
+        }
+        out.deinit(allocator);
+    }
+
+    var scanned_count: u32 = 0;
+    var last_key: ?[]const u8 = null;
+    var idx: usize = start_idx;
+    while (idx < matches.items.len) : (idx += 1) {
+        const m = matches.items[idx];
+        scanned_count += 1;
+        if (in.filter_predicate) |f| {
+            if (!f.match(m.item)) continue;
+        }
+        const cloned = cloneItem(allocator, m.item) catch return storage.Error.OutOfMemory;
+        try out.append(allocator, cloned);
+        last_key = m.key;
+        if (in.limit != 0 and out.items.len >= in.limit) {
+            idx += 1;
+            break;
+        }
+    }
+
+    const truncated = idx < matches.items.len;
+    const cursor_out: ?[]const u8 = if (truncated and last_key != null)
+        allocator.dupe(u8, last_key.?) catch return storage.Error.OutOfMemory
+    else
+        null;
+
+    const count: u32 = @intCast(out.items.len);
+    return .{
+        .items = out.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory,
+        .count = count,
+        .scanned_count = scanned_count,
+        .last_evaluated_key = cursor_out,
+    };
 }
 
 // ---------------------------------------------------------------------------

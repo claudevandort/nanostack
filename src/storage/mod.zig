@@ -1332,6 +1332,45 @@ pub const UpdateItemResult = struct {
     new_item: ?Item = null,
 };
 
+/// Generic predicate that the service layer passes to query/scan to
+/// match items against a partition key + sort-key predicate. Returns
+/// true if the item should be included. Caller-side state lives in `ctx`.
+pub const ItemPredicate = struct {
+    ctx: *anyopaque,
+    match_fn: *const fn (ctx: *anyopaque, item: *const Item) bool,
+
+    pub fn match(self: ItemPredicate, item: *const Item) bool {
+        return self.match_fn(self.ctx, item);
+    }
+};
+
+/// Query input: storage walks all items in the table that satisfy
+/// `key_predicate` (PK + optional SK), then applies the optional
+/// `filter_predicate` (the FilterExpression). Result is sorted by sort
+/// key according to `forward`.
+pub const QueryInput = struct {
+    table: []const u8,
+    /// Predicate that fires only on the partition+sort key match.
+    key_predicate: ItemPredicate,
+    /// Optional FilterExpression predicate, applied after the key match.
+    filter_predicate: ?ItemPredicate = null,
+    /// false = descending sort by sort key.
+    forward: bool = true,
+    /// Cap on emitted items. 0 = no cap.
+    limit: u32 = 0,
+    /// ExclusiveStartKey serialised as the composite key string. Items
+    /// strictly after this in sort order are emitted.
+    exclusive_start_key: ?[]const u8 = null,
+};
+
+pub const QueryResult = struct {
+    items: []Item,
+    count: u32,
+    scanned_count: u32,
+    /// Last item's composite-key string when truncated. null otherwise.
+    last_evaluated_key: ?[]const u8 = null,
+};
+
 
 pub const DynamoBackend = struct {
     ctx: *anyopaque,
@@ -1348,6 +1387,7 @@ pub const DynamoBackend = struct {
         getItem: *const fn (ctx: *anyopaque, allocator: Allocator, in: GetItemInput) Error!GetItemResult,
         deleteItem: *const fn (ctx: *anyopaque, allocator: Allocator, in: DeleteItemInput) Error!DeleteItemResult,
         updateItem: *const fn (ctx: *anyopaque, allocator: Allocator, in: UpdateItemInput) Error!UpdateItemResult,
+        query: *const fn (ctx: *anyopaque, allocator: Allocator, in: QueryInput) Error!QueryResult,
     };
 
     pub fn listTables(self: DynamoBackend, allocator: Allocator) Error![]const []const u8 {
@@ -1376,6 +1416,9 @@ pub const DynamoBackend = struct {
     }
     pub fn updateItem(self: DynamoBackend, allocator: Allocator, in: UpdateItemInput) Error!UpdateItemResult {
         return self.vtable.updateItem(self.ctx, allocator, in);
+    }
+    pub fn query(self: DynamoBackend, allocator: Allocator, in: QueryInput) Error!QueryResult {
+        return self.vtable.query(self.ctx, allocator, in);
     }
 };
 

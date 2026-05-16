@@ -82,6 +82,9 @@ DynamoDB is the second AWS service nanostack covers, opt-in via `--services s3,d
 | UpdateItem | supported (SET / REMOVE / ADD / DELETE; if_not_exists, list_append, atomic counters; full ReturnValues; ConditionExpression) | M15-expressions |
 | ConditionExpression | supported (=, <>, <, <=, >, >=, AND, OR, NOT, BETWEEN, IN, attribute_exists, attribute_not_exists, attribute_type, begins_with, contains, parentheses) | M15-expressions |
 | UpdateExpression | supported (SET / REMOVE / ADD / DELETE actions; arithmetic on N; if_not_exists; list_append; set union / subtraction) | M15-expressions |
+| Query | supported (KeyConditionExpression + FilterExpression; Limit; ScanIndexForward; ExclusiveStartKey/LastEvaluatedKey cursor) | M15-query |
+| KeyConditionExpression | supported (pk = X [AND sk pred]; sk pred = `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `begins_with`) | M15-query |
+| FilterExpression | supported (reuses ConditionExpression grammar; runs after key match) | M15-query |
 | GetItem / PutItem / DeleteItem | planned | M15-items |
 | UpdateItem (with UpdateExpression) | planned | M15-expressions |
 | Query (incl. GSI/LSI) | planned | M15-query / M15-gsi |
