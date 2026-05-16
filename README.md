@@ -30,7 +30,7 @@ To persist buckets across runs, mount a volume on `/data`:
 docker run --rm -p 4566:4566 -v "$(mktemp -d):/data" claudevandort/nanostack:latest
 ```
 
-Available tags: `:latest`, `:vX.Y.Z` (immutable per release), `:X.Y` (latest patch on this minor). Multi-arch image (`linux/amd64` + `linux/arm64`). Image size: ~1.5 MB (`scratch`-based, fully-static musl binary, no shell or libc inside).
+Available tags: `:latest`, `:X.Y.Z` (immutable per release, e.g. `:0.1.1`), `:X.Y` (latest patch on this minor). Multi-arch image (`linux/amd64` + `linux/arm64`). Image size: ~1.5 MB (`scratch`-based, fully-static musl binary, no shell or libc inside).
 
 ### Build from source
 
