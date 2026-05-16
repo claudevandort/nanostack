@@ -26,6 +26,8 @@ const timing_safe = std.crypto.timing_safe;
 const canonical = @import("canonical.zig");
 const signing_key = @import("signing_key.zig");
 const iso8601 = @import("iso8601.zig");
+const principal_mod = @import("principal.zig");
+pub const Principal = principal_mod.Principal;
 
 pub const Header = canonical.Header;
 
@@ -50,7 +52,6 @@ pub const VerifyOptions = struct {
 };
 
 pub const VerifyError = error{
-    MissingAuth,
     MalformedAuthorization,
     MalformedCredentialScope,
     MalformedPresignedQuery,
@@ -67,23 +68,35 @@ pub const VerifyError = error{
 };
 
 /// Top-level entry point. Branches between header-auth and presigned URLs.
+///
+/// Returns the verified `Principal` on success:
+/// - Header SigV4 or presigned URL valid → `awsAccount(creds.access_key)`.
+/// - No `Authorization` header AND no `X-Amz-Algorithm` query param →
+///   `anonymous()` (M14: anonymous requests proceed to the authz hook
+///   instead of auto-403'ing; the bucket policy / ACL evaluator gates
+///   them per public-read semantics).
+///
+/// All other failure modes (malformed signature, bad credential scope,
+/// signature mismatch, expired, etc.) still raise `VerifyError`.
 pub fn verify(
     allocator: Allocator,
     req: Request,
     creds: Credentials,
     opts: VerifyOptions,
-) VerifyError!void {
+) VerifyError!Principal {
     if (canonical.findHeader(req.headers, "Authorization")) |auth| {
         if (std.mem.startsWith(u8, auth, "AWS4-HMAC-SHA256")) {
-            return verifyHeader(allocator, req, creds, opts, auth);
+            try verifyHeader(allocator, req, creds, opts, auth);
+            return Principal.awsAccount(creds.access_key);
         }
     }
     if (queryParam(req.query, "X-Amz-Algorithm")) |alg| {
         if (std.mem.eql(u8, alg, "AWS4-HMAC-SHA256")) {
-            return verifyPresigned(allocator, req, creds, opts);
+            try verifyPresigned(allocator, req, creds, opts);
+            return Principal.awsAccount(creds.access_key);
         }
     }
-    return VerifyError.MissingAuth;
+    return Principal.anonymous();
 }
 
 // ---------------------------------------------------------------------------
@@ -424,7 +437,7 @@ test "verify: AWS SigV4 get-vanilla example" {
         },
     };
 
-    try verify(
+    _ = try verify(
         testing.allocator,
         .{
             .method = "GET",
@@ -512,14 +525,15 @@ test "verify: missing signed header → MissingSignedHeader (the LocalStack bug)
     ));
 }
 
-test "verify: no Authorization, no presigned → MissingAuth" {
+test "verify: no Authorization, no presigned → anonymous Principal" {
     const headers = [_]Header{.{ .name = "Host", .value = "x" }};
-    try testing.expectError(VerifyError.MissingAuth, verify(
+    const p = try verify(
         testing.allocator,
         .{ .method = "GET", .path = "/", .query = "", .headers = &headers, .body = "" },
         .{ .access_key = "AKIDEXAMPLE", .secret_key = "secret" },
         .{ .region = "us-east-1", .service = "s3", .now_unix = 0 },
-    ));
+    );
+    try testing.expect(p.isAnonymous());
 }
 
 test "verify: streaming hash → StreamingUnsupported" {
@@ -586,7 +600,7 @@ test "verify presigned: happy path round-trip" {
     var full_query_buf: [768]u8 = undefined;
     const full_query = std.fmt.bufPrint(&full_query_buf, "{s}&X-Amz-Signature={s}", .{ query, &sig }) catch unreachable;
 
-    try verify(
+    _ = try verify(
         testing.allocator,
         .{ .method = "GET", .path = "/", .query = full_query, .headers = &headers, .body = "" },
         .{ .access_key = access_key, .secret_key = secret_key },

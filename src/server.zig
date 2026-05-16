@@ -54,11 +54,20 @@ pub const App = struct {
         });
 
         // ---------- SigV4 verification ----------
-        if (!self.config.no_auth) {
+        //
+        // Returns a `Principal` (anonymous when no auth headers present,
+        // aws_account when SigV4 verification passed). All other failure
+        // modes still raise. M14 wires this into the authz hook below.
+        //
+        // `--no-auth` short-circuits to the bucket-owner principal: every
+        // request is treated as fully-authorised (no policy/ACL check).
+        const principal: sigv4.Principal = if (self.config.no_auth)
+            sigv4.Principal.awsAccount(self.config.access_key)
+        else blk: {
             const verify_headers = collectHeaders(arena, req) catch {
                 return respondError(res, request_id, host_id, .internal_error, req.url.path, &.{});
             };
-            sigv4.verify(arena, .{
+            const p = sigv4.verify(arena, .{
                 .method = method_str,
                 .path = req.url.path,
                 .query = req.url.query,
@@ -75,6 +84,16 @@ pub const App = struct {
             }) catch |err| {
                 return respondError(res, request_id, host_id, mapVerifyError(err), req.url.path, &.{});
             };
+            break :blk p;
+        };
+
+        // M14 phase 2 placeholder: anonymous principals are denied with the
+        // same 403 AccessDenied response that the old MissingAuth path
+        // produced. Phase 4 replaces this blanket-deny with real bucket
+        // policy / ACL / PAB evaluation — at which point a public-read
+        // bucket starts serving anonymous reads end-to-end.
+        if (principal.isAnonymous()) {
+            return respondError(res, request_id, host_id, .access_denied, req.url.path, &.{});
         }
 
         // ---------- Service dispatch ----------
@@ -121,7 +140,6 @@ pub const App = struct {
 
 fn mapVerifyError(e: sigv4.VerifyError) errors.Code {
     return switch (e) {
-        sigv4.VerifyError.MissingAuth => .access_denied,
         sigv4.VerifyError.InvalidAccessKeyId => .invalid_access_key_id,
         sigv4.VerifyError.SignatureDoesNotMatch => .signature_does_not_match,
         sigv4.VerifyError.RequestTimeTooSkewed => .request_time_too_skewed,

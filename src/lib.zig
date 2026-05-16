@@ -42,6 +42,7 @@ pub const iso8601 = @import("auth/iso8601.zig");
 pub const signing_key = @import("auth/signing_key.zig");
 pub const canonical = @import("auth/canonical.zig");
 pub const action_map = @import("auth/action_map.zig");
+pub const principal = @import("auth/principal.zig");
 pub const storage = @import("storage/mod.zig");
 pub const storage_util = @import("storage/util.zig");
 pub const fs_backend = @import("storage/fs.zig");
@@ -113,6 +114,7 @@ test {
     _ = signing_key;
     _ = canonical;
     _ = action_map;
+    _ = principal;
     _ = storage;
     _ = storage_util;
     _ = fs_backend;
