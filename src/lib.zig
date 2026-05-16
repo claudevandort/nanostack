@@ -46,6 +46,7 @@ pub const principal = @import("auth/principal.zig");
 pub const policy_eval = @import("auth/policy_eval.zig");
 pub const acl_eval = @import("auth/acl_eval.zig");
 pub const pab_gate = @import("auth/pab_gate.zig");
+pub const authz = @import("auth/authz.zig");
 pub const storage = @import("storage/mod.zig");
 pub const storage_util = @import("storage/util.zig");
 pub const fs_backend = @import("storage/fs.zig");
@@ -121,6 +122,7 @@ test {
     _ = policy_eval;
     _ = acl_eval;
     _ = pab_gate;
+    _ = authz;
     _ = storage;
     _ = storage_util;
     _ = fs_backend;

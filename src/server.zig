@@ -11,6 +11,7 @@ const cli = @import("cli.zig");
 const router = @import("router.zig");
 const errors = @import("wire/errors.zig");
 const sigv4 = @import("auth/sigv4.zig");
+const authz = @import("auth/authz.zig");
 const storage = @import("storage/mod.zig");
 const fs_backend = @import("storage/fs.zig");
 const s3 = @import("services/s3/mod.zig");
@@ -87,17 +88,28 @@ pub const App = struct {
             break :blk p;
         };
 
-        // M14 phase 2 placeholder: anonymous principals are denied with the
-        // same 403 AccessDenied response that the old MissingAuth path
-        // produced. Phase 4 replaces this blanket-deny with real bucket
-        // policy / ACL / PAB evaluation — at which point a public-read
-        // bucket starts serving anonymous reads end-to-end.
-        if (principal.isAnonymous()) {
-            return respondError(res, request_id, host_id, .access_denied, req.url.path, &.{});
-        }
-
-        // ---------- Service dispatch ----------
+        // ---------- Routing ----------
         const parsed = router.parse(method_str, host_header, req.url.path, req.url.query);
+
+        // ---------- Authz hook (M14) ----------
+        //
+        // Real bucket-policy / ACL / PAB evaluation. `--no-auth` bypasses
+        // (principal is the bucket owner; orchestrator's owner-implicit
+        // fallback always allows). All other principals — including
+        // anonymous — go through the evaluator: a public-read bucket
+        // serves anonymous reads end-to-end; a private one returns 403.
+        if (!self.config.no_auth) {
+            const decision = authz.check(.{
+                .allocator = arena,
+                .backend = self.backend,
+                .principal = principal,
+                .owner_id = self.config.access_key,
+                .parsed = parsed,
+            });
+            if (decision == .deny) {
+                return respondError(res, request_id, host_id, .access_denied, req.url.path, &.{});
+            }
+        }
 
         // Bridge sigv4-collected headers into storage.Header for the service.
         // Same shape, just a cast — but Zig 0.16 won't let us @ptrCast slices
