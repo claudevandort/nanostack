@@ -246,14 +246,77 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+/// Extract a virtual-hosted bucket name from `host` (port already stripped).
+///
+/// Returns the bucket name if `host` looks like a virtual-host suffix we
+/// recognise, otherwise null (caller falls back to path-style routing).
+///
+/// Recognised suffixes:
+///   - `.s3.amazonaws.com`                  (legacy global)
+///   - `.s3.<region>.amazonaws.com`         (modern)
+///   - `.s3-<region>.amazonaws.com`         (older regional)
+///   - `.s3-website-<region>.amazonaws.com` (S3 Website)
+///   - `.s3-accelerate.amazonaws.com`       (Transfer Acceleration)
+///   - `.localhost`, `.127.0.0.1`           (dev-local)
+///
+/// Anything else returns null — important to avoid the historical bug
+/// where `s3.amazonaws.com` was parsed as bucket=`s3`.
 fn virtualHostBucket(host: []const u8) ?[]const u8 {
+    // Reserved bare hosts: never virtual-hosted.
     const reserved = [_][]const u8{ "localhost", "127.0.0.1", "0.0.0.0" };
     for (reserved) |r| {
         if (std.mem.eql(u8, host, r)) return null;
     }
-    const dot = std.mem.indexOfScalar(u8, host, '.') orelse return null;
-    if (dot == 0) return null;
-    return host[0..dot];
+
+    // Dev-local: `.localhost`, `.127.0.0.1`.
+    const dev_suffixes = [_][]const u8{ ".localhost", ".127.0.0.1" };
+    for (dev_suffixes) |suf| {
+        if (std.mem.endsWith(u8, host, suf)) {
+            const bucket = host[0 .. host.len - suf.len];
+            return if (bucket.len == 0) null else bucket;
+        }
+    }
+
+    // AWS canonical forms — explicit suffixes.
+    const aws_fixed = [_][]const u8{
+        ".s3.amazonaws.com",
+        ".s3-accelerate.amazonaws.com",
+    };
+    for (aws_fixed) |suf| {
+        if (std.mem.endsWith(u8, host, suf)) {
+            const bucket = host[0 .. host.len - suf.len];
+            return if (bucket.len == 0) null else bucket;
+        }
+    }
+
+    // Regional forms: `.s3.<region>.amazonaws.com`, `.s3-<region>.amazonaws.com`,
+    // `.s3-website-<region>.amazonaws.com`. Check the `.amazonaws.com` suffix and
+    // then verify the bucket-side ends with one of the s3* labels.
+    const amazonaws = ".amazonaws.com";
+    if (std.mem.endsWith(u8, host, amazonaws)) {
+        const without_tld = host[0 .. host.len - amazonaws.len];
+        // `without_tld` is now `<bucket>.s3<-?region|-website-<region>>` —
+        // or `<bucket>.s3` for the no-region AWS-canonical case (handled above).
+        // We need to find the s3-label boundary.
+        const last_dot = std.mem.lastIndexOfScalar(u8, without_tld, '.') orelse return null;
+        const tail = without_tld[last_dot + 1 ..];
+        if (std.mem.startsWith(u8, tail, "s3-") or std.mem.startsWith(u8, tail, "s3.")) {
+            // `<bucket>.s3-region` form.
+            const bucket = without_tld[0..last_dot];
+            return if (bucket.len == 0) null else bucket;
+        }
+        // `<bucket>.s3.<region>` modern form: tail is the region; need to walk
+        // back one more dot to find the `s3` label and the bucket boundary.
+        const prev_dot = std.mem.lastIndexOfScalar(u8, without_tld[0..last_dot], '.') orelse return null;
+        const s3_label = without_tld[prev_dot + 1 .. last_dot];
+        if (std.mem.eql(u8, s3_label, "s3")) {
+            const bucket = without_tld[0..prev_dot];
+            return if (bucket.len == 0) null else bucket;
+        }
+        return null;
+    }
+
+    return null;
 }
 
 fn pathToKey(path: []const u8) ?[]const u8 {
@@ -374,6 +437,35 @@ test "virtual-hosted: GET /obj on bucket host → get_object" {
     try testing.expectEqualStrings("mybucket", p.bucket.?);
     try testing.expectEqualStrings("foo", p.key.?);
     try testing.expectEqual(Operation.get_object, p.op);
+}
+
+test "virtual-hosted: s3.amazonaws.com is NOT a virtual-host → falls back to path-style" {
+    // Drift #19 regression: the old "everything before the first dot" parser
+    // would misroute this as bucket=s3 with no key.
+    const p = parse("GET", "s3.amazonaws.com", "/foo", "");
+    try testing.expectEqualStrings("foo", p.bucket.?);
+    try testing.expectEqual(Operation.list_objects, p.op);
+}
+
+test "virtual-hosted: s3-us-west-2.amazonaws.com (older regional form) → null" {
+    const p = parse("GET", "s3-us-west-2.amazonaws.com", "/foo", "");
+    try testing.expectEqualStrings("foo", p.bucket.?);
+}
+
+test "virtual-hosted: mybucket.s3-us-west-2.amazonaws.com → virtual-host" {
+    const p = parse("GET", "mybucket.s3-us-west-2.amazonaws.com", "/foo", "");
+    try testing.expectEqualStrings("mybucket", p.bucket.?);
+    try testing.expectEqualStrings("foo", p.key.?);
+}
+
+test "virtual-hosted: mybucket.localhost → virtual-host" {
+    const p = parse("GET", "mybucket.localhost", "/", "");
+    try testing.expectEqualStrings("mybucket", p.bucket.?);
+}
+
+test "virtual-hosted: example.com is not an S3 host → null" {
+    const p = parse("GET", "example.com", "/foo", "");
+    try testing.expectEqualStrings("foo", p.bucket.?);
 }
 
 test "multipart: POST /b/k?uploads → create_multipart_upload" {
