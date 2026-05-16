@@ -794,6 +794,7 @@ const dynamo_vtable: storage.DynamoBackend.VTable = .{
     .putItem = vtDdbPutItem,
     .getItem = vtDdbGetItem,
     .deleteItem = vtDdbDeleteItem,
+    .updateItem = vtDdbUpdateItem,
 };
 
 fn vtDdbListTables(ctx: *anyopaque, allocator: Allocator) storage.Error![]const []const u8 {
@@ -819,6 +820,9 @@ fn vtDdbGetItem(ctx: *anyopaque, allocator: Allocator, in: storage.GetItemInput)
 }
 fn vtDdbDeleteItem(ctx: *anyopaque, allocator: Allocator, in: storage.DeleteItemInput) storage.Error!storage.DeleteItemResult {
     return ddbDeleteItem(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtDdbUpdateItem(ctx: *anyopaque, allocator: Allocator, in: storage.UpdateItemInput) storage.Error!storage.UpdateItemResult {
+    return ddbUpdateItem(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 
 // ---------------------------------------------------------------------------
@@ -3612,6 +3616,12 @@ pub fn ddbPutItem(self: *Fs, allocator: Allocator, in: storage.PutItemInput) sto
         return storage.Error.OutOfMemory;
     errdefer self.allocator.free(key_str);
 
+    // Condition check (under the mutex, against the in-memory state).
+    if (in.condition) |c| {
+        const existing_ptr: ?*const storage.Item = slot.items.get(key_str);
+        if (!c.evaluate(existing_ptr)) return storage.Error.ConditionalCheckFailed;
+    }
+
     var result: storage.PutItemResult = .{};
 
     // If an item already exists at this key, surface it as old_item (using
@@ -3662,6 +3672,11 @@ pub fn ddbDeleteItem(self: *Fs, allocator: Allocator, in: storage.DeleteItemInpu
         return storage.Error.OutOfMemory;
     defer self.allocator.free(key_str);
 
+    if (in.condition) |c| {
+        const existing_ptr: ?*const storage.Item = slot.items.get(key_str);
+        if (!c.evaluate(existing_ptr)) return storage.Error.ConditionalCheckFailed;
+    }
+
     const removed = slot.items.fetchRemove(key_str) orelse return .{ .old_item = null };
 
     // Delete the on-disk file (best-effort: missing is fine).
@@ -3678,6 +3693,64 @@ pub fn ddbDeleteItem(self: *Fs, allocator: Allocator, in: storage.DeleteItemInpu
     removed.value.deinit(self.allocator);
     self.allocator.destroy(removed.value);
     return .{ .old_item = old };
+}
+
+/// UpdateItem: under the mutex, build a writable clone of the existing
+/// item (or a fresh key-only item), run the caller-supplied applier,
+/// then persist the result. The applier returns false → ApplyError-class
+/// failure surfaced as ValidationException by the service.
+pub fn ddbUpdateItem(self: *Fs, allocator: Allocator, in: storage.UpdateItemInput) storage.Error!storage.UpdateItemResult {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.dynamo_tables.get(in.table) orelse return storage.Error.TableNotFound;
+    const key_str = storage.dynamo_state.buildKeyFromAttrs(self.allocator, slot, in.key) catch
+        return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(key_str);
+
+    const existing_ptr: ?*const storage.Item = slot.items.get(key_str);
+
+    if (in.condition) |c| {
+        if (!c.evaluate(existing_ptr)) return storage.Error.ConditionalCheckFailed;
+    }
+
+    var result: storage.UpdateItemResult = .{};
+
+    // Build a writable working item. Start from existing (deep clone)
+    // or the key-only Item if absent (UpdateItem creates if missing).
+    var working: storage.Item = if (existing_ptr) |ep|
+        cloneItem(allocator, ep) catch return storage.Error.OutOfMemory
+    else
+        cloneItem(allocator, in.key) catch return storage.Error.OutOfMemory;
+
+    if (existing_ptr) |ep| {
+        result.old_item = cloneItem(allocator, ep) catch return storage.Error.OutOfMemory;
+    }
+
+    if (!in.apply_fn(in.apply_ctx, &working)) return storage.Error.ConditionalCheckFailed;
+
+    result.new_item = cloneItem(allocator, &working) catch return storage.Error.OutOfMemory;
+
+    // Persist: deep-copy into long-lived state and write to disk.
+    const owned = cloneItem(self.allocator, &working) catch return storage.Error.OutOfMemory;
+    const owned_ptr = self.allocator.create(storage.Item) catch return storage.Error.OutOfMemory;
+    owned_ptr.* = owned;
+
+    const key_hash = itemKeyHash(key_str);
+    writeItemJson(self, slot.name, &key_hash, owned_ptr) catch {
+        owned_ptr.deinit(self.allocator);
+        self.allocator.destroy(owned_ptr);
+        return storage.Error.Io;
+    };
+
+    // Replace in-memory.
+    if (slot.items.fetchRemove(key_str)) |old| {
+        self.allocator.free(old.key);
+        old.value.deinit(self.allocator);
+        self.allocator.destroy(old.value);
+    }
+    slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
+    return result;
 }
 
 // ---------------------------------------------------------------------------
