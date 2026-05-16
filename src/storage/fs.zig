@@ -812,7 +812,6 @@ const vtable: storage.Backend.VTable = .{
     .getObjectRetention = vtGetObjectRetention,
     .putObjectLegalHold = vtPutObjectLegalHold,
     .getObjectLegalHold = vtGetObjectLegalHold,
-    .getBucketPolicyStatus = vtGetBucketPolicyStatus,
     .restoreObject = vtRestoreObject,
     .updateObjectEncryption = vtUpdateObjectEncryption,
     .putBucketReplication = vtPutBucketReplication,
@@ -990,9 +989,6 @@ fn vtPutObjectLegalHold(ctx: *anyopaque, bucket: []const u8, key: []const u8, ve
 }
 fn vtGetObjectLegalHold(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error!storage.LegalHoldStatus {
     return getObjectLegalHold(@ptrCast(@alignCast(ctx)), bucket, key, version_id);
-}
-fn vtGetBucketPolicyStatus(ctx: *anyopaque, bucket: []const u8) storage.Error!bool {
-    return getBucketPolicyStatus(@ptrCast(@alignCast(ctx)), bucket);
 }
 fn vtRestoreObject(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) storage.Error!void {
     return restoreObject(@ptrCast(@alignCast(ctx)), bucket, key, version_id, days);
@@ -2670,47 +2666,6 @@ pub fn getObjectLegalHold(self: *Fs, bucket: []const u8, key: []const u8, versio
 
 // ---------------------------------------------------------------------------
 // M13: PolicyStatus, RestoreObject, UpdateObjectEncryption, Replication.
-
-pub fn getBucketPolicyStatus(self: *Fs, bucket: []const u8) storage.Error!bool {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const idx = findBucket(self, bucket) orelse return storage.Error.NoSuchBucket;
-    const slot = &self.buckets.items[idx];
-    const policy = slot.policy_json orelse return storage.Error.NoSuchBucketPolicy;
-    // Lightweight heuristic: IsPublic=true if policy contains both
-    // `"Principal":"*"` (with optional whitespace) and `"Effect":"Allow"`.
-    return containsPublicPrincipalAllow(policy);
-}
-
-fn containsPublicPrincipalAllow(s: []const u8) bool {
-    // Look for "Principal" : "*" (allowing whitespace around the colon)
-    // and "Effect" : "Allow" similarly. Cheap and matches real Statement
-    // shapes; misses edge cases like Principal: { "AWS": "*" } which we
-    // treat as conservative-false.
-    var i: usize = 0;
-    var has_principal_star = false;
-    while (std.mem.indexOfPos(u8, s, i, "\"Principal\"")) |p| {
-        const rest = s[p + "\"Principal\"".len ..];
-        var j: usize = 0;
-        while (j < rest.len and (rest[j] == ' ' or rest[j] == '\t' or rest[j] == ':')) : (j += 1) {}
-        if (j < rest.len and rest[j] == '"') {
-            j += 1;
-            if (j < rest.len and rest[j] == '*') {
-                has_principal_star = true;
-                break;
-            }
-        }
-        i = p + 1;
-    }
-    if (!has_principal_star) return false;
-    i = 0;
-    while (std.mem.indexOfPos(u8, s, i, "\"Effect\"")) |p| {
-        const rest = s[p + "\"Effect\"".len ..];
-        if (std.mem.indexOf(u8, rest, "\"Allow\"")) |_| return true;
-        i = p + 1;
-    }
-    return false;
-}
 
 pub fn restoreObject(self: *Fs, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) storage.Error!void {
     try storage.validateObjectKey(key);
