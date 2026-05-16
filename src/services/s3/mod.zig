@@ -514,12 +514,58 @@ fn listBuckets(ctx: Context) Result {
         }
         ctx.allocator.free(buckets);
     }
-    const body = s3_responses.renderListAllMyBucketsResult(
-        ctx.allocator,
-        ctx.owner_id,
-        ctx.owner_display_name,
-        buckets,
-    ) catch return .{ .err = .internal_error };
+
+    // Wave 3 #22: 2023 pagination params.
+    const prefix = queryValueOpt(ctx.allocator, ctx.request.query, "prefix") catch
+        return .{ .err = .invalid_request };
+    const region_filter = queryValueOpt(ctx.allocator, ctx.request.query, "bucket-region") catch
+        return .{ .err = .invalid_request };
+    const cont_token = queryValueOpt(ctx.allocator, ctx.request.query, "continuation-token") catch
+        return .{ .err = .invalid_request };
+    const max_buckets_raw = queryValueOpt(ctx.allocator, ctx.request.query, "max-buckets") catch
+        return .{ .err = .invalid_request };
+
+    // Default 1000, hard cap 10000 per AWS docs.
+    var max_buckets: usize = 1000;
+    if (max_buckets_raw) |v| {
+        max_buckets = std.fmt.parseInt(usize, v, 10) catch return .{ .err = .invalid_request };
+        if (max_buckets == 0 or max_buckets > 10000) return .{ .err = .invalid_request };
+    }
+
+    // Sort lex-ascending so pagination is deterministic.
+    std.mem.sort(storage.Bucket, buckets, {}, struct {
+        fn lt(_: void, a: storage.Bucket, b: storage.Bucket) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+
+    // Build a filtered+paginated view.
+    var emitted: std.ArrayList(storage.Bucket) = .empty;
+    defer emitted.deinit(ctx.allocator);
+    var next_token: ?[]const u8 = null;
+
+    for (buckets) |b| {
+        if (prefix) |p| if (!std.mem.startsWith(u8, b.name, p)) continue;
+        if (region_filter) |r| if (!std.mem.eql(u8, b.region, r)) continue;
+        // Skip past the continuation token (token = last-emitted-name; we
+        // start with the bucket strictly greater).
+        if (cont_token) |t| if (!std.mem.lessThan(u8, t, b.name)) continue;
+        if (emitted.items.len >= max_buckets) {
+            // We hit the cap; the previous loop iteration's last name is
+            // the continuation token for the next page.
+            next_token = emitted.items[emitted.items.len - 1].name;
+            break;
+        }
+        emitted.append(ctx.allocator, b) catch return .{ .err = .internal_error };
+    }
+
+    const body = s3_responses.renderListAllMyBucketsResult(ctx.allocator, .{
+        .owner_id = ctx.owner_id,
+        .display_name = ctx.owner_display_name,
+        .buckets = emitted.items,
+        .prefix = prefix,
+        .continuation_token = next_token,
+    }) catch return .{ .err = .internal_error };
     return .{ .ok = .{ .status = 200, .body = body } };
 }
 
