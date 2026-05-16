@@ -1227,10 +1227,11 @@ pub const Backend = struct {
     }
 };
 
-/// Validate an S3 object key. AWS permits virtually any UTF-8; the only
-/// hard rules we enforce are non-empty and ≤ 1024 bytes.
+/// Validate an S3 object key. AWS permits virtually any UTF-8; the rules
+/// we enforce are non-empty, ≤ 1024 bytes, and well-formed UTF-8.
 pub fn validateObjectKey(key: []const u8) Error!void {
     if (key.len == 0 or key.len > 1024) return Error.InvalidObjectKey;
+    if (!std.unicode.utf8ValidateSlice(key)) return Error.InvalidObjectKey;
 }
 
 test "validateObjectKey: empty" {
@@ -1247,6 +1248,14 @@ test "validateObjectKey: too long" {
 test "validateObjectKey: typical" {
     try validateObjectKey("foo/bar.txt");
     try validateObjectKey("emoji-🚀.bin");
+}
+
+test "validateObjectKey: rejects invalid UTF-8" {
+    const testing = std.testing;
+    // Lone continuation byte — invalid UTF-8.
+    try testing.expectError(Error.InvalidObjectKey, validateObjectKey("bad-\xff-key"));
+    // Truncated multibyte sequence.
+    try testing.expectError(Error.InvalidObjectKey, validateObjectKey("trunc-\xc2"));
 }
 
 test "validateTagSet: empty + typical" {
