@@ -791,6 +791,9 @@ const dynamo_vtable: storage.DynamoBackend.VTable = .{
     .describeTable = vtDdbDescribeTable,
     .deleteTable = vtDdbDeleteTable,
     .updateTable = vtDdbUpdateTable,
+    .putItem = vtDdbPutItem,
+    .getItem = vtDdbGetItem,
+    .deleteItem = vtDdbDeleteItem,
 };
 
 fn vtDdbListTables(ctx: *anyopaque, allocator: Allocator) storage.Error![]const []const u8 {
@@ -807,6 +810,15 @@ fn vtDdbDeleteTable(ctx: *anyopaque, name: []const u8) storage.Error!void {
 }
 fn vtDdbUpdateTable(ctx: *anyopaque, in: storage.UpdateTableInput) storage.Error!*const storage.TableSlot {
     return ddbUpdateTable(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtDdbPutItem(ctx: *anyopaque, allocator: Allocator, in: storage.PutItemInput) storage.Error!storage.PutItemResult {
+    return ddbPutItem(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtDdbGetItem(ctx: *anyopaque, allocator: Allocator, in: storage.GetItemInput) storage.Error!storage.GetItemResult {
+    return ddbGetItem(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtDdbDeleteItem(ctx: *anyopaque, allocator: Allocator, in: storage.DeleteItemInput) storage.Error!storage.DeleteItemResult {
+    return ddbDeleteItem(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 
 // ---------------------------------------------------------------------------
@@ -3481,6 +3493,191 @@ pub fn ddbUpdateTable(self: *Fs, in: storage.UpdateTableInput) storage.Error!*co
     if (in.billing_mode) |bm| slot.billing_mode = bm;
     writeSchemaJson(self, slot) catch return storage.Error.Io;
     return slot;
+}
+
+// ---------------------------------------------------------------------------
+// DynamoDB item operations (M15-items, Phase 3)
+//
+// Items live in-memory in `slot.items` and are persisted to
+// <table>/items/<safe_key>.json. The "safe key" is sha256 hex of the
+// composite key string — avoids filename-encoding nightmares and keeps
+// the dir flat.
+
+const ddb_attr = @import("../wire/dynamodb/attribute_value.zig");
+
+fn itemKeyHash(key: []const u8) [64]u8 {
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    sha.update(key);
+    var digest: [32]u8 = undefined;
+    sha.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn itemPath(self: *Fs, table: []const u8, key_hash: *const [64]u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/dynamodb/tables/{s}/items/{s}.json", .{ self.base_dir, table, key_hash });
+}
+
+fn writeItemJson(self: *Fs, table: []const u8, key_hash: *const [64]u8, item: *const storage.Item) !void {
+    var dir_buf: [4096]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&dir_buf, "{s}/dynamodb/tables/{s}/items", .{ self.base_dir, table });
+    try Io.Dir.cwd().createDirPath(self.io, dir_path);
+
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try renderItem(&s, self.allocator, item);
+    const body = aw.toOwnedSlice() catch return error.OutOfMemory;
+    defer self.allocator.free(body);
+
+    var path_buf: [4096]u8 = undefined;
+    const path = try itemPath(self, table, key_hash, &path_buf);
+    try writeAtomic(self.io, path, body);
+}
+
+fn renderItem(s: *std.json.Stringify, allocator: Allocator, item: *const storage.Item) !void {
+    try s.beginObject();
+    for (item.names, item.values) |name, value| {
+        try s.objectField(name);
+        try ddb_attr.renderValue(s, allocator, value);
+    }
+    try s.endObject();
+}
+
+fn cloneItem(allocator: Allocator, item: *const storage.Item) !storage.Item {
+    const names = try allocator.alloc([]const u8, item.names.len);
+    var names_done: usize = 0;
+    errdefer {
+        for (names[0..names_done]) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    const values = try allocator.alloc(ddb_attr.AttributeValue, item.values.len);
+    var values_done: usize = 0;
+    errdefer {
+        for (values[0..values_done]) |*v| {
+            var copy = v.*;
+            ddb_attr.deinit(allocator, &copy);
+        }
+        allocator.free(values);
+    }
+    for (item.names, 0..) |n, i| {
+        names[i] = try allocator.dupe(u8, n);
+        names_done = i + 1;
+    }
+    for (item.values, 0..) |v, i| {
+        values[i] = try cloneAttributeValue(allocator, v);
+        values_done = i + 1;
+    }
+    return .{ .names = names, .values = values };
+}
+
+fn cloneAttributeValue(allocator: Allocator, v: ddb_attr.AttributeValue) !ddb_attr.AttributeValue {
+    return switch (v) {
+        .s => |s| .{ .s = try allocator.dupe(u8, s) },
+        .n => |s| .{ .n = try allocator.dupe(u8, s) },
+        .b => |bytes| .{ .b = try allocator.dupe(u8, bytes) },
+        .bool => |b| .{ .bool = b },
+        .null => .null,
+        .list => |items| blk: {
+            const out = try allocator.alloc(ddb_attr.AttributeValue, items.len);
+            for (items, 0..) |child, i| out[i] = try cloneAttributeValue(allocator, child);
+            break :blk .{ .list = out };
+        },
+        .map => |m| blk: {
+            const names = try allocator.alloc([]const u8, m.names.len);
+            for (m.names, 0..) |n, i| names[i] = try allocator.dupe(u8, n);
+            const values = try allocator.alloc(ddb_attr.AttributeValue, m.values.len);
+            for (m.values, 0..) |child, i| values[i] = try cloneAttributeValue(allocator, child);
+            break :blk .{ .map = .{ .names = names, .values = values } };
+        },
+        .ss => |elems| .{ .ss = try dupSlices(allocator, elems) },
+        .ns => |elems| .{ .ns = try dupSlices(allocator, elems) },
+        .bs => |elems| .{ .bs = try dupSlices(allocator, elems) },
+    };
+}
+
+fn dupSlices(allocator: Allocator, src: []const []const u8) ![]const []const u8 {
+    const out = try allocator.alloc([]const u8, src.len);
+    for (src, 0..) |s, i| out[i] = try allocator.dupe(u8, s);
+    return out;
+}
+
+pub fn ddbPutItem(self: *Fs, allocator: Allocator, in: storage.PutItemInput) storage.Error!storage.PutItemResult {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.dynamo_tables.get(in.table) orelse return storage.Error.TableNotFound;
+
+    // Build the composite key from the item's key attributes.
+    const key_str = storage.dynamo_state.buildItemKey(self.allocator, slot, in.item) catch
+        return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(key_str);
+
+    var result: storage.PutItemResult = .{};
+
+    // If an item already exists at this key, surface it as old_item (using
+    // the caller's allocator) and free the in-memory copy.
+    if (slot.items.fetchRemove(key_str)) |existing| {
+        result.old_item = cloneItem(allocator, existing.value) catch return storage.Error.OutOfMemory;
+        self.allocator.free(existing.key);
+        existing.value.deinit(self.allocator);
+        self.allocator.destroy(existing.value);
+    }
+
+    // Deep-copy the new item into long-lived state.
+    const owned = cloneItem(self.allocator, in.item) catch return storage.Error.OutOfMemory;
+    const owned_ptr = self.allocator.create(storage.Item) catch return storage.Error.OutOfMemory;
+    owned_ptr.* = owned;
+
+    const key_hash = itemKeyHash(key_str);
+    writeItemJson(self, slot.name, &key_hash, owned_ptr) catch {
+        owned_ptr.deinit(self.allocator);
+        self.allocator.destroy(owned_ptr);
+        self.allocator.free(key_str);
+        return storage.Error.Io;
+    };
+
+    slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
+    return result;
+}
+
+pub fn ddbGetItem(self: *Fs, allocator: Allocator, in: storage.GetItemInput) storage.Error!storage.GetItemResult {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.dynamo_tables.get(in.table) orelse return storage.Error.TableNotFound;
+    const key_str = storage.dynamo_state.buildKeyFromAttrs(self.allocator, slot, in.key) catch
+        return storage.Error.OutOfMemory;
+    defer self.allocator.free(key_str);
+
+    const stored = slot.items.get(key_str) orelse return .{ .item = null };
+    return .{ .item = cloneItem(allocator, stored) catch return storage.Error.OutOfMemory };
+}
+
+pub fn ddbDeleteItem(self: *Fs, allocator: Allocator, in: storage.DeleteItemInput) storage.Error!storage.DeleteItemResult {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.dynamo_tables.get(in.table) orelse return storage.Error.TableNotFound;
+    const key_str = storage.dynamo_state.buildKeyFromAttrs(self.allocator, slot, in.key) catch
+        return storage.Error.OutOfMemory;
+    defer self.allocator.free(key_str);
+
+    const removed = slot.items.fetchRemove(key_str) orelse return .{ .old_item = null };
+
+    // Delete the on-disk file (best-effort: missing is fine).
+    const key_hash = itemKeyHash(key_str);
+    var path_buf: [4096]u8 = undefined;
+    const path = itemPath(self, slot.name, &key_hash, &path_buf) catch return storage.Error.Io;
+    Io.Dir.cwd().deleteFile(self.io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return storage.Error.Io,
+    };
+
+    const old = cloneItem(allocator, removed.value) catch return storage.Error.OutOfMemory;
+    self.allocator.free(removed.key);
+    removed.value.deinit(self.allocator);
+    self.allocator.destroy(removed.value);
+    return .{ .old_item = old };
 }
 
 // ---------------------------------------------------------------------------
