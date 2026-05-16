@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**nanostack** is a snappy, accurate AWS emulator for local development, written in Zig. Single static binary (~0.8 MB stripped), sub-second cold start, ~11 MB idle RSS. Currently `v0.1.2` — S3 is functionally complete for local-dev use (68 / 107 Smithy ops routed) **with real bucket-policy / ACL / Public Access Block enforcement** (no longer accept-store-roundtrip). Pre-`v1.0.0`; minor breaking changes are expected.
+**nanostack** is a snappy, accurate AWS emulator for local development, written in Zig. Single static binary (~0.8 MB stripped), sub-second cold start, ~11 MB idle RSS. Currently `v0.1.3` — S3 is functionally complete for local-dev use (68 / 107 Smithy ops routed) **with real bucket-policy / ACL / Public Access Block enforcement** and zero outstanding drift items in `SUPPORT.md`. Pre-`v1.0.0`; minor breaking changes are expected.
 
 The wedge is **accuracy beats LocalStack on the surface we cover**. See `docs/PRD.md` for the full product spec, `docs/SUPPORT.md` for the live op matrix + accuracy-wins-vs-LocalStack section + drift tracking table.
 
@@ -77,7 +77,7 @@ HTTP (httpz takeover)
 - **Authz hook runs between `router.parse` and `s3.handle`** (`src/auth/authz.zig`). Bucket policy + ACL + PAB are **really evaluated**, not accept-store-roundtrip. Order: account-scoped fast-path → PAB filters (non-owner) → bucket policy → ACL (per-object on object-read, per-bucket on object-create) → bucket-owner-implicit FULL_CONTROL → default deny. `--no-auth` bypasses both SigV4 and this hook. Unsigned requests arrive as `Principal.anonymous()` and go through the hook, not auto-403 — that's how `public-read` works end-to-end.
 - **XML emitter at `src/wire/xml.zig`**: `Element.text = null` self-closes as `<Foo/>`; `Element.text = ""` emits paired `<Foo></Foo>`. AWS expects paired tags for empty-but-present fields (Prefix, Delimiter, KeyMarker).
 - **Storage schema is versioned by milestones**, not by an explicit schema version field — every new persisted field on `MetaDoc` / `VersionedMetaDoc` / `ManifestDoc` / `BucketRecord` must be threaded through `readMeta`, `writeFlat*`, `cloneVersionedMeta`, `freeObjectMetaOwned`, `rebuildVersionIndex`, `migrateNoneToEnabled`, `rewriteVersionMeta`, `putObjectFlat`, `putObjectVersioned`, `completeMultipartUpload`, `rebuildUploadIndex`, `writeManifest`. M9/M10/M11/M12/M13 commits are the templates.
-- **SUPPORT.md drift table** (`docs/SUPPORT.md` § "Known drift — to fix") tracks known AWS-spec divergences across 3 waves. Status column (`todo` / `in-progress` / `done`) burns down as fixes land. Wave 1 + Wave 2 done; Wave 3 (11 items, validation + SigV4 edge cases) outstanding.
+- **SUPPORT.md drift table** (`docs/SUPPORT.md` § "Known drift — to fix") tracks known AWS-spec divergences across 3 waves. All three waves are done as of v0.1.3 — the table is empty and the only reason it remains is to record what we fixed. Future drift goes into a new wave.
 - **PR checklist** (`.github/PULL_REQUEST_TEMPLATE.md`): every PR confirms `zig build && zig build test` green, conformance suites green, and updates `docs/SUPPORT.md` + `docs/CHANGELOG.md` when user-visible behaviour shifts.
 
 ## Development workflow
