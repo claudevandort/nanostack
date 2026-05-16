@@ -36,6 +36,7 @@ pub const Error = error{
     // DynamoDB (M15).
     TableAlreadyExists,
     TableNotFound,
+    ConditionalCheckFailed,
     Io,
     OutOfMemory,
 };
@@ -1265,11 +1266,25 @@ pub const UpdateTableInput = struct {
     billing_mode: ?dynamo_state.BillingMode = null,
 };
 
+/// A pre-evaluated condition predicate. Storage holds the mutex and
+/// calls `evaluate` against the existing item. Returns true if the
+/// condition passes; false → the storage op fails with
+/// `ConditionalCheckFailed`.
+pub const ConditionPredicate = struct {
+    ctx: *anyopaque,
+    evaluate_fn: *const fn (ctx: *anyopaque, existing: ?*const Item) bool,
+
+    pub fn evaluate(self: ConditionPredicate, existing: ?*const Item) bool {
+        return self.evaluate_fn(self.ctx, existing);
+    }
+};
+
 /// PutItem input. `item` is borrowed from the request arena. The backend
 /// deep-copies into long-lived state.
 pub const PutItemInput = struct {
     table: []const u8,
     item: *const Item,
+    condition: ?ConditionPredicate = null,
 };
 
 /// PutItem result includes the previous item (when ReturnValues=ALL_OLD).
@@ -1293,11 +1308,30 @@ pub const GetItemResult = struct {
 pub const DeleteItemInput = struct {
     table: []const u8,
     key: *const Item,
+    condition: ?ConditionPredicate = null,
 };
 
 pub const DeleteItemResult = struct {
     old_item: ?Item = null,
 };
+
+/// UpdateItem input — runs the supplied applier under the Fs mutex.
+pub const UpdateItemInput = struct {
+    table: []const u8,
+    key: *const Item,
+    /// Called with a writable clone of the existing item (or a fresh
+    /// key-only item if absent). Should mutate it in-place.
+    apply_fn: *const fn (ctx: *anyopaque, item: *Item) bool,
+    apply_ctx: *anyopaque,
+    /// Optional ConditionExpression predicate.
+    condition: ?ConditionPredicate = null,
+};
+
+pub const UpdateItemResult = struct {
+    old_item: ?Item = null,
+    new_item: ?Item = null,
+};
+
 
 pub const DynamoBackend = struct {
     ctx: *anyopaque,
@@ -1313,6 +1347,7 @@ pub const DynamoBackend = struct {
         putItem: *const fn (ctx: *anyopaque, allocator: Allocator, in: PutItemInput) Error!PutItemResult,
         getItem: *const fn (ctx: *anyopaque, allocator: Allocator, in: GetItemInput) Error!GetItemResult,
         deleteItem: *const fn (ctx: *anyopaque, allocator: Allocator, in: DeleteItemInput) Error!DeleteItemResult,
+        updateItem: *const fn (ctx: *anyopaque, allocator: Allocator, in: UpdateItemInput) Error!UpdateItemResult,
     };
 
     pub fn listTables(self: DynamoBackend, allocator: Allocator) Error![]const []const u8 {
@@ -1338,6 +1373,9 @@ pub const DynamoBackend = struct {
     }
     pub fn deleteItem(self: DynamoBackend, allocator: Allocator, in: DeleteItemInput) Error!DeleteItemResult {
         return self.vtable.deleteItem(self.ctx, allocator, in);
+    }
+    pub fn updateItem(self: DynamoBackend, allocator: Allocator, in: UpdateItemInput) Error!UpdateItemResult {
+        return self.vtable.updateItem(self.ctx, allocator, in);
     }
 };
 

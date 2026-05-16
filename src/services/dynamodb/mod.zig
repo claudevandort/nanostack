@@ -75,6 +75,9 @@ pub fn handle(ctx: Context) Result {
     if (std.mem.eql(u8, target, "PutItem")) return items_handler.putItem(ctx);
     if (std.mem.eql(u8, target, "DeleteItem")) return items_handler.deleteItem(ctx);
 
+    // UpdateItem + ConditionExpression on Put/Delete (M15-expressions, Phase 4).
+    if (std.mem.eql(u8, target, "UpdateItem")) return items_handler.updateItem(ctx);
+
     // Anything else gets 400 ValidationException with a message that
     // names the unsupported target. AWS-correct: unknown targets return
     // ValidationException, not 404.
@@ -105,6 +108,7 @@ const StubBackend = struct {
             .putItem = stubPutItem,
             .getItem = stubGetItem,
             .deleteItem = stubDeleteItem,
+            .updateItem = stubUpdateItem,
         } };
     }
 
@@ -115,6 +119,9 @@ const StubBackend = struct {
         unreachable;
     }
     fn stubDeleteItem(_: *anyopaque, _: Allocator, _: storage.DeleteItemInput) storage.Error!storage.DeleteItemResult {
+        unreachable;
+    }
+    fn stubUpdateItem(_: *anyopaque, _: Allocator, _: storage.UpdateItemInput) storage.Error!storage.UpdateItemResult {
         unreachable;
     }
 

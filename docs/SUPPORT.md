@@ -77,8 +77,11 @@ DynamoDB is the second AWS service nanostack covers, opt-in via `--services s3,d
 | DeleteTable | supported (immediate; no `DELETING` state; returns TableDescription of the deleted table) | M15-tables |
 | UpdateTable | supported (BillingMode mutation only; online GSI add/remove deferred to v0.3) | M15-tables |
 | GetItem | supported (Item lookup by primary key; full AttributeValue coverage) | M15-items |
-| PutItem | supported (auto-overwrite; ReturnValues NONE/ALL_OLD; ConditionExpression in M15-expressions) | M15-items |
-| DeleteItem | supported (idempotent; ReturnValues NONE/ALL_OLD; ConditionExpression in M15-expressions) | M15-items |
+| PutItem | supported (auto-overwrite; ReturnValues NONE/ALL_OLD; ConditionExpression) | M15-items, M15-expressions |
+| DeleteItem | supported (idempotent; ReturnValues NONE/ALL_OLD; ConditionExpression) | M15-items, M15-expressions |
+| UpdateItem | supported (SET / REMOVE / ADD / DELETE; if_not_exists, list_append, atomic counters; full ReturnValues; ConditionExpression) | M15-expressions |
+| ConditionExpression | supported (=, <>, <, <=, >, >=, AND, OR, NOT, BETWEEN, IN, attribute_exists, attribute_not_exists, attribute_type, begins_with, contains, parentheses) | M15-expressions |
+| UpdateExpression | supported (SET / REMOVE / ADD / DELETE actions; arithmetic on N; if_not_exists; list_append; set union / subtraction) | M15-expressions |
 | GetItem / PutItem / DeleteItem | planned | M15-items |
 | UpdateItem (with UpdateExpression) | planned | M15-expressions |
 | Query (incl. GSI/LSI) | planned | M15-query / M15-gsi |
