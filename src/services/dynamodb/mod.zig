@@ -105,6 +105,10 @@ const StubBackend = struct {
     pub fn backend(self: *const StubBackend) storage.DynamoBackend {
         return .{ .ctx = @ptrCast(@constCast(self)), .vtable = &.{
             .listTables = stubListTables,
+            .createTable = stubCreateTable,
+            .describeTable = stubDescribeTable,
+            .deleteTable = stubDeleteTable,
+            .updateTable = stubUpdateTable,
         } };
     }
 
@@ -114,6 +118,19 @@ const StubBackend = struct {
         const out = try allocator.alloc([]const u8, self.names.len);
         for (self.names, 0..) |n, i| out[i] = try allocator.dupe(u8, n);
         return out;
+    }
+
+    fn stubCreateTable(_: *anyopaque, _: storage.CreateTableInput) storage.Error!void {
+        unreachable;
+    }
+    fn stubDescribeTable(_: *anyopaque, _: []const u8) storage.Error!*const storage.TableSlot {
+        unreachable;
+    }
+    fn stubDeleteTable(_: *anyopaque, _: []const u8) storage.Error!void {
+        unreachable;
+    }
+    fn stubUpdateTable(_: *anyopaque, _: storage.UpdateTableInput) storage.Error!*const storage.TableSlot {
+        unreachable;
     }
 };
 

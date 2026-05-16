@@ -459,6 +459,9 @@ pub fn mapStorageErr(e: storage.Error) errors.Code {
         storage.Error.InvalidBucketName => .invalid_bucket_name,
         storage.Error.InvalidObjectKey => .invalid_argument,
         storage.Error.InvalidTag => .invalid_tag,
+        // DynamoDB error variants — S3 should never see them; if it does,
+        // treat as internal_error (defensive).
+        storage.Error.TableAlreadyExists, storage.Error.TableNotFound => .internal_error,
         storage.Error.Io, storage.Error.OutOfMemory => .internal_error,
     };
 }

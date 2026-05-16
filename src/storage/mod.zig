@@ -33,6 +33,9 @@ pub const Error = error{
     InvalidBucketName,
     InvalidObjectKey,
     InvalidTag,
+    // DynamoDB (M15).
+    TableAlreadyExists,
+    TableNotFound,
     Io,
     OutOfMemory,
 };
@@ -1237,9 +1240,29 @@ pub const Backend = struct {
 // DynamoDB backend (M15, v0.2.0).
 //
 // Separate vtable from S3's `Backend` to keep each surface focused and
-// readable. `Fs` implements both — one struct, two backend views. The
-// Phase-1 stub only carries `listTables`; subsequent phases (M15-tables,
-// M15-items, ...) add the rest.
+// readable. `Fs` implements both — one struct, two backend views.
+
+pub const dynamo_state = @import("dynamo_state.zig");
+pub const TableSlot = dynamo_state.TableSlot;
+
+/// Inputs for CreateTable. All slices are borrowed from the request
+/// arena; the backend is responsible for copying anything it persists.
+pub const CreateTableInput = struct {
+    name: []const u8,
+    key_schema: []const dynamo_state.KeyAttribute,
+    attribute_definitions: []const dynamo_state.AttributeDef,
+    billing_mode: dynamo_state.BillingMode = .pay_per_request,
+    global_secondary_indexes: []const dynamo_state.GsiDef = &.{},
+    local_secondary_indexes: []const dynamo_state.LsiDef = &.{},
+    tags: []const dynamo_state.Tag = &.{},
+};
+
+/// Inputs for UpdateTable. Phase 2 supports BillingMode metadata changes
+/// only; other fields are accepted-and-ignored (documented divergence).
+pub const UpdateTableInput = struct {
+    name: []const u8,
+    billing_mode: ?dynamo_state.BillingMode = null,
+};
 
 pub const DynamoBackend = struct {
     ctx: *anyopaque,
@@ -1247,10 +1270,26 @@ pub const DynamoBackend = struct {
 
     pub const VTable = struct {
         listTables: *const fn (ctx: *anyopaque, allocator: Allocator) Error![]const []const u8,
+        createTable: *const fn (ctx: *anyopaque, in: CreateTableInput) Error!void,
+        describeTable: *const fn (ctx: *anyopaque, name: []const u8) Error!*const TableSlot,
+        deleteTable: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
+        updateTable: *const fn (ctx: *anyopaque, in: UpdateTableInput) Error!*const TableSlot,
     };
 
     pub fn listTables(self: DynamoBackend, allocator: Allocator) Error![]const []const u8 {
         return self.vtable.listTables(self.ctx, allocator);
+    }
+    pub fn createTable(self: DynamoBackend, in: CreateTableInput) Error!void {
+        return self.vtable.createTable(self.ctx, in);
+    }
+    pub fn describeTable(self: DynamoBackend, name: []const u8) Error!*const TableSlot {
+        return self.vtable.describeTable(self.ctx, name);
+    }
+    pub fn deleteTable(self: DynamoBackend, name: []const u8) Error!void {
+        return self.vtable.deleteTable(self.ctx, name);
+    }
+    pub fn updateTable(self: DynamoBackend, in: UpdateTableInput) Error!*const TableSlot {
+        return self.vtable.updateTable(self.ctx, in);
     }
 };
 

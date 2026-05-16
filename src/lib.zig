@@ -19,6 +19,7 @@ pub const acl_responses = @import("wire/acl_responses.zig");
 pub const policy_parser = @import("wire/policy_parser.zig");
 pub const policy_doc = @import("wire/policy_doc.zig");
 pub const ddb_attribute_value = @import("wire/dynamodb/attribute_value.zig");
+pub const dynamo_state = @import("storage/dynamo_state.zig");
 pub const ddb_errors = @import("wire/dynamodb/errors.zig");
 pub const dynamodb = @import("services/dynamodb/mod.zig");
 pub const ownership_controls_wire = @import("wire/ownership_controls.zig");
@@ -98,6 +99,7 @@ test {
     _ = policy_parser;
     _ = policy_doc;
     _ = ddb_attribute_value;
+    _ = dynamo_state;
     _ = ddb_errors;
     _ = dynamodb;
     _ = ownership_controls_wire;

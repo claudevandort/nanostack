@@ -719,6 +719,11 @@ buckets: std.ArrayList(BucketSlot),
 /// state is observable only within a single nanostack session for the
 /// 200-vs-202 distinction on RestoreObject (drift #21).
 restored_objects: std.StringHashMapUnmanaged(void),
+/// DynamoDB table metadata, in-memory. Keys are the table name (owned
+/// by the slot itself). Values are heap-allocated `TableSlot`s persisted
+/// at `<base>/dynamodb/tables/<name>/schema.json`. Lock via `mutex` for
+/// any mutation.
+dynamo_tables: std.StringHashMapUnmanaged(*storage.TableSlot),
 
 pub const InitError = error{
     OutOfMemory,
@@ -739,10 +744,13 @@ pub fn init(allocator: Allocator, io: Io, base_dir: []const u8) InitError!*Fs {
         .mutex = .init,
         .buckets = .empty,
         .restored_objects = .empty,
+        .dynamo_tables = .empty,
     };
 
     ensureS3Dir(self) catch return InitError.Io;
     loadRegistry(self) catch return InitError.Io;
+    ensureDynamoDir(self) catch return InitError.Io;
+    loadDynamoTables(self) catch return InitError.Io;
     return self;
 }
 
@@ -753,6 +761,14 @@ pub fn deinit(self: *Fs) void {
         var it = self.restored_objects.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.restored_objects.deinit(self.allocator);
+    }
+    {
+        var it = self.dynamo_tables.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinit(self.allocator);
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.dynamo_tables.deinit(self.allocator);
     }
     self.allocator.free(self.base_dir);
     self.allocator.destroy(self);
@@ -771,18 +787,26 @@ pub fn dynamoBackend(self: *Fs) storage.DynamoBackend {
 
 const dynamo_vtable: storage.DynamoBackend.VTable = .{
     .listTables = vtDdbListTables,
+    .createTable = vtDdbCreateTable,
+    .describeTable = vtDdbDescribeTable,
+    .deleteTable = vtDdbDeleteTable,
+    .updateTable = vtDdbUpdateTable,
 };
 
 fn vtDdbListTables(ctx: *anyopaque, allocator: Allocator) storage.Error![]const []const u8 {
     return ddbListTables(@ptrCast(@alignCast(ctx)), allocator);
 }
-
-pub fn ddbListTables(self: *Fs, allocator: Allocator) storage.Error![]const []const u8 {
-    _ = self;
-    _ = allocator;
-    // Phase-1 stub: no tables exist yet. M15-tables (Phase 2) wires this
-    // up against a real in-memory `dynamo.tables` map + disk persistence.
-    return &.{};
+fn vtDdbCreateTable(ctx: *anyopaque, in: storage.CreateTableInput) storage.Error!void {
+    return ddbCreateTable(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtDdbDescribeTable(ctx: *anyopaque, name: []const u8) storage.Error!*const storage.TableSlot {
+    return ddbDescribeTable(@ptrCast(@alignCast(ctx)), name);
+}
+fn vtDdbDeleteTable(ctx: *anyopaque, name: []const u8) storage.Error!void {
+    return ddbDeleteTable(@ptrCast(@alignCast(ctx)), name);
+}
+fn vtDdbUpdateTable(ctx: *anyopaque, in: storage.UpdateTableInput) storage.Error!*const storage.TableSlot {
+    return ddbUpdateTable(@ptrCast(@alignCast(ctx)), in);
 }
 
 // ---------------------------------------------------------------------------
@@ -3075,6 +3099,388 @@ pub fn listObjectVersions(self: *Fs, allocator: Allocator, in: storage.ListObjec
         .next_key_marker = next_key_owned,
         .next_version_id_marker = next_vid_owned,
     };
+}
+
+// ---------------------------------------------------------------------------
+// DynamoDB table operations (M15-tables, Phase 2)
+//
+// All mutating ops hold `self.mutex` for the validate-then-apply +
+// write-through-to-disk path. On startup we walk
+// `<base>/dynamodb/tables/*/schema.json` to rebuild the in-memory map.
+
+const ddb = struct {
+    const dynamo_state = storage.dynamo_state;
+    const TableSlot = storage.TableSlot;
+};
+
+fn ensureDynamoDir(self: *Fs) !void {
+    var buf: [4096]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/dynamodb/tables", .{self.base_dir});
+    try Io.Dir.cwd().createDirPath(self.io, path);
+}
+
+/// Serialise a TableSlot to the on-disk schema.json layout.
+/// Format is internal to nanostack; the wire layer translates to/from
+/// the AWS-PascalCase JSON shape on requests/responses.
+const SchemaDoc = struct {
+    version: u32,
+    name: []const u8,
+    key_schema: []const KeyAttrDoc,
+    attribute_definitions: []const AttributeDefDoc,
+    billing_mode: []const u8,
+    global_secondary_indexes: []const IndexDoc,
+    local_secondary_indexes: []const IndexDoc,
+    tags: []const TagDoc,
+    created_unix: i64,
+};
+const KeyAttrDoc = struct { name: []const u8, key_type: []const u8 };
+const AttributeDefDoc = struct { name: []const u8, type: []const u8 };
+const ProjectionDoc = struct { type: []const u8, non_key_attributes: []const []const u8 };
+const IndexDoc = struct {
+    name: []const u8,
+    key_schema: []const KeyAttrDoc,
+    projection: ProjectionDoc,
+};
+const TagDoc = struct { key: []const u8, value: []const u8 };
+
+fn tableDirPath(self: *Fs, name: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/dynamodb/tables/{s}", .{ self.base_dir, name });
+}
+
+fn schemaJsonPath(self: *Fs, name: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/dynamodb/tables/{s}/schema.json", .{ self.base_dir, name });
+}
+
+fn writeSchemaJson(self: *Fs, slot: *const storage.TableSlot) !void {
+    var dir_buf: [4096]u8 = undefined;
+    const dir_path = try tableDirPath(self, slot.name, &dir_buf);
+    try Io.Dir.cwd().createDirPath(self.io, dir_path);
+
+    const doc = try slotToDoc(self.allocator, slot);
+    defer freeDoc(self.allocator, doc);
+
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(doc, .{}, &aw.writer);
+    const body = aw.toOwnedSlice() catch return error.OutOfMemory;
+    defer self.allocator.free(body);
+
+    var path_buf: [4096]u8 = undefined;
+    const path = try schemaJsonPath(self, slot.name, &path_buf);
+    try writeAtomic(self.io, path, body);
+}
+
+fn slotToDoc(allocator: Allocator, slot: *const storage.TableSlot) !SchemaDoc {
+    const key_schema_doc = try allocator.alloc(KeyAttrDoc, slot.key_schema.len);
+    errdefer allocator.free(key_schema_doc);
+    for (slot.key_schema, 0..) |k, i| {
+        key_schema_doc[i] = .{ .name = k.name, .key_type = k.key_type.toAws() };
+    }
+
+    const attr_defs_doc = try allocator.alloc(AttributeDefDoc, slot.attribute_definitions.len);
+    errdefer allocator.free(attr_defs_doc);
+    for (slot.attribute_definitions, 0..) |a, i| {
+        attr_defs_doc[i] = .{ .name = a.name, .type = a.type.toAws() };
+    }
+
+    const gsi_doc = try indexesToDoc(allocator, slot.global_secondary_indexes, true);
+    errdefer allocator.free(gsi_doc);
+    const lsi_doc = try indexesToDoc(allocator, slot.local_secondary_indexes, false);
+    errdefer allocator.free(lsi_doc);
+
+    const tags_doc = try allocator.alloc(TagDoc, slot.tags.len);
+    errdefer allocator.free(tags_doc);
+    for (slot.tags, 0..) |t, i| tags_doc[i] = .{ .key = t.key, .value = t.value };
+
+    return .{
+        .version = 1,
+        .name = slot.name,
+        .key_schema = key_schema_doc,
+        .attribute_definitions = attr_defs_doc,
+        .billing_mode = slot.billing_mode.toAws(),
+        .global_secondary_indexes = gsi_doc,
+        .local_secondary_indexes = lsi_doc,
+        .tags = tags_doc,
+        .created_unix = slot.created_unix,
+    };
+}
+
+fn indexesToDoc(allocator: Allocator, src_gsi: anytype, _: bool) ![]IndexDoc {
+    const out = try allocator.alloc(IndexDoc, src_gsi.len);
+    errdefer allocator.free(out);
+    for (src_gsi, 0..) |g, i| {
+        const ks = try allocator.alloc(KeyAttrDoc, g.key_schema.len);
+        for (g.key_schema, 0..) |k, j| ks[j] = .{ .name = k.name, .key_type = k.key_type.toAws() };
+        out[i] = .{
+            .name = g.name,
+            .key_schema = ks,
+            .projection = .{ .type = g.projection.type.toAws(), .non_key_attributes = g.projection.non_key_attributes },
+        };
+    }
+    return out;
+}
+
+fn freeDoc(allocator: Allocator, doc: SchemaDoc) void {
+    allocator.free(doc.key_schema);
+    allocator.free(doc.attribute_definitions);
+    for (doc.global_secondary_indexes) |g| allocator.free(g.key_schema);
+    allocator.free(doc.global_secondary_indexes);
+    for (doc.local_secondary_indexes) |l| allocator.free(l.key_schema);
+    allocator.free(doc.local_secondary_indexes);
+    allocator.free(doc.tags);
+}
+
+fn loadDynamoTables(self: *Fs) !void {
+    var buf: [4096]u8 = undefined;
+    const tables_path = try std.fmt.bufPrint(&buf, "{s}/dynamodb/tables", .{self.base_dir});
+
+    var dir = Io.Dir.cwd().openDir(self.io, tables_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(self.io);
+
+    var it = dir.iterate();
+    while (try it.next(self.io)) |entry| {
+        if (entry.kind != .directory) continue;
+        try loadSingleTable(self, entry.name);
+    }
+}
+
+fn loadSingleTable(self: *Fs, name: []const u8) !void {
+    var path_buf: [4096]u8 = undefined;
+    const path = try schemaJsonPath(self, name, &path_buf);
+
+    const body = Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer self.allocator.free(body);
+
+    var parsed = std.json.parseFromSlice(SchemaDoc, self.allocator, body, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    const doc = parsed.value;
+
+    const slot = try docToSlot(self.allocator, doc);
+    const slot_ptr = try self.allocator.create(storage.TableSlot);
+    slot_ptr.* = slot;
+
+    // Map key shares ownership with slot.name.
+    try self.dynamo_tables.put(self.allocator, slot_ptr.name, slot_ptr);
+}
+
+fn docToSlot(allocator: Allocator, doc: SchemaDoc) !storage.TableSlot {
+    const name = try allocator.dupe(u8, doc.name);
+
+    const ks = try allocator.alloc(ddb.dynamo_state.KeyAttribute, doc.key_schema.len);
+    for (doc.key_schema, 0..) |k, i| {
+        ks[i] = .{
+            .name = try allocator.dupe(u8, k.name),
+            .key_type = ddb.dynamo_state.KeyType.fromAws(k.key_type) orelse .hash,
+        };
+    }
+
+    const ad = try allocator.alloc(ddb.dynamo_state.AttributeDef, doc.attribute_definitions.len);
+    for (doc.attribute_definitions, 0..) |a, i| {
+        ad[i] = .{
+            .name = try allocator.dupe(u8, a.name),
+            .type = ddb.dynamo_state.ScalarType.fromAws(a.type) orelse .string,
+        };
+    }
+
+    const gsis = try docIndexesToSlot(allocator, doc.global_secondary_indexes, ddb.dynamo_state.GsiDef);
+    const lsis = try docIndexesToSlot(allocator, doc.local_secondary_indexes, ddb.dynamo_state.LsiDef);
+
+    const tags = try allocator.alloc(ddb.dynamo_state.Tag, doc.tags.len);
+    for (doc.tags, 0..) |t, i| {
+        tags[i] = .{
+            .key = try allocator.dupe(u8, t.key),
+            .value = try allocator.dupe(u8, t.value),
+        };
+    }
+
+    return .{
+        .name = name,
+        .key_schema = ks,
+        .attribute_definitions = ad,
+        .billing_mode = ddb.dynamo_state.BillingMode.fromAws(doc.billing_mode) orelse .pay_per_request,
+        .global_secondary_indexes = gsis,
+        .local_secondary_indexes = lsis,
+        .tags = tags,
+        .created_unix = doc.created_unix,
+    };
+}
+
+fn docIndexesToSlot(allocator: Allocator, doc_indexes: []const IndexDoc, comptime T: type) ![]const T {
+    const out = try allocator.alloc(T, doc_indexes.len);
+    for (doc_indexes, 0..) |idx, i| {
+        const ks = try allocator.alloc(ddb.dynamo_state.KeyAttribute, idx.key_schema.len);
+        for (idx.key_schema, 0..) |k, j| {
+            ks[j] = .{
+                .name = try allocator.dupe(u8, k.name),
+                .key_type = ddb.dynamo_state.KeyType.fromAws(k.key_type) orelse .hash,
+            };
+        }
+        const nka = try allocator.alloc([]const u8, idx.projection.non_key_attributes.len);
+        for (idx.projection.non_key_attributes, 0..) |a, j| nka[j] = try allocator.dupe(u8, a);
+        out[i] = .{
+            .name = try allocator.dupe(u8, idx.name),
+            .key_schema = ks,
+            .projection = .{
+                .type = ddb.dynamo_state.ProjectionType.fromAws(idx.projection.type) orelse .all,
+                .non_key_attributes = nka,
+            },
+        };
+    }
+    return out;
+}
+
+pub fn ddbListTables(self: *Fs, allocator: Allocator) storage.Error![]const []const u8 {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+    var it = self.dynamo_tables.iterator();
+    while (it.next()) |entry| {
+        const owned = allocator.dupe(u8, entry.key_ptr.*) catch return storage.Error.OutOfMemory;
+        names.append(allocator, owned) catch return storage.Error.OutOfMemory;
+    }
+    // Sort lex-ascending for deterministic output (also matches AWS).
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return names.toOwnedSlice(allocator) catch storage.Error.OutOfMemory;
+}
+
+pub fn ddbCreateTable(self: *Fs, in: storage.CreateTableInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    if (self.dynamo_tables.contains(in.name)) return storage.Error.TableAlreadyExists;
+
+    const slot = cloneTableSlot(self.allocator, in, nowUnixSeconds(self.io)) catch
+        return storage.Error.OutOfMemory;
+    const slot_ptr = self.allocator.create(storage.TableSlot) catch {
+        var tmp = slot;
+        tmp.deinit(self.allocator);
+        return storage.Error.OutOfMemory;
+    };
+    slot_ptr.* = slot;
+
+    writeSchemaJson(self, slot_ptr) catch {
+        slot_ptr.deinit(self.allocator);
+        self.allocator.destroy(slot_ptr);
+        return storage.Error.Io;
+    };
+
+    self.dynamo_tables.put(self.allocator, slot_ptr.name, slot_ptr) catch {
+        // Disk has the schema but in-memory put failed — leave on disk;
+        // next startup will load it via loadDynamoTables. Surface OOM.
+        return storage.Error.OutOfMemory;
+    };
+}
+
+fn cloneTableSlot(allocator: Allocator, in: storage.CreateTableInput, created_unix: i64) !storage.TableSlot {
+    const name = try allocator.dupe(u8, in.name);
+    errdefer allocator.free(name);
+
+    const ks = try allocator.alloc(ddb.dynamo_state.KeyAttribute, in.key_schema.len);
+    var ks_done: usize = 0;
+    errdefer {
+        for (ks[0..ks_done]) |k| allocator.free(k.name);
+        allocator.free(ks);
+    }
+    for (in.key_schema, 0..) |k, i| {
+        ks[i] = .{ .name = try allocator.dupe(u8, k.name), .key_type = k.key_type };
+        ks_done = i + 1;
+    }
+
+    const ad = try allocator.alloc(ddb.dynamo_state.AttributeDef, in.attribute_definitions.len);
+    var ad_done: usize = 0;
+    errdefer {
+        for (ad[0..ad_done]) |a| allocator.free(a.name);
+        allocator.free(ad);
+    }
+    for (in.attribute_definitions, 0..) |a, i| {
+        ad[i] = .{ .name = try allocator.dupe(u8, a.name), .type = a.type };
+        ad_done = i + 1;
+    }
+
+    const gsis = try cloneIndexes(allocator, ddb.dynamo_state.GsiDef, in.global_secondary_indexes);
+    const lsis = try cloneIndexes(allocator, ddb.dynamo_state.LsiDef, in.local_secondary_indexes);
+
+    const tags = try allocator.alloc(ddb.dynamo_state.Tag, in.tags.len);
+    for (in.tags, 0..) |t, i| {
+        tags[i] = .{
+            .key = try allocator.dupe(u8, t.key),
+            .value = try allocator.dupe(u8, t.value),
+        };
+    }
+
+    return .{
+        .name = name,
+        .key_schema = ks,
+        .attribute_definitions = ad,
+        .billing_mode = in.billing_mode,
+        .global_secondary_indexes = gsis,
+        .local_secondary_indexes = lsis,
+        .tags = tags,
+        .created_unix = created_unix,
+    };
+}
+
+fn cloneIndexes(allocator: Allocator, comptime T: type, src: anytype) ![]const T {
+    const out = try allocator.alloc(T, src.len);
+    for (src, 0..) |idx, i| {
+        const ks = try allocator.alloc(ddb.dynamo_state.KeyAttribute, idx.key_schema.len);
+        for (idx.key_schema, 0..) |k, j| {
+            ks[j] = .{ .name = try allocator.dupe(u8, k.name), .key_type = k.key_type };
+        }
+        const nka = try allocator.alloc([]const u8, idx.projection.non_key_attributes.len);
+        for (idx.projection.non_key_attributes, 0..) |a, j| nka[j] = try allocator.dupe(u8, a);
+        out[i] = .{
+            .name = try allocator.dupe(u8, idx.name),
+            .key_schema = ks,
+            .projection = .{ .type = idx.projection.type, .non_key_attributes = nka },
+        };
+    }
+    return out;
+}
+
+pub fn ddbDescribeTable(self: *Fs, name: []const u8) storage.Error!*const storage.TableSlot {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    return self.dynamo_tables.get(name) orelse storage.Error.TableNotFound;
+}
+
+pub fn ddbDeleteTable(self: *Fs, name: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.dynamo_tables.get(name) orelse return storage.Error.TableNotFound;
+    var dir_buf: [4096]u8 = undefined;
+    const dir_path = tableDirPath(self, name, &dir_buf) catch return storage.Error.Io;
+    Io.Dir.cwd().deleteTree(self.io, dir_path) catch return storage.Error.Io;
+
+    _ = self.dynamo_tables.remove(name);
+    slot.deinit(self.allocator);
+    self.allocator.destroy(slot);
+}
+
+pub fn ddbUpdateTable(self: *Fs, in: storage.UpdateTableInput) storage.Error!*const storage.TableSlot {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.dynamo_tables.get(in.name) orelse return storage.Error.TableNotFound;
+    if (in.billing_mode) |bm| slot.billing_mode = bm;
+    writeSchemaJson(self, slot) catch return storage.Error.Io;
+    return slot;
 }
 
 // ---------------------------------------------------------------------------
