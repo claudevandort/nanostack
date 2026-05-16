@@ -14,6 +14,7 @@ const storage = @import("../../storage/mod.zig");
 const errors = @import("../../wire/dynamodb/errors.zig");
 const tables = @import("tables.zig");
 const items_handler = @import("items.zig");
+const query_handler = @import("query.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -78,6 +79,9 @@ pub fn handle(ctx: Context) Result {
     // UpdateItem + ConditionExpression on Put/Delete (M15-expressions, Phase 4).
     if (std.mem.eql(u8, target, "UpdateItem")) return items_handler.updateItem(ctx);
 
+    // Query + KeyConditionExpression + FilterExpression (M15-query, Phase 5).
+    if (std.mem.eql(u8, target, "Query")) return query_handler.query(ctx);
+
     // Anything else gets 400 ValidationException with a message that
     // names the unsupported target. AWS-correct: unknown targets return
     // ValidationException, not 404.
@@ -109,7 +113,11 @@ const StubBackend = struct {
             .getItem = stubGetItem,
             .deleteItem = stubDeleteItem,
             .updateItem = stubUpdateItem,
+            .query = stubQuery,
         } };
+    }
+    fn stubQuery(_: *anyopaque, _: Allocator, _: storage.QueryInput) storage.Error!storage.QueryResult {
+        unreachable;
     }
 
     fn stubPutItem(_: *anyopaque, _: Allocator, _: storage.PutItemInput) storage.Error!storage.PutItemResult {
