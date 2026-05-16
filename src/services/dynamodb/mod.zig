@@ -15,6 +15,7 @@ const errors = @import("../../wire/dynamodb/errors.zig");
 const tables = @import("tables.zig");
 const items_handler = @import("items.zig");
 const query_handler = @import("query.zig");
+const scan_handler = @import("scan.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -81,6 +82,9 @@ pub fn handle(ctx: Context) Result {
 
     // Query + KeyConditionExpression + FilterExpression (M15-query, Phase 5).
     if (std.mem.eql(u8, target, "Query")) return query_handler.query(ctx);
+
+    // Scan (M15-scan, Phase 6).
+    if (std.mem.eql(u8, target, "Scan")) return scan_handler.scan(ctx);
 
     // Anything else gets 400 ValidationException with a message that
     // names the unsupported target. AWS-correct: unknown targets return

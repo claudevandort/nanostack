@@ -85,6 +85,7 @@ DynamoDB is the second AWS service nanostack covers, opt-in via `--services s3,d
 | Query | supported (KeyConditionExpression + FilterExpression; Limit; ScanIndexForward; ExclusiveStartKey/LastEvaluatedKey cursor) | M15-query |
 | KeyConditionExpression | supported (pk = X [AND sk pred]; sk pred = `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `begins_with`) | M15-query |
 | FilterExpression | supported (reuses ConditionExpression grammar; runs after key match) | M15-query |
+| Scan | supported (FilterExpression, Limit, ExclusiveStartKey cursor; `TotalSegments > 1` → ValidationException) | M15-scan |
 | GetItem / PutItem / DeleteItem | planned | M15-items |
 | UpdateItem (with UpdateExpression) | planned | M15-expressions |
 | Query (incl. GSI/LSI) | planned | M15-query / M15-gsi |
