@@ -350,12 +350,20 @@ fn resolvePayloadHash(req: Request, allocator: Allocator) VerifyError!PayloadHas
         if (std.mem.startsWith(u8, v, "STREAMING-")) {
             return VerifyError.StreamingUnsupported;
         }
-        if (v.len == 64 and isLowercaseHex(v)) {
+        if (v.len == 64 and isHex(v)) {
             // Hex digest mode: verify the body actually matches what the
             // client signed. Without this, the body could be tampered in
             // transit and we'd accept it.
+            //
+            // AWS accepts both upper- and lowercase hex. canonical.sha256Hex
+            // returns lowercase, so we lowercase the header for the byte
+            // comparison only. The returned canonical value preserves the
+            // original case — the client's SigV4 canonical request used
+            // the literal header value, so we must too.
+            var lowered: [64]u8 = undefined;
+            for (v, 0..) |c, i| lowered[i] = std.ascii.toLower(c);
             const actual = canonical.sha256Hex(req.body);
-            if (!std.mem.eql(u8, v, &actual)) return VerifyError.XAmzContentSha256Mismatch;
+            if (!std.mem.eql(u8, &lowered, &actual)) return VerifyError.XAmzContentSha256Mismatch;
             return .{ .bytes = v, .owned = false };
         }
         // Otherwise treat as opaque and use literally — AWS allows raw values.
@@ -367,9 +375,9 @@ fn resolvePayloadHash(req: Request, allocator: Allocator) VerifyError!PayloadHas
     return .{ .bytes = buf, .owned = true };
 }
 
-fn isLowercaseHex(s: []const u8) bool {
+fn isHex(s: []const u8) bool {
     for (s) |c| {
-        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
         if (!ok) return false;
     }
     return true;

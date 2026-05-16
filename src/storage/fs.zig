@@ -714,6 +714,11 @@ io: Io,
 base_dir: []u8,
 mutex: Io.Mutex,
 buckets: std.ArrayList(BucketSlot),
+/// In-memory set of "already restored" object keys, formatted as
+/// `"<bucket>/<key>/<version_id?>"`. Lost on restart by design — restore
+/// state is observable only within a single nanostack session for the
+/// 200-vs-202 distinction on RestoreObject (drift #21).
+restored_objects: std.StringHashMapUnmanaged(void),
 
 pub const InitError = error{
     OutOfMemory,
@@ -733,6 +738,7 @@ pub fn init(allocator: Allocator, io: Io, base_dir: []const u8) InitError!*Fs {
         .base_dir = base_owned,
         .mutex = .init,
         .buckets = .empty,
+        .restored_objects = .empty,
     };
 
     ensureS3Dir(self) catch return InitError.Io;
@@ -743,6 +749,11 @@ pub fn init(allocator: Allocator, io: Io, base_dir: []const u8) InitError!*Fs {
 pub fn deinit(self: *Fs) void {
     for (self.buckets.items) |*b| b.deinit(self.allocator);
     self.buckets.deinit(self.allocator);
+    {
+        var it = self.restored_objects.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
+        self.restored_objects.deinit(self.allocator);
+    }
     self.allocator.free(self.base_dir);
     self.allocator.destroy(self);
 }
@@ -990,7 +1001,7 @@ fn vtPutObjectLegalHold(ctx: *anyopaque, bucket: []const u8, key: []const u8, ve
 fn vtGetObjectLegalHold(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) storage.Error!storage.LegalHoldStatus {
     return getObjectLegalHold(@ptrCast(@alignCast(ctx)), bucket, key, version_id);
 }
-fn vtRestoreObject(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) storage.Error!void {
+fn vtRestoreObject(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) storage.Error!storage.RestoreOutcome {
     return restoreObject(@ptrCast(@alignCast(ctx)), bucket, key, version_id, days);
 }
 fn vtUpdateObjectEncryption(ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, algorithm: storage.SseAlgorithm, kms_key_id: []const u8) storage.Error!void {
@@ -2667,7 +2678,7 @@ pub fn getObjectLegalHold(self: *Fs, bucket: []const u8, key: []const u8, versio
 // ---------------------------------------------------------------------------
 // M13: PolicyStatus, RestoreObject, UpdateObjectEncryption, Replication.
 
-pub fn restoreObject(self: *Fs, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) storage.Error!void {
+pub fn restoreObject(self: *Fs, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) storage.Error!storage.RestoreOutcome {
     try storage.validateObjectKey(key);
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
@@ -2677,28 +2688,45 @@ pub fn restoreObject(self: *Fs, bucket: []const u8, key: []const u8, version_id:
     if (slot.versioning_status == .none) {
         // Restore on a flat object: rewrite meta.json.
         if (version_id) |_| return storage.Error.NoSuchKey;
-        return writeFlatRestore(self, bucket, key, days);
-    }
-
-    const chain = slot.versions.getPtr(key) orelse return storage.Error.NoSuchKey;
-    if (chain.items.len == 0) return storage.Error.NoSuchKey;
-    var target_idx: usize = 0;
-    if (version_id) |vid| {
-        var found: ?usize = null;
-        for (chain.items, 0..) |entry, i| {
-            if (std.mem.eql(u8, entry.version_id, vid)) {
-                found = i;
-                break;
+        try writeFlatRestore(self, bucket, key, days);
+    } else {
+        const chain = slot.versions.getPtr(key) orelse return storage.Error.NoSuchKey;
+        if (chain.items.len == 0) return storage.Error.NoSuchKey;
+        var target_idx: usize = 0;
+        if (version_id) |vid| {
+            var found: ?usize = null;
+            for (chain.items, 0..) |entry, i| {
+                if (std.mem.eql(u8, entry.version_id, vid)) {
+                    found = i;
+                    break;
+                }
             }
+            target_idx = found orelse return storage.Error.NoSuchKey;
         }
-        target_idx = found orelse return storage.Error.NoSuchKey;
-    }
-    if (chain.items[target_idx].is_delete_marker) return storage.Error.NoSuchKey;
+        if (chain.items[target_idx].is_delete_marker) return storage.Error.NoSuchKey;
 
-    const now = nowUnixSeconds(self.io);
-    chain.items[target_idx].restore_in_progress = true;
-    chain.items[target_idx].restore_expiry_unix = now + @as(i64, @intCast(days)) * 86400;
-    try rewriteVersionMeta(self, bucket, key, &chain.items[target_idx]);
+        const now = nowUnixSeconds(self.io);
+        chain.items[target_idx].restore_in_progress = true;
+        chain.items[target_idx].restore_expiry_unix = now + @as(i64, @intCast(days)) * 86400;
+        try rewriteVersionMeta(self, bucket, key, &chain.items[target_idx]);
+    }
+
+    // Drift #21: AWS returns 200 for an "already restored" idempotent
+    // RestoreObject and 202 for a fresh restore. State is in-memory only
+    // — lost on restart, acceptable for local-dev semantics.
+    const dedup_key = std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}", .{
+        bucket, key, version_id orelse "",
+    }) catch return storage.Error.OutOfMemory;
+    const entry = self.restored_objects.getOrPut(self.allocator, dedup_key) catch {
+        self.allocator.free(dedup_key);
+        return storage.Error.OutOfMemory;
+    };
+    if (entry.found_existing) {
+        // Free the redundant key — the existing map entry owns its own copy.
+        self.allocator.free(dedup_key);
+        return .already_in_progress;
+    }
+    return .initiated;
 }
 
 fn writeFlatRestore(self: *Fs, bucket: []const u8, key: []const u8, days: u32) storage.Error!void {

@@ -132,6 +132,46 @@ def test_content_sha256_mismatch_returns_distinct_code(s3, bucket_name):
         best_effort_delete_bucket(s3, bucket_name)
 
 
+def test_content_sha256_uppercase_hex_is_validated(s3, bucket_name):
+    """AWS accepts both upper- and lowercase hex in x-amz-content-sha256.
+
+    Drift table row 17. Previously uppercase hex fell through the
+    case-sensitive check to the "opaque" branch, silently bypassing
+    the body-integrity verification.
+    """
+    import hashlib
+    s3.create_bucket(Bucket=bucket_name)
+    try:
+        body = b"hello"
+        correct_upper = hashlib.sha256(body).hexdigest().upper()
+
+        # Happy path: signed with the uppercase digest matching the body → 200.
+        resp = sign_and_send(
+            "PUT", f"/{bucket_name}/k",
+            body=body,
+            payload_hash=correct_upper,
+        )
+        assert resp.status_code == 200, \
+            f"expected 200, got {resp.status_code}: {resp.text}"
+
+        # Mismatch path: uppercase hex that does NOT match → 400 (not silently accepted).
+        wrong_upper = ("A" * 64)
+        resp = sign_and_send(
+            "PUT", f"/{bucket_name}/k2",
+            body=body,
+            payload_hash=wrong_upper,
+        )
+        assert resp.status_code == 400, \
+            f"expected 400 on mismatch, got {resp.status_code}: {resp.text}"
+        assert "<Code>XAmzContentSHA256Mismatch</Code>" in resp.text
+    finally:
+        try:
+            s3.delete_object(Bucket=bucket_name, Key="k")
+        except Exception:
+            pass
+        best_effort_delete_bucket(s3, bucket_name)
+
+
 def test_no_auth_flag_accepts_anonymous():
     bin_path = os.environ.get("NANOSTACK_BIN")
     if not bin_path:

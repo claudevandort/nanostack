@@ -8,24 +8,27 @@ const Allocator = std.mem.Allocator;
 const xml = @import("xml.zig");
 const storage = @import("../storage/mod.zig");
 
-/// Render the ListBuckets response body. Caller owns the returned slice.
-///
-/// `owner_id` is the canonical user ID; we use the configured access key.
-/// `display_name` is the human-friendly owner name.
-pub fn renderListAllMyBucketsResult(
-    allocator: Allocator,
+/// Input to renderListAllMyBucketsResult. Supports the 2023 paging fields
+/// (drift #22): `prefix` is echoed when set; `continuation_token` is the
+/// NEXT-page token (absent when the listing isn't truncated).
+pub const ListBucketsInput = struct {
     owner_id: []const u8,
     display_name: []const u8,
     buckets: []const storage.Bucket,
-) ![]u8 {
+    prefix: ?[]const u8 = null,
+    continuation_token: ?[]const u8 = null,
+};
+
+/// Render the ListBuckets response body. Caller owns the returned slice.
+pub fn renderListAllMyBucketsResult(allocator: Allocator, in: ListBucketsInput) ![]u8 {
     // Build child element backing storage on a single arena so we don't
     // have to free a hundred tiny allocations on the happy path.
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var owner_id_el: xml.Element = .{ .name = "ID", .text = owner_id };
-    var owner_display_el: xml.Element = .{ .name = "DisplayName", .text = display_name };
+    var owner_id_el: xml.Element = .{ .name = "ID", .text = in.owner_id };
+    var owner_display_el: xml.Element = .{ .name = "DisplayName", .text = in.display_name };
     var owner_el: xml.Element = .{
         .name = "Owner",
         .children = try arena.dupe(xml.Node, &.{
@@ -37,8 +40,8 @@ pub fn renderListAllMyBucketsResult(
     // For each bucket build <Bucket><Name>...</Name><CreationDate>...</CreationDate><BucketRegion>...</BucketRegion></Bucket>.
     // AWS 2023 addition: BucketRegion lets newer SDKs route cross-region
     // requests without an extra HeadBucket. Drift table row 11.
-    var bucket_nodes = try arena.alloc(xml.Node, buckets.len);
-    for (buckets, 0..) |b, i| {
+    var bucket_nodes = try arena.alloc(xml.Node, in.buckets.len);
+    for (in.buckets, 0..) |b, i| {
         const date_str = try formatIso8601(arena, b.created_unix);
         const name_el = try arena.create(xml.Element);
         name_el.* = .{ .name = "Name", .text = b.name };
@@ -59,13 +62,27 @@ pub fn renderListAllMyBucketsResult(
     }
     var buckets_el: xml.Element = .{ .name = "Buckets", .children = bucket_nodes };
 
+    // Build child list: owner + buckets, plus optional Prefix + ContinuationToken.
+    var children: std.ArrayList(xml.Node) = .empty;
+    try children.append(arena, .{ .element = &owner_el });
+    try children.append(arena, .{ .element = &buckets_el });
+
+    var prefix_el: xml.Element = undefined;
+    if (in.prefix) |p| {
+        prefix_el = .{ .name = "Prefix", .text = p };
+        try children.append(arena, .{ .element = &prefix_el });
+    }
+
+    var token_el: xml.Element = undefined;
+    if (in.continuation_token) |t| {
+        token_el = .{ .name = "ContinuationToken", .text = t };
+        try children.append(arena, .{ .element = &token_el });
+    }
+
     const root: xml.Element = .{
         .name = "ListAllMyBucketsResult",
         .attrs = &.{.{ .name = "xmlns", .value = "http://s3.amazonaws.com/doc/2006-03-01/" }},
-        .children = try arena.dupe(xml.Node, &.{
-            .{ .element = &owner_el },
-            .{ .element = &buckets_el },
-        }),
+        .children = children.items,
     };
 
     return xml.renderToOwnedSlice(allocator, &root);
@@ -152,7 +169,11 @@ test "formatIso8601: unix epoch" {
 }
 
 test "renderListAllMyBucketsResult: empty" {
-    const got = try renderListAllMyBucketsResult(testing.allocator, "owner-id", "Owner Name", &.{});
+    const got = try renderListAllMyBucketsResult(testing.allocator, .{
+        .owner_id = "owner-id",
+        .display_name = "Owner Name",
+        .buckets = &.{},
+    });
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
@@ -168,7 +189,11 @@ test "renderListAllMyBucketsResult: one bucket" {
     const buckets = [_]storage.Bucket{
         .{ .name = "alpha", .region = "us-east-1", .created_unix = 0 },
     };
-    const got = try renderListAllMyBucketsResult(testing.allocator, "test", "nanostack", &buckets);
+    const got = try renderListAllMyBucketsResult(testing.allocator, .{
+        .owner_id = "test",
+        .display_name = "nanostack",
+        .buckets = &buckets,
+    });
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
@@ -180,4 +205,20 @@ test "renderListAllMyBucketsResult: one bucket" {
             "</ListAllMyBucketsResult>",
         got,
     );
+}
+
+test "renderListAllMyBucketsResult: with Prefix + ContinuationToken" {
+    const buckets = [_]storage.Bucket{
+        .{ .name = "alpha", .region = "us-east-1", .created_unix = 0 },
+    };
+    const got = try renderListAllMyBucketsResult(testing.allocator, .{
+        .owner_id = "test",
+        .display_name = "nanostack",
+        .buckets = &buckets,
+        .prefix = "al",
+        .continuation_token = "alpha",
+    });
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.indexOf(u8, got, "<Prefix>al</Prefix>") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "<ContinuationToken>alpha</ContinuationToken>") != null);
 }

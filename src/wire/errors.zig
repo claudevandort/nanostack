@@ -51,6 +51,7 @@ pub const Code = enum {
     invalid_bucket_state,
     invalid_retention_period,
     replication_configuration_not_found_error,
+    illegal_location_constraint,
     internal_error,
 
     pub fn awsCode(self: Code) []const u8 {
@@ -97,6 +98,7 @@ pub const Code = enum {
             .invalid_bucket_state => "InvalidBucketState",
             .invalid_retention_period => "InvalidRetentionPeriod",
             .replication_configuration_not_found_error => "ReplicationConfigurationNotFoundError",
+            .illegal_location_constraint => "IllegalLocationConstraintException",
             .internal_error => "InternalError",
         };
     }
@@ -145,6 +147,7 @@ pub const Code = enum {
             .invalid_bucket_state => "The request is not valid with the current state of the bucket.",
             .invalid_retention_period => "The retention period specified is not valid.",
             .replication_configuration_not_found_error => "The replication configuration was not found",
+            .illegal_location_constraint => "The unspecified location constraint is incompatible for the region specific endpoint this request was sent to.",
             .internal_error => "We encountered an internal error. Please try again.",
         };
     }
@@ -179,6 +182,7 @@ pub const Code = enum {
             .invalid_bucket_state => 409,
             .invalid_retention_period => 400,
             .replication_configuration_not_found_error => 404,
+            .illegal_location_constraint => 400,
             .method_not_allowed => 405,
             .internal_error => 500,
         };

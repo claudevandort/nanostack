@@ -13,8 +13,12 @@ pub fn restoreObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
         restore_wire.ParseError.OutOfMemory => return .{ .err = .internal_error },
     };
     const version_id = mod.queryValue(ctx.allocator, ctx.request.query, "versionId") catch return .{ .err = .internal_error };
-    ctx.backend.restoreObject(bucket, key, version_id, days) catch |err| return .{ .err = mod.mapStorageErr(err) };
-    // AWS-exact: 202 Accepted for a new restore request. We don't model the
-    // 200-vs-202 distinction for "already-restored"; always 202.
-    return .{ .ok = .{ .status = 202, .body = "" } };
+    const outcome = ctx.backend.restoreObject(bucket, key, version_id, days) catch |err| return .{ .err = mod.mapStorageErr(err) };
+    // AWS-exact: 202 Accepted on first restore; 200 OK when an earlier
+    // RestoreObject already initiated a restore on this object/version.
+    const status: u16 = switch (outcome) {
+        .initiated => 202,
+        .already_in_progress => 200,
+    };
+    return .{ .ok = .{ .status = status, .body = "" } };
 }

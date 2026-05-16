@@ -16,6 +16,29 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-05-16
+
+**Patch release: Wave 3 drift fixes — `SUPPORT.md` "Known drift" table is now empty.**
+
+Per the [versioning scheme](#versioning-scheme), patches mark "significant pinned cuts of work". Wave 3 closes ten remaining AWS-spec divergences surfaced by the 2026-05-14 drift audit (validation, SigV4 edge cases, virtual-host parsing, error-code corrections, and a couple of small handler bugs). Combined with Wave 1 (status/error codes, v0.1.0) and Wave 2 (response-shape gaps, v0.1.1), the drift table is now empty.
+
+### Added
+- **`<LocationConstraint>` validation on CreateBucket.** Mismatched constraint → 400 `IllegalLocationConstraintException` (drift #20). Empty body remains "us-east-1 historical, no constraint required".
+- **RestoreObject 200-vs-202 distinction.** First restore returns 202 Accepted; repeats return 200 OK (drift #21). State is in-memory only — lost on restart, acceptable for local-dev semantics.
+- **ListBuckets 2023 pagination.** Honours `?prefix`, `?bucket-region`, `?max-buckets` (default 1000, max 10000), `?continuation-token`. Emits `<Prefix>` + `<ContinuationToken>` (next-page) in the response (drift #22).
+- **`parseHttpDate` accepts RFC 850 + asctime forms** in `If-Modified-Since` / `If-Unmodified-Since`, matching AWS per RFC 7231 §7.1.1.1 (drift #18). Modern clients only emit IMF-fixdate but the parsers are small and cost almost nothing.
+
+### Changed
+- **Virtual-host parser uses an explicit suffix allow-list** (drift #19). Previous over-matching parsed `s3.amazonaws.com` as bucket=`s3` and `example.com` as bucket=`example`. New parser recognises only the documented AWS forms (`.s3.amazonaws.com`, `.s3-<region>.amazonaws.com`, `.s3.<region>.amazonaws.com`, `.s3-website-<region>.amazonaws.com`, `.s3-accelerate.amazonaws.com`) plus dev-local (`.localhost`, `.127.0.0.1`). Unknown hosts fall back to path-style routing.
+- **`x-amz-content-sha256` accepts both upper- and lowercase hex** (drift #17). Previously uppercase fell through to the "opaque" branch and silently bypassed body-integrity verification.
+- **Object key UTF-8 well-formedness check** added to `validateObjectKey` (drift #12). Lone continuation bytes and truncated multibyte sequences are now rejected via `std.unicode.utf8ValidateSlice`.
+- **`CompleteMultipartUpload` part list capped at 10000** (drift #13). Over-cap → 400 `InvalidRequest`, matching AWS.
+- **`CompleteMultipartUpload` empty `<Part>` list → `MalformedXML`** (drift #14, was incorrectly `InvalidRequest`).
+- **`parseAmzDate` rejects invalid day-in-month** (drift #15). Feb 30, Apr 31, leap-year-edge dates (2000 vs 2100) all validated correctly.
+
+### Removed
+- `getBucketPolicyStatus` from the storage `Backend` vtable (orphaned by v0.1.2's switch to evaluator-based `IsPublic`).
+
 ## [0.1.2] — 2026-05-16
 
 **Patch release: real ACL + bucket policy + PAB enforcement.**

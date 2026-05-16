@@ -86,6 +86,9 @@ pub const Context = struct {
     allocator: Allocator,
     owner_id: []const u8,
     owner_display_name: []const u8,
+    /// Server's configured region. Used by CreateBucket to validate the
+    /// optional `<LocationConstraint>` in the request body.
+    region: []const u8 = "us-east-1",
     request: RequestData = .{},
 };
 
@@ -471,6 +474,17 @@ fn createBucket(ctx: Context, name: []const u8) Result {
         const hv = findHeader(ctx.request.headers, "x-amz-bucket-object-lock-enabled") orelse break :blk false;
         break :blk std.ascii.eqlIgnoreCase(hv, "true");
     };
+
+    // Wave 3 #20: validate <LocationConstraint> in the request body if present.
+    // AWS rejects a constraint that doesn't match the endpoint's region with
+    // IllegalLocationConstraintException (400). An empty/missing body is
+    // historically "us-east-1, no constraint" and always accepted.
+    if (extractLocationConstraint(ctx.request.body)) |constraint| {
+        if (!std.mem.eql(u8, constraint, ctx.region)) {
+            return .{ .err = .illegal_location_constraint };
+        }
+    }
+
     ctx.backend.createBucket(.{ .name = name, .object_lock_enabled = lock_enabled }) catch |err| return .{ .err = mapStorageErr(err) };
     const location = std.fmt.allocPrint(ctx.allocator, "/{s}", .{name}) catch
         return .{ .err = .internal_error };
@@ -500,12 +514,58 @@ fn listBuckets(ctx: Context) Result {
         }
         ctx.allocator.free(buckets);
     }
-    const body = s3_responses.renderListAllMyBucketsResult(
-        ctx.allocator,
-        ctx.owner_id,
-        ctx.owner_display_name,
-        buckets,
-    ) catch return .{ .err = .internal_error };
+
+    // Wave 3 #22: 2023 pagination params.
+    const prefix = queryValueOpt(ctx.allocator, ctx.request.query, "prefix") catch
+        return .{ .err = .invalid_request };
+    const region_filter = queryValueOpt(ctx.allocator, ctx.request.query, "bucket-region") catch
+        return .{ .err = .invalid_request };
+    const cont_token = queryValueOpt(ctx.allocator, ctx.request.query, "continuation-token") catch
+        return .{ .err = .invalid_request };
+    const max_buckets_raw = queryValueOpt(ctx.allocator, ctx.request.query, "max-buckets") catch
+        return .{ .err = .invalid_request };
+
+    // Default 1000, hard cap 10000 per AWS docs.
+    var max_buckets: usize = 1000;
+    if (max_buckets_raw) |v| {
+        max_buckets = std.fmt.parseInt(usize, v, 10) catch return .{ .err = .invalid_request };
+        if (max_buckets == 0 or max_buckets > 10000) return .{ .err = .invalid_request };
+    }
+
+    // Sort lex-ascending so pagination is deterministic.
+    std.mem.sort(storage.Bucket, buckets, {}, struct {
+        fn lt(_: void, a: storage.Bucket, b: storage.Bucket) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+
+    // Build a filtered+paginated view.
+    var emitted: std.ArrayList(storage.Bucket) = .empty;
+    defer emitted.deinit(ctx.allocator);
+    var next_token: ?[]const u8 = null;
+
+    for (buckets) |b| {
+        if (prefix) |p| if (!std.mem.startsWith(u8, b.name, p)) continue;
+        if (region_filter) |r| if (!std.mem.eql(u8, b.region, r)) continue;
+        // Skip past the continuation token (token = last-emitted-name; we
+        // start with the bucket strictly greater).
+        if (cont_token) |t| if (!std.mem.lessThan(u8, t, b.name)) continue;
+        if (emitted.items.len >= max_buckets) {
+            // We hit the cap; the previous loop iteration's last name is
+            // the continuation token for the next page.
+            next_token = emitted.items[emitted.items.len - 1].name;
+            break;
+        }
+        emitted.append(ctx.allocator, b) catch return .{ .err = .internal_error };
+    }
+
+    const body = s3_responses.renderListAllMyBucketsResult(ctx.allocator, .{
+        .owner_id = ctx.owner_id,
+        .display_name = ctx.owner_display_name,
+        .buckets = emitted.items,
+        .prefix = prefix,
+        .continuation_token = next_token,
+    }) catch return .{ .err = .internal_error };
     return .{ .ok = .{ .status = 200, .body = body } };
 }
 
@@ -918,6 +978,20 @@ pub fn findHeader(headers: []const storage.Header, lower_name: []const u8) ?[]co
         if (std.ascii.eqlIgnoreCase(h.name, lower_name)) return h.value;
     }
     return null;
+}
+
+/// Extract the inner text of `<LocationConstraint>...</LocationConstraint>`
+/// from a CreateBucket request body. Returns null if absent or empty.
+/// Substring-scan rather than XML parse — the body is tiny (≤200 bytes
+/// in practice) and the shape is rigidly fixed by the AWS SDK.
+fn extractLocationConstraint(body: []const u8) ?[]const u8 {
+    const open = "<LocationConstraint>";
+    const close = "</LocationConstraint>";
+    const start = std.mem.indexOf(u8, body, open) orelse return null;
+    const after_open = start + open.len;
+    const end = std.mem.indexOfPos(u8, body, after_open, close) orelse return null;
+    const value = body[after_open..end];
+    return if (value.len == 0) null else value;
 }
 
 fn buildObjectHeaders(ctx: Context, meta: storage.Object, range_header: ?[]const u8) ![]Header {
