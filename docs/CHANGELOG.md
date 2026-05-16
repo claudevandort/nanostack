@@ -16,6 +16,32 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-16
+
+**Patch release: real ACL + bucket policy + PAB enforcement.**
+
+Per the [versioning scheme](#versioning-scheme), patches mark "significant pinned cuts of work". This release replaces the accept-store-roundtrip behaviour of M10's access-control surface with a real evaluator that runs after auth and before service dispatch. The user-visible promise — "if `PutBucketPolicy` succeeded, the policy actually applies" — is now true. Anonymous GET against a `public-read` object ACL works end-to-end; explicit `Deny` supersedes `Allow` even against the bucket owner; Public Access Block both rejects public-granting puts and filters out public statements/grants at eval time.
+
+### Added
+- **Structured policy document parser** (`src/wire/policy_doc.zig`) — turns raw bucket-policy JSON into a typed `PolicyDocument { statements: []Statement }`. Recognises `Principal: "*"` / `{"AWS": "*"}` / `{"AWS": ["arn", ...]}`, scalar or array `Action` / `Resource`, with AWS-glob wildcards (`s3:*`, `s3:Get*`, `arn:aws:s3:::bucket/*`). Statements bearing `Condition`, `NotPrincipal`, `NotAction`, or `NotResource` are flagged as unsupported and skipped by the evaluator.
+- **IAM action mapping** (`src/auth/action_map.zig`) — exhaustive 66-row table mapping every routed `Operation` enum variant to its `s3:*` IAM action string, plus `isAccountScoped` / `isObjectScoped` predicates. Account-scoped ops (`ListBuckets`, `CreateBucket`) get an owner-only fast-path.
+- **Principal model** (`src/auth/principal.zig`) — `Principal { kind: { anonymous, aws_account }, id }`. Unsigned requests now arrive at the authz hook as `anonymous` instead of being auto-rejected at the SigV4 layer.
+- **Policy evaluator** (`src/auth/policy_eval.zig`) — IAM-standard semantics: explicit `Deny` ends evaluation immediately; `Allow` accumulates; no match means "no match" (caller falls through to ACL). Glob matching is iterative two-pointer, zero alloc.
+- **ACL evaluator** (`src/auth/acl_eval.zig`) — Grant + Grantee matching with `FULL_CONTROL` implying READ + WRITE + READ_ACP + WRITE_ACP. Group URIs: `AllUsers` matches everyone (incl. anonymous), `AuthenticatedUsers` matches any aws_account principal, `LogDelivery` never grants ordinary access.
+- **PAB gate module** (`src/auth/pab_gate.zig`) — three entry points: put-time gates (`gatePolicyPut` / `gateAclPut` reject public-granting puts when the corresponding switch is on, returning 403 `AccessDenied`), and eval-time predicates (`shouldIgnorePublicAcls` / `shouldRestrictPublicBuckets`, both with bucket-owner bypass).
+- **Authz hook** (`src/auth/authz.zig`) — orchestrator that runs between `router.parse` and `s3.handle`. Fetches the bucket's ACL + policy + PAB via existing per-config getters, applies PAB filters for non-owner principals, evaluates the bucket policy, falls through to ACL (per-object on object-read, per-bucket on object-create), and finally to bucket-owner-implicit FULL_CONTROL.
+- **11 enforcement conformance tests** at `tests/conformance/python/test_policy_enforcement.py` covering: anonymous GET on public-read object ACL, anonymous GET on public-read policy, explicit Deny against the bucket owner, Deny-supersedes-Allow precedence, PAB admission gates for both policy and ACL puts, `IgnorePublicAcls` filter, `RestrictPublicBuckets` filter (with owner-bypass), `Condition` divergence, and `GetBucketPolicyStatus` correctness against the real evaluator.
+
+### Changed
+- **`sigv4.verify` returns a `Principal` instead of `void`.** Unsigned requests no longer raise `MissingAuth`; they return `Principal.anonymous()` and proceed to the evaluator. All other failure modes (bad signature, expired presign, etc.) still raise as before.
+- **`GetBucketPolicyStatus.IsPublic` is now computed by the real evaluator.** Replaces the prior substring scan of the JSON body. The service layer parses the policy, synthesises an anonymous `s3:GetObject` request against `arn:aws:s3:::<bucket>/*`, and reports `IsPublic = true` iff the evaluator says `Allow` or the bucket ACL has a public group grant. The vestigial `getBucketPolicyStatus` backend vtable entry was removed.
+- **Public-granting policy/ACL puts are rejected at admit-time** when the corresponding PAB switch is on (`BlockPublicPolicy`, `BlockPublicAcls`). Previously these puts succeeded silently.
+
+### Divergences
+- **Statements with `Condition` blocks are silently skipped** (treated as no-match). The condition-keys spec (~80 keys × 6 operator families) is disproportionate to the dev-loop value. Documented in `SUPPORT.md`.
+- **Single-tenant principal model.** One configured `access_key` → one IAM identity (the bucket owner). No cross-account ARNs, no IAM user/role policies, no STS / assumed roles.
+- **`NotPrincipal` / `NotAction` / `NotResource` statements are skipped.** Same rationale as Condition.
+
 ## [0.1.1] — 2026-05-15
 
 **Patch release: Docker-first distribution + accuracy/drift fixes + AWS CLI conformance.**

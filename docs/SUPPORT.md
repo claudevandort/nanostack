@@ -183,7 +183,12 @@ The "Milestone" column points at the release tag in which the capability landed.
 | Canned ACL values: `private`, `public-read`, `public-read-write`, `authenticated-read`, `log-delivery-write` | supported (full expansion) | M10 |
 | Canned ACL values: `bucket-owner-read`, `bucket-owner-full-control`, `aws-exec-read` | supported (degrades to "private" — emulator has no distinct bucket owner; documented divergence) | M10 |
 | Default `AccessControlPolicy` synthesis (Owner FULL_CONTROL) when none stored | supported | M10 |
-| **Access enforcement (ACL / policy / PAB)** | **not enforced** (documented divergence — accept-store-roundtrip only) | M10 |
+| **Access enforcement (ACL / policy / PAB)** | **enforced** — real evaluator runs after auth, before dispatch (`tests/conformance/python/test_policy_enforcement.py`) | M14 |
+| Public Access Block — put-time admission gates (`BlockPublicPolicy`, `BlockPublicAcls` reject public-granting puts) | supported | M14 |
+| Public Access Block — eval-time filters (`IgnorePublicAcls`, `RestrictPublicBuckets`; bucket-owner bypasses both) | supported | M14 |
+| Bucket-policy `Condition` blocks | **skipped silently (no-match)** — documented divergence; condition-keys spec is ~80 keys × 6 operator families | M14 |
+| Bucket-policy `NotPrincipal` / `NotAction` / `NotResource` | skipped silently — same rationale as `Condition` | M14 |
+| Cross-account principal ARNs / IAM user-role policies / STS / assumed roles | not supported — single-tenant model (one configured `access_key` = bucket owner) | post-v1.1 |
 | Bucket-policy condition-key validation | not supported (well-formed JSON only) | post-v1.1 |
 | Bucket-policy size cap (20 KB) | not enforced (documented divergence) | post-v1.1 |
 | Access Points / MRAP / S3 Access Grants | not supported | post-v1.1 |

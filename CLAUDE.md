@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**nanostack** is a snappy, accurate AWS emulator for local development, written in Zig. Single static binary (~0.8 MB stripped), sub-second cold start, ~11 MB idle RSS. Currently `v0.1.0` — S3 is functionally complete for local-dev use (68 / 107 Smithy ops routed). Pre-`v1.0.0`; minor breaking changes are expected.
+**nanostack** is a snappy, accurate AWS emulator for local development, written in Zig. Single static binary (~0.8 MB stripped), sub-second cold start, ~11 MB idle RSS. Currently `v0.1.2` — S3 is functionally complete for local-dev use (68 / 107 Smithy ops routed) **with real bucket-policy / ACL / Public Access Block enforcement** (no longer accept-store-roundtrip). Pre-`v1.0.0`; minor breaking changes are expected.
 
 The wedge is **accuracy beats LocalStack on the surface we cover**. See `docs/PRD.md` for the full product spec, `docs/SUPPORT.md` for the live op matrix + accuracy-wins-vs-LocalStack section + drift tracking table.
 
@@ -73,7 +73,8 @@ HTTP (httpz takeover)
 
 - **`storage.Backend` is a vtable**, not a Zig interface — adding a backend op means a new vtable entry in `storage/mod.zig` AND an `fs.zig` impl. The fs backend is the only one shipped; the vtable exists as an abstraction boundary for future backends.
 - **Per-request arena allocator**: handlers receive `ctx.allocator` which is freed when the response is sent. Body + header values are arena-allocated. The backend uses `self.allocator` (long-lived) for persisted state.
-- **`Context.owner_id` / `owner_display_name`** come from the configured `access_key` and represent the bucket-owner identity. Used wherever AWS responses emit `<Owner>` (ListObjectsV2 fetch-owner, ListObjectVersions, ListMultipartUploads).
+- **`Context.owner_id` / `owner_display_name`** come from the configured `access_key` and represent the bucket-owner identity. Used wherever AWS responses emit `<Owner>` (ListObjectsV2 fetch-owner, ListObjectVersions, ListMultipartUploads) and as the principal identity for owner-implicit FULL_CONTROL in the authz hook.
+- **Authz hook runs between `router.parse` and `s3.handle`** (`src/auth/authz.zig`). Bucket policy + ACL + PAB are **really evaluated**, not accept-store-roundtrip. Order: account-scoped fast-path → PAB filters (non-owner) → bucket policy → ACL (per-object on object-read, per-bucket on object-create) → bucket-owner-implicit FULL_CONTROL → default deny. `--no-auth` bypasses both SigV4 and this hook. Unsigned requests arrive as `Principal.anonymous()` and go through the hook, not auto-403 — that's how `public-read` works end-to-end.
 - **XML emitter at `src/wire/xml.zig`**: `Element.text = null` self-closes as `<Foo/>`; `Element.text = ""` emits paired `<Foo></Foo>`. AWS expects paired tags for empty-but-present fields (Prefix, Delimiter, KeyMarker).
 - **Storage schema is versioned by milestones**, not by an explicit schema version field — every new persisted field on `MetaDoc` / `VersionedMetaDoc` / `ManifestDoc` / `BucketRecord` must be threaded through `readMeta`, `writeFlat*`, `cloneVersionedMeta`, `freeObjectMetaOwned`, `rebuildVersionIndex`, `migrateNoneToEnabled`, `rewriteVersionMeta`, `putObjectFlat`, `putObjectVersioned`, `completeMultipartUpload`, `rebuildUploadIndex`, `writeManifest`. M9/M10/M11/M12/M13 commits are the templates.
 - **SUPPORT.md drift table** (`docs/SUPPORT.md` § "Known drift — to fix") tracks known AWS-spec divergences across 3 waves. Status column (`todo` / `in-progress` / `done`) burns down as fixes land. Wave 1 + Wave 2 done; Wave 3 (11 items, validation + SigV4 edge cases) outstanding.

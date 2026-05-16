@@ -11,6 +11,7 @@ const cli = @import("cli.zig");
 const router = @import("router.zig");
 const errors = @import("wire/errors.zig");
 const sigv4 = @import("auth/sigv4.zig");
+const authz = @import("auth/authz.zig");
 const storage = @import("storage/mod.zig");
 const fs_backend = @import("storage/fs.zig");
 const s3 = @import("services/s3/mod.zig");
@@ -54,11 +55,20 @@ pub const App = struct {
         });
 
         // ---------- SigV4 verification ----------
-        if (!self.config.no_auth) {
+        //
+        // Returns a `Principal` (anonymous when no auth headers present,
+        // aws_account when SigV4 verification passed). All other failure
+        // modes still raise. M14 wires this into the authz hook below.
+        //
+        // `--no-auth` short-circuits to the bucket-owner principal: every
+        // request is treated as fully-authorised (no policy/ACL check).
+        const principal: sigv4.Principal = if (self.config.no_auth)
+            sigv4.Principal.awsAccount(self.config.access_key)
+        else blk: {
             const verify_headers = collectHeaders(arena, req) catch {
                 return respondError(res, request_id, host_id, .internal_error, req.url.path, &.{});
             };
-            sigv4.verify(arena, .{
+            const p = sigv4.verify(arena, .{
                 .method = method_str,
                 .path = req.url.path,
                 .query = req.url.query,
@@ -75,10 +85,31 @@ pub const App = struct {
             }) catch |err| {
                 return respondError(res, request_id, host_id, mapVerifyError(err), req.url.path, &.{});
             };
-        }
+            break :blk p;
+        };
 
-        // ---------- Service dispatch ----------
+        // ---------- Routing ----------
         const parsed = router.parse(method_str, host_header, req.url.path, req.url.query);
+
+        // ---------- Authz hook (M14) ----------
+        //
+        // Real bucket-policy / ACL / PAB evaluation. `--no-auth` bypasses
+        // (principal is the bucket owner; orchestrator's owner-implicit
+        // fallback always allows). All other principals — including
+        // anonymous — go through the evaluator: a public-read bucket
+        // serves anonymous reads end-to-end; a private one returns 403.
+        if (!self.config.no_auth) {
+            const decision = authz.check(.{
+                .allocator = arena,
+                .backend = self.backend,
+                .principal = principal,
+                .owner_id = self.config.access_key,
+                .parsed = parsed,
+            });
+            if (decision == .deny) {
+                return respondError(res, request_id, host_id, .access_denied, req.url.path, &.{});
+            }
+        }
 
         // Bridge sigv4-collected headers into storage.Header for the service.
         // Same shape, just a cast — but Zig 0.16 won't let us @ptrCast slices
@@ -121,7 +152,6 @@ pub const App = struct {
 
 fn mapVerifyError(e: sigv4.VerifyError) errors.Code {
     return switch (e) {
-        sigv4.VerifyError.MissingAuth => .access_denied,
         sigv4.VerifyError.InvalidAccessKeyId => .invalid_access_key_id,
         sigv4.VerifyError.SignatureDoesNotMatch => .signature_does_not_match,
         sigv4.VerifyError.RequestTimeTooSkewed => .request_time_too_skewed,

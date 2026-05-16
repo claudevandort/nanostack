@@ -1010,7 +1010,6 @@ pub const Backend = struct {
         putObjectLegalHold: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, status: LegalHoldStatus) Error!void,
         getObjectLegalHold: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8) Error!LegalHoldStatus,
         // M13.
-        getBucketPolicyStatus: *const fn (ctx: *anyopaque, bucket: []const u8) Error!bool,
         restoreObject: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) Error!void,
         updateObjectEncryption: *const fn (ctx: *anyopaque, bucket: []const u8, key: []const u8, version_id: ?[]const u8, algorithm: SseAlgorithm, kms_key_id: []const u8) Error!void,
         putBucketReplication: *const fn (ctx: *anyopaque, bucket: []const u8, cfg: ReplicationConfig) Error!void,
@@ -1211,9 +1210,6 @@ pub const Backend = struct {
         return self.vtable.getObjectLegalHold(self.ctx, bucket, key, version_id);
     }
 
-    pub fn getBucketPolicyStatus(self: Backend, bucket: []const u8) Error!bool {
-        return self.vtable.getBucketPolicyStatus(self.ctx, bucket);
-    }
     pub fn restoreObject(self: Backend, bucket: []const u8, key: []const u8, version_id: ?[]const u8, days: u32) Error!void {
         return self.vtable.restoreObject(self.ctx, bucket, key, version_id, days);
     }
