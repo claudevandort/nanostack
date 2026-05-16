@@ -24,6 +24,17 @@ pub const Config = struct {
     skew_seconds: i64 = 900,
     /// `--version` flag: print version + exit before starting the server.
     print_version: bool = false,
+
+    /// True if the comma-separated `--services` list contains `name`.
+    /// Case-sensitive, whitespace-trimmed around each entry.
+    pub fn hasService(self: Config, name: []const u8) bool {
+        var it = std.mem.splitScalar(u8, self.services, ',');
+        while (it.next()) |raw| {
+            const s = std.mem.trim(u8, raw, " \t");
+            if (std.mem.eql(u8, s, name)) return true;
+        }
+        return false;
+    }
 };
 
 pub const ParseError = error{
@@ -131,4 +142,28 @@ test "missing value" {
 
 test "invalid port" {
     try testing.expectError(ParseError.InvalidValue, parse(&.{ "nanostack", "--port", "abc" }));
+}
+
+test "hasService: default is s3 only" {
+    const c = try parse(&.{"nanostack"});
+    try testing.expect(c.hasService("s3"));
+    try testing.expect(!c.hasService("dynamodb"));
+}
+
+test "hasService: --services s3,dynamodb enables both" {
+    const c = try parse(&.{ "nanostack", "--services", "s3,dynamodb" });
+    try testing.expect(c.hasService("s3"));
+    try testing.expect(c.hasService("dynamodb"));
+}
+
+test "hasService: --services dynamodb only" {
+    const c = try parse(&.{ "nanostack", "--services", "dynamodb" });
+    try testing.expect(!c.hasService("s3"));
+    try testing.expect(c.hasService("dynamodb"));
+}
+
+test "hasService: whitespace tolerated" {
+    const c = try parse(&.{ "nanostack", "--services", "s3, dynamodb" });
+    try testing.expect(c.hasService("s3"));
+    try testing.expect(c.hasService("dynamodb"));
 }
