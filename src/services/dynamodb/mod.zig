@@ -12,6 +12,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const storage = @import("../../storage/mod.zig");
 const errors = @import("../../wire/dynamodb/errors.zig");
+const tables = @import("tables.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -60,8 +61,13 @@ pub const target_prefix = "DynamoDB_20120810.";
 /// Dispatch a request based on its `X-Amz-Target` suffix.
 pub fn handle(ctx: Context) Result {
     const target = ctx.request.target;
-    // Phase 1 stub: just ListTables. Phase 2+ extends this dispatch.
-    if (std.mem.eql(u8, target, "ListTables")) return listTables(ctx);
+
+    // Table management (M15-tables, Phase 2).
+    if (std.mem.eql(u8, target, "ListTables")) return tables.listTables(ctx);
+    if (std.mem.eql(u8, target, "CreateTable")) return tables.createTable(ctx);
+    if (std.mem.eql(u8, target, "DescribeTable")) return tables.describeTable(ctx);
+    if (std.mem.eql(u8, target, "DeleteTable")) return tables.deleteTable(ctx);
+    if (std.mem.eql(u8, target, "UpdateTable")) return tables.updateTable(ctx);
 
     // Anything else gets 400 ValidationException with a message that
     // names the unsupported target. AWS-correct: unknown targets return
@@ -72,25 +78,6 @@ pub fn handle(ctx: Context) Result {
     const owned = ctx.allocator.dupe(u8, msg) catch
         return .{ .err = .{ .code = .internal_server_error } };
     return .{ .err = .{ .code = .validation_exception, .message = owned } };
-}
-
-/// ListTables Phase-1 stub: returns `{"TableNames": []}`.
-fn listTables(ctx: Context) Result {
-    const names = ctx.backend.listTables(ctx.allocator) catch
-        return .{ .err = .{ .code = .internal_server_error } };
-    var aw: std.Io.Writer.Allocating = .init(ctx.allocator);
-    defer aw.deinit();
-    var s: std.json.Stringify = .{ .writer = &aw.writer };
-    s.beginObject() catch return .{ .err = .{ .code = .internal_server_error } };
-    s.objectField("TableNames") catch return .{ .err = .{ .code = .internal_server_error } };
-    s.beginArray() catch return .{ .err = .{ .code = .internal_server_error } };
-    for (names) |name| {
-        s.write(name) catch return .{ .err = .{ .code = .internal_server_error } };
-    }
-    s.endArray() catch return .{ .err = .{ .code = .internal_server_error } };
-    s.endObject() catch return .{ .err = .{ .code = .internal_server_error } };
-    const body = aw.toOwnedSlice() catch return .{ .err = .{ .code = .internal_server_error } };
-    return .{ .ok = .{ .body = body } };
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +92,10 @@ const StubBackend = struct {
     pub fn backend(self: *const StubBackend) storage.DynamoBackend {
         return .{ .ctx = @ptrCast(@constCast(self)), .vtable = &.{
             .listTables = stubListTables,
+            .createTable = stubCreateTable,
+            .describeTable = stubDescribeTable,
+            .deleteTable = stubDeleteTable,
+            .updateTable = stubUpdateTable,
         } };
     }
 
@@ -114,6 +105,19 @@ const StubBackend = struct {
         const out = try allocator.alloc([]const u8, self.names.len);
         for (self.names, 0..) |n, i| out[i] = try allocator.dupe(u8, n);
         return out;
+    }
+
+    fn stubCreateTable(_: *anyopaque, _: storage.CreateTableInput) storage.Error!void {
+        unreachable;
+    }
+    fn stubDescribeTable(_: *anyopaque, _: []const u8) storage.Error!*const storage.TableSlot {
+        unreachable;
+    }
+    fn stubDeleteTable(_: *anyopaque, _: []const u8) storage.Error!void {
+        unreachable;
+    }
+    fn stubUpdateTable(_: *anyopaque, _: storage.UpdateTableInput) storage.Error!*const storage.TableSlot {
+        unreachable;
     }
 };
 

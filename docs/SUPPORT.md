@@ -71,8 +71,11 @@ DynamoDB is the second AWS service nanostack covers, opt-in via `--services s3,d
 
 | Operation | Status | Milestone |
 |---|---|---|
-| ListTables | supported (stub — empty list only) | M15-scaffold |
-| CreateTable / DescribeTable / DeleteTable / UpdateTable | planned | M15-tables |
+| ListTables | supported (paginated; Limit + ExclusiveStartTableName cursor; lex-ascending) | M15-tables |
+| CreateTable | supported (KeySchema, AttributeDefinitions, GSI/LSI defs, BillingMode, Tags; index queryability lands in M15-gsi) | M15-tables |
+| DescribeTable | supported (returns TableStatus=ACTIVE, KeySchema, AttributeDefinitions, GSI/LSI defs, BillingModeSummary, synthetic ItemCount + TableSizeBytes) | M15-tables |
+| DeleteTable | supported (immediate; no `DELETING` state; returns TableDescription of the deleted table) | M15-tables |
+| UpdateTable | supported (BillingMode mutation only; online GSI add/remove deferred to v0.3) | M15-tables |
 | GetItem / PutItem / DeleteItem | planned | M15-items |
 | UpdateItem (with UpdateExpression) | planned | M15-expressions |
 | Query (incl. GSI/LSI) | planned | M15-query / M15-gsi |

@@ -56,19 +56,14 @@ def test_list_tables_emits_aws_request_id_header(ddb):
 
 
 def test_unsupported_target_returns_validation_exception(ddb):
-    """Phase 1 only implements ListTables. CreateTable (and any other) →
-    400 ValidationException with the target name in the message."""
+    """Targets not yet implemented (e.g. PartiQL's ExecuteStatement, deferred
+    to v0.3) → 400 ValidationException with the target name in the message."""
     with pytest.raises(botocore.exceptions.ClientError) as ei:
-        ddb.create_table(
-            TableName="t",
-            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
-            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
-            BillingMode="PAY_PER_REQUEST",
-        )
+        ddb.execute_statement(Statement="SELECT * FROM t")
     err = ei.value.response["Error"]
     assert err["Code"] == "ValidationException"
     assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
-    assert "CreateTable" in err.get("Message", ""), \
+    assert "ExecuteStatement" in err.get("Message", ""), \
         f"expected target name in message, got {err.get('Message')!r}"
 
 
