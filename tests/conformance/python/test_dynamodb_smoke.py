@@ -33,10 +33,11 @@ def ddb():
     return _make_ddb()
 
 
-def test_list_tables_returns_empty_list(ddb):
-    """Phase 1 stub: nanostack always returns an empty table list."""
+def test_list_tables_returns_a_list(ddb):
+    """ListTables returns a list (may be empty on a fresh server, but other
+    tests in parallel may have created tables, so just assert the shape)."""
     out = ddb.list_tables()
-    assert out["TableNames"] == []
+    assert isinstance(out["TableNames"], list)
     assert out["ResponseMetadata"]["HTTPStatusCode"] == 200
 
 

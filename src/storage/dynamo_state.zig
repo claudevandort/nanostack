@@ -1,13 +1,13 @@
 //! In-memory DynamoDB state managed by `Fs` (M15).
 //!
-//! Each table has a `TableSlot` carrying the schema metadata plus
-//! (later, in Phase 3+) the actual items + index entries. Persistence
-//! lives at `<data_dir>/profiles/<profile>/dynamodb/tables/<name>/schema.json`.
-//!
-//! Phase 2 ships the table metadata + persistence; Phase 3 adds items.
+//! Each table has a `TableSlot` carrying the schema metadata + an
+//! `items` map. Items persist at
+//! `<data_dir>/profiles/<profile>/dynamodb/tables/<name>/items/<key_hash>.json`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const attribute_value = @import("../wire/dynamodb/attribute_value.zig");
+pub const AttributeValue = attribute_value.AttributeValue;
 
 pub const KeyType = enum {
     hash,
@@ -127,6 +127,31 @@ pub const Tag = struct {
     value: []const u8,
 };
 
+/// One DynamoDB item — a map of attribute name → AttributeValue. The
+/// names array preserves insertion order; lookups go through
+/// `attributeValue()`.
+pub const Item = struct {
+    names: []const []const u8,
+    values: []AttributeValue,
+
+    pub fn attributeValue(self: *const Item, name: []const u8) ?*const AttributeValue {
+        for (self.names, 0..) |n, i| {
+            if (std.mem.eql(u8, n, name)) return &self.values[i];
+        }
+        return null;
+    }
+
+    pub fn deinit(self: *Item, allocator: Allocator) void {
+        for (self.names) |n| allocator.free(n);
+        allocator.free(self.names);
+        for (self.values) |*v| {
+            var copy = v.*;
+            attribute_value.deinit(allocator, &copy);
+        }
+        allocator.free(self.values);
+    }
+};
+
 /// One DynamoDB table's persisted state. Strings + slices live in the
 /// `Fs.allocator` long-lived arena and are freed via `deinit`.
 pub const TableSlot = struct {
@@ -138,6 +163,10 @@ pub const TableSlot = struct {
     local_secondary_indexes: []const LsiDef = &.{},
     tags: []const Tag = &.{},
     created_unix: i64,
+    /// In-memory item store, keyed on a stable composite "<pk>|<sk?>"
+    /// string. Populated by ddbPutItem on every write and rebuilt on
+    /// startup by walking the items/ directory.
+    items: std.StringHashMapUnmanaged(*Item) = .empty,
 
     pub fn deinit(self: *TableSlot, allocator: Allocator) void {
         allocator.free(self.name);
@@ -154,6 +183,13 @@ pub const TableSlot = struct {
             allocator.free(t.value);
         }
         allocator.free(self.tags);
+        var it = self.items.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit(allocator);
+            allocator.destroy(entry.value_ptr.*);
+        }
+        self.items.deinit(allocator);
     }
 
     fn freeIndex(allocator: Allocator, name: []const u8, key_schema: []const KeyAttribute, projection: Projection) void {
@@ -209,6 +245,66 @@ pub fn validateTableName(name: []const u8) ValidateNameError!void {
 pub fn validateAttributeName(name: []const u8) ValidateNameError!void {
     if (name.len == 0 or name.len > 65535) return error.InvalidTableName;
     if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidTableName;
+}
+
+// ---------------------------------------------------------------------------
+// Composite-key helpers
+//
+// Maps need a stable string key per (PK, SK) pair. We serialise the key
+// attribute values as `<type>:<value>` separated by `|`. Type-tagging
+// the bytes ensures e.g. {"S":"42"} and {"N":"42"} don't collide.
+
+pub const KeyError = error{
+    MissingKey, // item is missing a key attribute declared on the table
+    InvalidKeyType, // key attribute is not a scalar S/N/B
+    OutOfMemory,
+};
+
+/// Build a composite key string from an item's key attributes against
+/// the slot's KeySchema. Caller owns the returned slice.
+pub fn buildItemKey(allocator: Allocator, slot: *const TableSlot, item: *const Item) KeyError![]u8 {
+    const pk = slot.partitionKey();
+    const pk_val = item.attributeValue(pk.name) orelse return error.MissingKey;
+    const pk_part = try encodeKeyPart(allocator, pk_val);
+    defer allocator.free(pk_part);
+
+    if (slot.sortKey()) |sk| {
+        const sk_val = item.attributeValue(sk.name) orelse return error.MissingKey;
+        const sk_part = try encodeKeyPart(allocator, sk_val);
+        defer allocator.free(sk_part);
+        return std.fmt.allocPrint(allocator, "{s}|{s}", .{ pk_part, sk_part }) catch return error.OutOfMemory;
+    }
+    return allocator.dupe(u8, pk_part) catch return error.OutOfMemory;
+}
+
+/// Build a composite key from explicit key attribute values (used by
+/// GetItem / DeleteItem where the Item shape carries only the keys).
+pub fn buildKeyFromAttrs(
+    allocator: Allocator,
+    slot: *const TableSlot,
+    key_attrs: *const Item,
+) KeyError![]u8 {
+    return buildItemKey(allocator, slot, key_attrs);
+}
+
+fn encodeKeyPart(allocator: Allocator, v: *const AttributeValue) KeyError![]u8 {
+    return switch (v.*) {
+        .s => |s| std.fmt.allocPrint(allocator, "S:{s}", .{s}) catch error.OutOfMemory,
+        .n => |s| std.fmt.allocPrint(allocator, "N:{s}", .{s}) catch error.OutOfMemory,
+        .b => |bytes| blk: {
+            // Hex-encode binary to keep the key string ASCII-safe.
+            const out = allocator.alloc(u8, 2 + bytes.len * 2) catch return error.OutOfMemory;
+            out[0] = 'B';
+            out[1] = ':';
+            const hex = "0123456789abcdef";
+            for (bytes, 0..) |b, i| {
+                out[2 + i * 2] = hex[(b >> 4) & 0xF];
+                out[2 + i * 2 + 1] = hex[b & 0xF];
+            }
+            break :blk out;
+        },
+        else => error.InvalidKeyType,
+    };
 }
 
 // ---------------------------------------------------------------------------

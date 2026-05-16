@@ -1244,6 +1244,7 @@ pub const Backend = struct {
 
 pub const dynamo_state = @import("dynamo_state.zig");
 pub const TableSlot = dynamo_state.TableSlot;
+pub const Item = dynamo_state.Item;
 
 /// Inputs for CreateTable. All slices are borrowed from the request
 /// arena; the backend is responsible for copying anything it persists.
@@ -1264,6 +1265,40 @@ pub const UpdateTableInput = struct {
     billing_mode: ?dynamo_state.BillingMode = null,
 };
 
+/// PutItem input. `item` is borrowed from the request arena. The backend
+/// deep-copies into long-lived state.
+pub const PutItemInput = struct {
+    table: []const u8,
+    item: *const Item,
+};
+
+/// PutItem result includes the previous item (when ReturnValues=ALL_OLD).
+/// The caller's allocator owns the returned item.
+pub const PutItemResult = struct {
+    /// The previously-stored item at the same key, if any. The caller
+    /// owns the slices via the allocator passed to the call.
+    old_item: ?Item = null,
+};
+
+pub const GetItemInput = struct {
+    table: []const u8,
+    /// Item carrying only the key attributes.
+    key: *const Item,
+};
+
+pub const GetItemResult = struct {
+    item: ?Item = null,
+};
+
+pub const DeleteItemInput = struct {
+    table: []const u8,
+    key: *const Item,
+};
+
+pub const DeleteItemResult = struct {
+    old_item: ?Item = null,
+};
+
 pub const DynamoBackend = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -1274,6 +1309,10 @@ pub const DynamoBackend = struct {
         describeTable: *const fn (ctx: *anyopaque, name: []const u8) Error!*const TableSlot,
         deleteTable: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
         updateTable: *const fn (ctx: *anyopaque, in: UpdateTableInput) Error!*const TableSlot,
+        // M15-items.
+        putItem: *const fn (ctx: *anyopaque, allocator: Allocator, in: PutItemInput) Error!PutItemResult,
+        getItem: *const fn (ctx: *anyopaque, allocator: Allocator, in: GetItemInput) Error!GetItemResult,
+        deleteItem: *const fn (ctx: *anyopaque, allocator: Allocator, in: DeleteItemInput) Error!DeleteItemResult,
     };
 
     pub fn listTables(self: DynamoBackend, allocator: Allocator) Error![]const []const u8 {
@@ -1290,6 +1329,15 @@ pub const DynamoBackend = struct {
     }
     pub fn updateTable(self: DynamoBackend, in: UpdateTableInput) Error!*const TableSlot {
         return self.vtable.updateTable(self.ctx, in);
+    }
+    pub fn putItem(self: DynamoBackend, allocator: Allocator, in: PutItemInput) Error!PutItemResult {
+        return self.vtable.putItem(self.ctx, allocator, in);
+    }
+    pub fn getItem(self: DynamoBackend, allocator: Allocator, in: GetItemInput) Error!GetItemResult {
+        return self.vtable.getItem(self.ctx, allocator, in);
+    }
+    pub fn deleteItem(self: DynamoBackend, allocator: Allocator, in: DeleteItemInput) Error!DeleteItemResult {
+        return self.vtable.deleteItem(self.ctx, allocator, in);
     }
 };
 
