@@ -82,16 +82,16 @@ def test_update_set_overwrites_existing(ddb, table):
 
 def test_update_set_arithmetic_counter(ddb, table):
     """Atomic counter: SET x = x + :v."""
-    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "count": {"N": "10"}})
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "tally": {"N": "10"}})
     ddb.update_item(
         TableName=table,
         Key={"id": {"S": "k"}},
         UpdateExpression="SET #c = #c + :inc",
-        ExpressionAttributeNames={"#c": "count"},
+        ExpressionAttributeNames={"#c": "tally"},
         ExpressionAttributeValues={":inc": {"N": "5"}},
     )
     got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})
-    assert got["Item"]["count"]["N"] in {"15", "15.0"}
+    assert got["Item"]["tally"]["N"] in {"15", "15.0"}
 
 
 def test_update_set_if_not_exists(ddb, table):
@@ -129,23 +129,23 @@ def test_update_add_counter_creates_when_missing(ddb, table):
     ddb.update_item(
         TableName=table,
         Key={"id": {"S": "k"}},
-        UpdateExpression="ADD count :inc",
+        UpdateExpression="ADD tally :inc",
         ExpressionAttributeValues={":inc": {"N": "1"}},
     )
     got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})
-    assert got["Item"]["count"]["N"] in {"1", "1.0"}
+    assert got["Item"]["tally"]["N"] in {"1", "1.0"}
 
 
 def test_update_add_increments_existing(ddb, table):
-    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "count": {"N": "10"}})
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "tally": {"N": "10"}})
     ddb.update_item(
         TableName=table,
         Key={"id": {"S": "k"}},
-        UpdateExpression="ADD count :inc",
+        UpdateExpression="ADD tally :inc",
         ExpressionAttributeValues={":inc": {"N": "3"}},
     )
     got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})
-    assert got["Item"]["count"]["N"] in {"13", "13.0"}
+    assert got["Item"]["tally"]["N"] in {"13", "13.0"}
 
 
 # ---------------------------------------------------------------------------
@@ -291,3 +291,43 @@ def test_condition_between(ddb, table):
     )
     got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})
     assert got["Item"]["ok"] == {"S": "y"}
+
+
+# ---------------------------------------------------------------------------
+# Reserved-word enforcement (v0.2.1)
+
+def test_condition_with_reserved_word_rejected(ddb, table):
+    """`Status` is an AWS reserved word; bare use must be rejected."""
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "Status": {"S": "pending"}})
+    with pytest.raises(botocore.exceptions.ClientError) as ei:
+        ddb.scan(
+            TableName=table,
+            FilterExpression="Status = :v",
+            ExpressionAttributeValues={":v": {"S": "pending"}},
+        )
+    assert ei.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_condition_with_reserved_word_via_placeholder_ok(ddb, table):
+    """`#s` aliased to `Status` works."""
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "Status": {"S": "pending"}})
+    out = ddb.scan(
+        TableName=table,
+        FilterExpression="#s = :v",
+        ExpressionAttributeNames={"#s": "Status"},
+        ExpressionAttributeValues={":v": {"S": "pending"}},
+    )
+    assert out["Count"] == 1
+
+
+def test_update_expression_reserved_word_rejected(ddb, table):
+    """UpdateExpression rejects bare reserved words too."""
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "Name": {"S": "Bob"}})
+    with pytest.raises(botocore.exceptions.ClientError) as ei:
+        ddb.update_item(
+            TableName=table,
+            Key={"id": {"S": "k"}},
+            UpdateExpression="SET Name = :v",  # Name is reserved
+            ExpressionAttributeValues={":v": {"S": "Alice"}},
+        )
+    assert ei.value.response["Error"]["Code"] == "ValidationException"

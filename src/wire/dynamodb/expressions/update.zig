@@ -24,6 +24,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lexer = @import("lexer.zig");
+const reserved_words = @import("reserved_words.zig");
 const Token = lexer.Token;
 const TokenKind = lexer.TokenKind;
 const condition_mod = @import("condition.zig");
@@ -35,6 +36,9 @@ const storage = @import("../../../storage/mod.zig");
 pub const ParseError = error{
     Malformed,
     UnknownFunction,
+    /// Identifier matches a DynamoDB reserved word and wasn't aliased
+    /// via `#placeholder`.
+    ReservedWord,
     OutOfMemory,
     InvalidToken,
 };
@@ -200,6 +204,10 @@ const Parser = struct {
         const t = self.peek();
         switch (t.kind) {
             .identifier => {
+                // Reserved-word check fires in operand position only.
+                // Function names (if_not_exists / list_append) route through
+                // parseSetValue's function-call branch and don't land here.
+                if (reserved_words.isReserved(t.text)) return ParseError.ReservedWord;
                 _ = self.advance();
                 return .{ .name = t.text };
             },
@@ -474,7 +482,7 @@ test "parse: REMOVE + SET" {
 }
 
 test "parse: ADD on counter" {
-    var doc = try parse(testing.allocator, "ADD count :inc", null);
+    var doc = try parse(testing.allocator, "ADD tally :inc", null);
     defer doc.deinit();
     try testing.expectEqual(@as(usize, 1), doc.actions.len);
 }

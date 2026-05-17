@@ -27,6 +27,7 @@ pub const ddb_expr_lexer = @import("wire/dynamodb/expressions/lexer.zig");
 pub const ddb_expr_condition = @import("wire/dynamodb/expressions/condition.zig");
 pub const ddb_expr_update = @import("wire/dynamodb/expressions/update.zig");
 pub const ddb_expr_key_condition = @import("wire/dynamodb/expressions/key_condition.zig");
+pub const ddb_expr_reserved_words = @import("wire/dynamodb/expressions/reserved_words.zig");
 pub const dynamodb_query = @import("services/dynamodb/query.zig");
 pub const dynamodb_scan = @import("services/dynamodb/scan.zig");
 pub const dynamodb_batch = @import("services/dynamodb/batch.zig");
@@ -120,6 +121,7 @@ test {
     _ = ddb_expr_condition;
     _ = ddb_expr_update;
     _ = ddb_expr_key_condition;
+    _ = ddb_expr_reserved_words;
     _ = dynamodb_query;
     _ = dynamodb_scan;
     _ = dynamodb_batch;

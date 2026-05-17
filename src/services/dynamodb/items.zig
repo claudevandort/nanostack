@@ -288,6 +288,10 @@ fn mapExprParseErr(e: condition.ParseError) mod.ErrorBody {
             .code = .validation_exception,
             .message = "Unknown function in ConditionExpression.",
         },
+        condition.ParseError.ReservedWord => .{
+            .code = .validation_exception,
+            .message = "Reserved keyword used as a bare attribute name in ConditionExpression; alias via ExpressionAttributeNames (e.g. `#x` mapped to `\"Status\"`).",
+        },
         condition.ParseError.OutOfMemory => .{ .code = .internal_server_error },
         else => .{ .code = .validation_exception, .message = "ConditionExpression is malformed." },
     };
@@ -298,6 +302,10 @@ fn mapUpdateParseErr(e: update_mod.ParseError) mod.ErrorBody {
         update_mod.ParseError.UnknownFunction => .{
             .code = .validation_exception,
             .message = "Unknown function in UpdateExpression.",
+        },
+        update_mod.ParseError.ReservedWord => .{
+            .code = .validation_exception,
+            .message = "Reserved keyword used as a bare attribute name in UpdateExpression; alias via ExpressionAttributeNames.",
         },
         update_mod.ParseError.OutOfMemory => .{ .code = .internal_server_error },
         else => .{ .code = .validation_exception, .message = "UpdateExpression is malformed." },
