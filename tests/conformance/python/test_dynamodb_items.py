@@ -7,6 +7,13 @@ Phase 4 (M15-expressions).
 
 from __future__ import annotations
 
+import os
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
+
 import pytest
 import boto3
 import botocore.exceptions
@@ -202,3 +209,99 @@ def test_get_from_missing_table(ddb):
     with pytest.raises(botocore.exceptions.ClientError) as ei:
         ddb.get_item(TableName="no-such-table-items", Key={"id": {"S": "x"}})
     assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def _spawn_nanostack(bin_path: str, data_dir: str, port: int) -> subprocess.Popen:
+    proc = subprocess.Popen(
+        [bin_path, "--port", str(port), "--data-dir", data_dir, "--services", "s3,dynamodb"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    # Wait for the port to accept connections.
+    import requests
+    deadline = time.time() + 5
+    url = f"http://127.0.0.1:{port}/"
+    while time.time() < deadline:
+        try:
+            requests.get(url, timeout=1)
+            return proc
+        except requests.RequestException:
+            time.sleep(0.1)
+    proc.kill()
+    raise AssertionError(f"nanostack did not bind :{port} within 5s")
+
+
+def test_items_persist_across_nanostack_restart():
+    """v0.2.1: items written to disk survive a nanostack restart.
+
+    Spawns a dedicated nanostack instance on a free port, creates a
+    table + puts 5 items, kills the server, restarts pointing at the
+    same --data-dir, and verifies all 5 items are queryable again.
+    """
+    bin_path = os.environ.get("NANOSTACK_BIN")
+    if not bin_path:
+        pytest.skip("NANOSTACK_BIN not set; skipping restart conformance test")
+
+    # Pick a free port.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    data_dir = tempfile.mkdtemp(prefix="ns-restart-")
+    ep = f"http://127.0.0.1:{port}"
+
+    def ddb_client():
+        return boto3.client(
+            "dynamodb",
+            endpoint_url=ep,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+            config=Config(retries={"max_attempts": 1}),
+        )
+
+    # Pass 1: seed + write.
+    proc = _spawn_nanostack(bin_path, data_dir, port)
+    try:
+        ddb = ddb_client()
+        ddb.create_table(
+            TableName="Survivors",
+            KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        for i in range(5):
+            ddb.put_item(TableName="Survivors", Item={
+                "id": {"S": f"k{i}"},
+                "n": {"N": str(i)},
+                "tag": {"S": "alive"},
+            })
+        # Sanity: 5 items live in the running instance.
+        out = ddb.scan(TableName="Survivors")
+        assert out["Count"] == 5
+    finally:
+        proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+    # Pass 2: restart, verify items survive.
+    proc2 = _spawn_nanostack(bin_path, data_dir, port)
+    try:
+        ddb = ddb_client()
+        out = ddb.scan(TableName="Survivors")
+        assert out["Count"] == 5, f"expected 5 items after restart, got {out['Count']}"
+        ids = sorted(it["id"]["S"] for it in out["Items"])
+        assert ids == [f"k{i}" for i in range(5)]
+
+        # Spot-check via GetItem that AttributeValue round-trips.
+        item = ddb.get_item(TableName="Survivors", Key={"id": {"S": "k2"}})["Item"]
+        assert item["n"] == {"N": "2"}
+        assert item["tag"] == {"S": "alive"}
+    finally:
+        proc2.kill()
+        try:
+            proc2.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        shutil.rmtree(data_dir, ignore_errors=True)

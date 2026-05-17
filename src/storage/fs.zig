@@ -3295,6 +3295,92 @@ fn loadSingleTable(self: *Fs, name: []const u8) !void {
 
     // Map key shares ownership with slot.name.
     try self.dynamo_tables.put(self.allocator, slot_ptr.name, slot_ptr);
+
+    // v0.2.1: rebuild the in-memory items map by walking <table>/items/*.json.
+    // Corrupted files are skipped with a warning — same policy as schema.json.
+    try loadTableItems(self, slot_ptr);
+}
+
+fn loadTableItems(self: *Fs, slot: *storage.TableSlot) !void {
+    var dir_buf: [4096]u8 = undefined;
+    const items_path = try std.fmt.bufPrint(&dir_buf, "{s}/dynamodb/tables/{s}/items", .{ self.base_dir, slot.name });
+
+    var dir = Io.Dir.cwd().openDir(self.io, items_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return, // freshly created table with no items yet
+        else => return err,
+    };
+    defer dir.close(self.io);
+
+    var it = dir.iterate();
+    while (try it.next(self.io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+        loadSingleItem(self, slot, entry.name) catch |err| {
+            std.log.warn("dynamodb: skipping corrupted item file {s}/items/{s}: {s}", .{
+                slot.name, entry.name, @errorName(err),
+            });
+        };
+    }
+}
+
+fn loadSingleItem(self: *Fs, slot: *storage.TableSlot, file_name: []const u8) !void {
+    var path_buf: [4096]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/dynamodb/tables/{s}/items/{s}", .{ self.base_dir, slot.name, file_name });
+
+    const body = try Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(4 * 1024 * 1024));
+    defer self.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.MalformedItemFile;
+    const obj = parsed.value.object;
+
+    // Build an Item from the JSON object: each (name, AttributeValue) pair.
+    const n = obj.count();
+    const names = try self.allocator.alloc([]const u8, n);
+    var names_done: usize = 0;
+    errdefer {
+        for (names[0..names_done]) |nm| self.allocator.free(nm);
+        self.allocator.free(names);
+    }
+    const values = try self.allocator.alloc(@import("../wire/dynamodb/attribute_value.zig").AttributeValue, n);
+    var values_done: usize = 0;
+    errdefer {
+        for (values[0..values_done]) |*v| {
+            var copy = v.*;
+            @import("../wire/dynamodb/attribute_value.zig").deinit(self.allocator, &copy);
+        }
+        self.allocator.free(values);
+    }
+    var entry_it = obj.iterator();
+    var i: usize = 0;
+    while (entry_it.next()) |entry| : (i += 1) {
+        names[i] = try self.allocator.dupe(u8, entry.key_ptr.*);
+        names_done = i + 1;
+        values[i] = try @import("../wire/dynamodb/attribute_value.zig").parseValue(self.allocator, entry.value_ptr.*);
+        values_done = i + 1;
+    }
+
+    const item_ptr = try self.allocator.create(storage.Item);
+    item_ptr.* = .{ .names = names, .values = values };
+
+    // Compute the composite key the same way ddbPutItem does so post-restart
+    // lookups hit. If the item lacks key attributes (shouldn't happen — write
+    // path validates), surface as MalformedItemFile so the warn-and-skip path
+    // fires.
+    const key_str = storage.dynamo_state.buildItemKey(self.allocator, slot, item_ptr) catch {
+        item_ptr.deinit(self.allocator);
+        self.allocator.destroy(item_ptr);
+        return error.MalformedItemFile;
+    };
+
+    slot.items.put(self.allocator, key_str, item_ptr) catch {
+        self.allocator.free(key_str);
+        item_ptr.deinit(self.allocator);
+        self.allocator.destroy(item_ptr);
+        return error.OutOfMemory;
+    };
 }
 
 fn docToSlot(allocator: Allocator, doc: SchemaDoc) !storage.TableSlot {
