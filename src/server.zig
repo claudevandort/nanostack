@@ -215,16 +215,23 @@ fn handleDynamo(
         };
     }
 
-    // Strip the `DynamoDB_20120810.` prefix. Anything else (e.g. the
-    // Streams sub-service `DynamoDBStreams_20120810.*`) is rejected with
-    // ValidationException — Phase 1 only handles the core service.
-    if (!std.mem.startsWith(u8, target_header, dynamodb.target_prefix)) {
+    // Strip whichever target prefix matched. Two are accepted: the
+    // core DynamoDB service and the DynamoDBStreams sub-service
+    // (v0.2.2). Anything else is rejected with ValidationException.
+    var sub_service: dynamodb.SubService = .core;
+    var target: []const u8 = "";
+    if (std.mem.startsWith(u8, target_header, dynamodb.target_prefix)) {
+        sub_service = .core;
+        target = target_header[dynamodb.target_prefix.len..];
+    } else if (std.mem.startsWith(u8, target_header, dynamodb.streams_target_prefix)) {
+        sub_service = .streams;
+        target = target_header[dynamodb.streams_target_prefix.len..];
+    } else {
         return respondDdbError(res, request_id, host_id, .{
             .code = .validation_exception,
-            .message = "Only DynamoDB_20120810 targets are supported.",
+            .message = "Only DynamoDB_20120810 and DynamoDBStreams_20120810 targets are supported.",
         });
     }
-    const target = target_header[dynamodb.target_prefix.len..];
 
     const all_headers = collectHeaders(arena, req) catch {
         return respondDdbError(res, request_id, host_id, .{ .code = .internal_server_error });
@@ -242,6 +249,7 @@ fn handleDynamo(
             .headers = svc_headers,
             .body = req.body() orelse "",
             .target = target,
+            .sub_service = sub_service,
         },
     });
 

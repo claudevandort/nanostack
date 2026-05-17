@@ -43,11 +43,15 @@ pub const Result = union(enum) {
     err: ErrorBody,
 };
 
+pub const SubService = enum { core, streams };
+
 pub const RequestData = struct {
     headers: []const storage.Header = &.{},
     body: []const u8 = "",
     /// X-Amz-Target value, post-prefix-strip — e.g. `ListTables`.
     target: []const u8 = "",
+    /// Which target prefix matched on the way in.
+    sub_service: SubService = .core,
 };
 
 pub const Context = struct {
@@ -61,11 +65,21 @@ pub const Context = struct {
 
 /// Service-wide target prefix. AWS uses `DynamoDB_20120810.` for the
 /// core service; `DynamoDBStreams_20120810.` is the Streams sub-service
-/// (deferred to v0.3).
+/// (v0.2.2).
 pub const target_prefix = "DynamoDB_20120810.";
+pub const streams_target_prefix = "DynamoDBStreams_20120810.";
 
-/// Dispatch a request based on its `X-Amz-Target` suffix.
+/// Dispatch a request based on the matched sub-service + the
+/// X-Amz-Target suffix. The HTTP layer strips whichever prefix matched
+/// and routes here.
 pub fn handle(ctx: Context) Result {
+    return switch (ctx.request.sub_service) {
+        .core => handleCore(ctx),
+        .streams => handleStreams(ctx),
+    };
+}
+
+fn handleCore(ctx: Context) Result {
     const target = ctx.request.target;
 
     // Table management (M15-tables, Phase 2).
@@ -106,6 +120,27 @@ pub fn handle(ctx: Context) Result {
     // Anything else gets 400 ValidationException with a message that
     // names the unsupported target. AWS-correct: unknown targets return
     // ValidationException, not 404.
+    return unsupportedTarget(ctx, target);
+}
+
+/// Phase 3 stub for the DynamoDBStreams sub-service. Phases 4 + 5 fill
+/// in ListStreams / DescribeStream / GetShardIterator / GetRecords.
+/// Kinesis-tee ops (Enable/DisableKinesisStreamingDestination) are
+/// explicitly rejected in Phase 7 — they're handled here so we don't
+/// silently accept them.
+fn handleStreams(ctx: Context) Result {
+    const target = ctx.request.target;
+    if (std.mem.eql(u8, target, "EnableKinesisStreamingDestination") or
+        std.mem.eql(u8, target, "DisableKinesisStreamingDestination"))
+    {
+        const owned = ctx.allocator.dupe(u8, "Kinesis service is not enabled on this nanostack instance.") catch
+            return .{ .err = .{ .code = .internal_server_error } };
+        return .{ .err = .{ .code = .validation_exception, .message = owned } };
+    }
+    return unsupportedTarget(ctx, target);
+}
+
+fn unsupportedTarget(ctx: Context, target: []const u8) Result {
     var msg_buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrint(&msg_buf, "Unsupported operation: {s}", .{target}) catch
         return .{ .err = .{ .code = .validation_exception } };
