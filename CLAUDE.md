@@ -22,13 +22,13 @@ The wedge is **accuracy beats LocalStack on the surface we cover**. See `docs/PR
 
 ### Conformance suites (CI gate)
 
-Conformance lives in `tests/conformance/{python,awscli,js}` and drives **real AWS SDKs + the AWS CLI v2** against a running nanostack.
+Conformance lives in `tests/conformance/{python,awscli,js}/{service}/` — each client surface is split by service so adding a new service is just a new subdirectory. See `tests/conformance/README.md` for the full index.
 
 ```sh
 # Start a server on a dedicated port (use 14566 to match CI):
-./zig-out/bin/nanostack --port 14566 --data-dir "$(mktemp -d)" &
+./zig-out/bin/nanostack --port 14566 --data-dir "$(mktemp -d)" --services s3,dynamodb &
 
-# Python (boto3) — primary suite, 173 tests at the low-level op surface:
+# Python (boto3) — primary suite, ~308 tests across s3/ and dynamodb/.
 cd tests/conformance/python
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -36,16 +36,20 @@ NANOSTACK_ENDPOINT=http://127.0.0.1:14566 \
   NANOSTACK_BIN=$(realpath ../../../zig-out/bin/nanostack) \
   pytest -n auto
 
-# Single test:
-pytest tests/conformance/python/test_versioning.py::test_versioning_head_on_delete_marker_returns_405 -v
+# Scope to one service:
+pytest -n auto s3/
+pytest -n auto dynamodb/
 
-# AWS CLI v2 — 10 tests for high-level `aws s3` commands (cp -r, sync idempotency, mv, presign):
+# Single test:
+pytest s3/test_versioning.py::test_versioning_head_on_delete_marker_returns_405 -v
+
+# AWS CLI v2 — ~19 tests for high-level commands (s3 cp/sync/mv/presign, dynamodb create-table/put-item/query):
 cd tests/conformance/awscli
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 NANOSTACK_ENDPOINT=http://127.0.0.1:14566 pytest -n auto
 
-# JS (aws-sdk-js v3) — smaller smoke suite:
+# JS (aws-sdk-js v3) — ~65 tests across s3/ and dynamodb/:
 cd tests/conformance/js && npm ci && NANOSTACK_ENDPOINT=http://127.0.0.1:14566 npm test
 ```
 
