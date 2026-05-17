@@ -214,3 +214,45 @@ def test_transact_write_cross_table_atomic(ddb, request):
                 ddb.delete_table(TableName=name)
             except botocore.exceptions.ClientError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Backfill (v0.2.1): mixed-op transactions.
+
+def test_transact_write_mixed_ops(ddb, accounts_table):
+    """One TransactWriteItems carrying Put + Update + Delete + ConditionCheck.
+    All four must succeed atomically."""
+    # Seed an extra row we'll be removing.
+    ddb.put_item(TableName=accounts_table, Item={"id": {"S": "charlie"}, "balance": {"N": "200"}})
+
+    ddb.transact_write_items(TransactItems=[
+        # ConditionCheck: alice must exist (she does).
+        {"ConditionCheck": {
+            "TableName": accounts_table,
+            "Key": {"id": {"S": "alice"}},
+            "ConditionExpression": "attribute_exists(id)",
+        }},
+        # Update bob's balance.
+        {"Update": {
+            "TableName": accounts_table,
+            "Key": {"id": {"S": "bob"}},
+            "UpdateExpression": "SET balance = balance + :n",
+            "ExpressionAttributeValues": {":n": {"N": "10"}},
+        }},
+        # Put a fresh row.
+        {"Put": {
+            "TableName": accounts_table,
+            "Item": {"id": {"S": "dana"}, "balance": {"N": "1"}},
+        }},
+        # Delete charlie.
+        {"Delete": {
+            "TableName": accounts_table,
+            "Key": {"id": {"S": "charlie"}},
+        }},
+    ])
+
+    # Verify all four landed.
+    bob = ddb.get_item(TableName=accounts_table, Key={"id": {"S": "bob"}})["Item"]
+    assert float(bob["balance"]["N"]) == 60  # 50 + 10
+    assert "Item" in ddb.get_item(TableName=accounts_table, Key={"id": {"S": "dana"}})
+    assert "Item" not in ddb.get_item(TableName=accounts_table, Key={"id": {"S": "charlie"}})

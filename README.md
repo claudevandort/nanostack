@@ -2,7 +2,7 @@
 
 A snappy, accurate AWS emulator for local development, written in Zig.
 
-**Status:** `v0.2.0` — first minor: **S3 + DynamoDB on the same port.** S3 is functionally complete for local-dev (**68 / 107 Smithy ops routed**) with real bucket-policy / ACL / PAB enforcement. DynamoDB v1 covers **18 ops** including UpdateItem with full UpdateExpression, queryable GSI/LSI, batch ops, and transactional reads + writes with all-or-nothing atomicity. Opt-in via `--services s3,dynamodb`. Shipped as a single multi-arch Docker image. Pre-`v1.0.0`. See [`docs/CHANGELOG.md`](docs/CHANGELOG.md) for the versioning scheme.
+**Status:** `v0.2.1` — first minor + first patch: **S3 + DynamoDB on the same port, both with three-SDK conformance.** S3 is functionally complete for local-dev (**68 / 107 Smithy ops routed**) with real bucket-policy / ACL / PAB enforcement. DynamoDB v1 covers **18 ops** including UpdateItem with full UpdateExpression, queryable GSI/LSI, batch, atomic transactions, and (as of v0.2.1) cross-restart item persistence + 573-word reserved-word enforcement. Both services verified against Python (boto3) + JS (aws-sdk-js v3) + AWS CLI v2. Opt-in via `--services s3,dynamodb`. Shipped as a single multi-arch Docker image. Pre-`v1.0.0`. See [`docs/CHANGELOG.md`](docs/CHANGELOG.md) for the versioning scheme.
 
 ## What it is
 

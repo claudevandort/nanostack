@@ -43,8 +43,13 @@ pub fn scan(ctx: Context) Result {
     var filter_doc_opt: ?condition_mod.Document = null;
     if (root.get("FilterExpression")) |fe_v| {
         if (fe_v != .string) return .{ .err = .{ .code = .validation_exception } };
-        filter_doc_opt = condition_mod.parse(ctx.allocator, fe_v.string, names_json) catch
-            return .{ .err = .{ .code = .validation_exception, .message = "FilterExpression is malformed." } };
+        filter_doc_opt = condition_mod.parse(ctx.allocator, fe_v.string, names_json) catch |err| switch (err) {
+            condition_mod.ParseError.ReservedWord => return .{ .err = .{
+                .code = .validation_exception,
+                .message = "Reserved keyword used as a bare attribute name in FilterExpression; alias via ExpressionAttributeNames.",
+            } },
+            else => return .{ .err = .{ .code = .validation_exception, .message = "FilterExpression is malformed." } },
+        };
     }
     defer if (filter_doc_opt) |*d| d.deinit();
 

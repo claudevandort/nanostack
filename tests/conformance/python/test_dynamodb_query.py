@@ -229,3 +229,23 @@ def test_query_begins_with_sk(ddb, request):
             ddb.delete_table(TableName=name)
         except botocore.exceptions.ClientError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Backfill (v0.2.1): sort-key comparison ops <, <=, >=.
+
+@pytest.mark.parametrize("op,threshold,expected", [
+    ("<",  "300", ["100", "200"]),
+    ("<=", "300", ["100", "200", "300"]),
+    (">=", "300", ["300", "400", "500"]),
+], ids=["lt", "le", "ge"])
+def test_query_sk_lt_le_ge(ddb, events_table, op, threshold, expected):
+    """Sort-key predicates <, <=, >= work in KeyConditionExpression."""
+    out = ddb.query(
+        TableName=events_table,
+        KeyConditionExpression=f"#u = :u AND ts {op} :t",
+        ExpressionAttributeNames={"#u": "user"},
+        ExpressionAttributeValues={":u": {"S": "alice"}, ":t": {"N": threshold}},
+    )
+    tss = sorted(it["ts"]["N"] for it in out["Items"])
+    assert tss == expected

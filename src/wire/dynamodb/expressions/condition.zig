@@ -23,6 +23,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lexer = @import("lexer.zig");
+const reserved_words = @import("reserved_words.zig");
 const Token = lexer.Token;
 const TokenKind = lexer.TokenKind;
 const av = @import("../attribute_value.zig");
@@ -32,6 +33,10 @@ const storage = @import("../../../storage/mod.zig");
 pub const ParseError = error{
     Malformed,
     UnknownFunction,
+    /// Identifier matches a DynamoDB reserved word and wasn't aliased
+    /// via `#placeholder`. AWS rejects these — clients must use
+    /// ExpressionAttributeNames.
+    ReservedWord,
     OutOfMemory,
     InvalidToken,
 };
@@ -231,6 +236,10 @@ const Parser = struct {
         const t = self.peek();
         switch (t.kind) {
             .identifier => {
+                // Reserved-word check fires in operand position only. Function
+                // calls route through parseFunctionCall (identifier + `(`),
+                // so callable names like `attribute_exists` never land here.
+                if (reserved_words.isReserved(t.text)) return ParseError.ReservedWord;
                 _ = self.advance();
                 return .{ .name = t.text };
             },
@@ -591,7 +600,7 @@ test "parse + evaluate: attribute_not_exists on absent attr" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var doc = try parse(testing.allocator, "attribute_not_exists(missing)", null);
+    var doc = try parse(testing.allocator, "attribute_not_exists(extra)", null);
     defer doc.deinit();
 
     var item = try makeItem(a, .{ .id = AttributeValue{ .s = "k1" } });
@@ -631,7 +640,7 @@ test "parse + evaluate: NOT inverts" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var doc = try parse(testing.allocator, "NOT attribute_exists(missing)", null);
+    var doc = try parse(testing.allocator, "NOT attribute_exists(extra)", null);
     defer doc.deinit();
 
     var item = try makeItem(a, .{ .id = AttributeValue{ .s = "k1" } });
@@ -644,10 +653,10 @@ test "parse + evaluate: begins_with on string" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var doc = try parse(testing.allocator, "begins_with(name, :p)", null);
+    var doc = try parse(testing.allocator, "begins_with(label, :p)", null);
     defer doc.deinit();
 
-    var item = try makeItem(a, .{ .name = AttributeValue{ .s = "Alice" } });
+    var item = try makeItem(a, .{ .label = AttributeValue{ .s = "Alice" } });
 
     var vals = std.json.ObjectMap.empty;
     defer vals.deinit(a);

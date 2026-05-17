@@ -12,12 +12,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lexer = @import("lexer.zig");
+const reserved_words = @import("reserved_words.zig");
 const Token = lexer.Token;
 const TokenKind = lexer.TokenKind;
 const condition_mod = @import("condition.zig");
 const Operand = condition_mod.Operand;
 
-pub const ParseError = error{ Malformed, OutOfMemory, InvalidToken };
+pub const ParseError = error{ Malformed, ReservedWord, OutOfMemory, InvalidToken };
 
 pub const SortPredicate = union(enum) {
     eq: Operand,
@@ -99,6 +100,7 @@ const Parser = struct {
         const t = self.peek();
         switch (t.kind) {
             .identifier => {
+                if (reserved_words.isReserved(t.text)) return ParseError.ReservedWord;
                 _ = self.advance();
                 return t.text;
             },
