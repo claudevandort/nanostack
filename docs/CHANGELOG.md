@@ -16,6 +16,46 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-05-17
+
+**Patch release: DynamoDB PartiQL.**
+
+PartiQL is the SQL-shaped DDB surface a lot of apps reach for, especially apps migrated from a relational backend. v0.2.4 lands all three ops — `ExecuteStatement`, `ExecuteTransaction`, `BatchExecuteStatement` — by recognising that the WHERE clause and SET clause grammars are isomorphic to ConditionExpression / UpdateExpression, so most of the work is a thin SQL-shaped lexer/parser that delegates to the existing evaluators.
+
+After v0.2.4 the deferred list trims to Backups/PITR and Imports/Exports. DDB at this point covers everything most local-dev workflows reach for.
+
+### Added — three PartiQL ops
+
+- **`ExecuteStatement`** — SELECT / INSERT / UPDATE / DELETE.
+  - **SELECT**: PK eq query, PK + SK predicate (eq / lt / le / gt / ge / BETWEEN / begins_with), full-table scan (no WHERE), column projection, parameterised `?` placeholders, quoted + unquoted identifiers.
+  - **INSERT**: `INSERT INTO "t" VALUE {'col': literal_or_?, ...}` with all common attribute types (S/N/BOOL/NULL via inline; lists/maps/sets via positional `?` params).
+  - **UPDATE**: `UPDATE "t" SET col = ?, col = col + ? WHERE pk = ?` — atomic counter arithmetic (add/sub against the existing value), multi-assignment, new-attribute creation.
+  - **DELETE**: `DELETE FROM "t" WHERE pk = ? [AND sk = ?]`.
+  - **RETURNING**: `ALL OLD *`, `ALL NEW *`, `MODIFIED OLD *`, `MODIFIED NEW *` — maps to the underlying `ReturnValues` field.
+- **`ExecuteTransaction`** — up to 100 statements, all INSERT / UPDATE / DELETE (SELECT rejected per AWS). All-or-nothing atomicity via the existing `transactWriteItems` primitive. Cancellation surfaces `TransactionCanceledException` with the parallel `CancellationReasons` array.
+- **`BatchExecuteStatement`** — up to 25 statements, independent (non-atomic) execution. SELECT, INSERT, UPDATE, DELETE all allowed. Per-statement errors are reported inline rather than aborting the batch.
+
+### Internals
+
+- **`?` placeholder mechanism**: The PartiQL parser tracks each `?` in encounter order; the handler synthesises an in-memory parameter map from the request's `Parameters` array. The WHERE / SET evaluators take the same parameter array via a small dispatch helper.
+- **WHERE eval reuses `condition_mod.valuesEqual` / `compareValues`** (already used by Query). No new evaluator code.
+- **SET eval is custom but minimal** — assign / add-to-col / sub-from-col with `std.fmt.parseFloat` for the arithmetic case, matching the existing UpdateExpression's atomic-counter approach.
+- **No storage backend changes.** PartiQL routes through `query`, `putItem`, `updateItem`, `deleteItem`, `transactWriteItems` — all existing vtable entries.
+
+### Tests
+- Zig unit tests: 497 → 514 (+17 — 8 lexer + 8 parser + 1 misc).
+- Python conformance: 351 → 383 (+32 — 14 SELECT + 14 INSERT/UPDATE/DELETE + 4 Transaction/Batch tests + 1 surface).
+- JS conformance: 74 → 80 (+6 — ExecuteStatement + Transaction + Batch shape).
+- AWS CLI conformance: 25 → 29 (+4 — execute-statement / execute-transaction shape).
+
+### Documented divergences (intentional)
+- **Phase-1 WHERE grammar** for SELECT covers PK eq + SK predicate only (no OR / NOT / IN / scan-filter syntax). Future patches may extend.
+- **LIMIT in statement is rejected** — matches AWS. Use the request-level `Limit`.
+- **Quoted identifiers are case-sensitive**; unquoted case-fold to lowercase — matches AWS.
+
+### Strategic note
+After v0.2.4 the DDB deferred list trims to Backups/PITR and Imports/Exports. The next minor (v0.3.0) is still SQS per PRD §15.
+
 ## [0.2.3] — 2026-05-17
 
 **Patch release: DynamoDB TTL background sweeper.**

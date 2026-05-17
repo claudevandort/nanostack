@@ -20,6 +20,7 @@ const batch_handler = @import("batch.zig");
 const tx_handler = @import("transactions.zig");
 const misc_handler = @import("misc.zig");
 const streams_handler = @import("streams.zig");
+const partiql_handler = @import("partiql.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -121,6 +122,11 @@ fn handleCore(ctx: Context) Result {
     // TTL (v0.2.3) — UpdateTimeToLive / DescribeTimeToLive.
     if (std.mem.eql(u8, target, "UpdateTimeToLive")) return tables.updateTimeToLive(ctx);
     if (std.mem.eql(u8, target, "DescribeTimeToLive")) return tables.describeTimeToLive(ctx);
+
+    // PartiQL (v0.2.4).
+    if (std.mem.eql(u8, target, "ExecuteStatement")) return partiql_handler.executeStatement(ctx);
+    if (std.mem.eql(u8, target, "ExecuteTransaction")) return partiql_handler.executeTransaction(ctx);
+    if (std.mem.eql(u8, target, "BatchExecuteStatement")) return partiql_handler.batchExecuteStatement(ctx);
 
     // Kinesis-streaming-destination ops are on the core DDB service
     // (not the Streams sub-service). We explicitly reject them so they
