@@ -5817,6 +5817,9 @@ pub fn sqsReceiveMessage(self: *Fs, allocator: Allocator, in: storage.ReceiveMes
     const vt: i64 = @intCast(in.visibility_timeout orelse slot.attrs.visibility_timeout);
     const max: usize = @min(@as(usize, in.max_messages), 10);
 
+    // Parse RedrivePolicy once per call (lazy).
+    const redrive: ?Redrive = parseRedrivePolicy(slot.attrs.redrive_policy);
+
     var out: std.ArrayList(storage.ReceivedMessage) = .empty;
     errdefer {
         for (out.items) |m| {
@@ -5829,9 +5832,39 @@ pub fn sqsReceiveMessage(self: *Fs, allocator: Allocator, in: storage.ReceiveMes
         out.deinit(allocator);
     }
 
-    for (slot.messages.items) |m| {
+    // Iterate via index because we may need to remove (DLQ route) mid-pass.
+    var i: usize = 0;
+    while (i < slot.messages.items.len) {
         if (out.items.len >= max) break;
-        if (m.visible_unix > now) continue;
+        const m = slot.messages.items[i];
+        if (m.visible_unix > now) {
+            i += 1;
+            continue;
+        }
+
+        // DLQ check: a message that's been delivered maxReceiveCount
+        // times before this attempt moves to the DLQ instead of being
+        // returned. (AWS-real triggers when receive_count >= max.)
+        if (redrive) |rd| if (m.receive_count >= rd.max_receive_count) {
+            if (self.sqs_queues.get(rd.dlq_name)) |dlq| {
+                _ = slot.messages.orderedRemove(i);
+                // Persist the move: write to DLQ's messages dir, delete
+                // from source.
+                m.visible_unix = now;
+                m.receive_count = 0;
+                writeMessageJson(self, dlq.name, m) catch return storage.Error.Io;
+                var path_buf: [4096]u8 = undefined;
+                const src_path = messagePath(self, slot.name, m.id, &path_buf) catch return storage.Error.Io;
+                Io.Dir.cwd().deleteFile(self.io, src_path) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return storage.Error.Io,
+                };
+                dlq.messages.append(self.allocator, m) catch return storage.Error.OutOfMemory;
+                continue; // don't increment i — element at i was removed
+            }
+            // No DLQ found — fall through and deliver normally (matches
+            // AWS behaviour when the DLQ has been deleted).
+        };
 
         m.receive_count += 1;
         m.visible_unix = now + vt;
@@ -5849,9 +5882,58 @@ pub fn sqsReceiveMessage(self: *Fs, allocator: Allocator, in: storage.ReceiveMes
             else
                 null,
         });
+        i += 1;
     }
 
     return .{ .messages = out.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory };
+}
+
+const Redrive = struct {
+    dlq_name: []const u8,
+    max_receive_count: u32,
+};
+
+/// Parse a RedrivePolicy JSON string of the form
+/// `{"deadLetterTargetArn":"arn:aws:sqs:region:account:name","maxReceiveCount":N}`.
+/// Returns null on missing-or-malformed (we don't reject — matches AWS).
+/// The returned `dlq_name` slice points into the input `json_str`, so
+/// callers must hold the slot's lifetime for the duration of use.
+fn parseRedrivePolicy(json_str: ?[]const u8) ?Redrive {
+    const s = json_str orelse return null;
+    // Find "deadLetterTargetArn":"...":name" by manual scan to avoid
+    // depending on parsed-arena lifetimes. We accept whitespace + ASCII
+    // only; the JSON shape AWS sends is always tight.
+    const arn_key = "\"deadLetterTargetArn\"";
+    const max_key = "\"maxReceiveCount\"";
+    const arn_idx = std.mem.indexOf(u8, s, arn_key) orelse return null;
+
+    // Skip `:`, whitespace, then expect `"...arn..."`.
+    var cur = arn_idx + arn_key.len;
+    while (cur < s.len and (s[cur] == ':' or s[cur] == ' ')) : (cur += 1) {}
+    if (cur >= s.len or s[cur] != '"') return null;
+    cur += 1;
+    const arn_start = cur;
+    while (cur < s.len and s[cur] != '"') : (cur += 1) {}
+    if (cur >= s.len) return null;
+    const arn = s[arn_start..cur];
+
+    const max_idx = std.mem.indexOf(u8, s, max_key) orelse return null;
+    cur = max_idx + max_key.len;
+    while (cur < s.len and (s[cur] == ':' or s[cur] == ' ')) : (cur += 1) {}
+    // maxReceiveCount may be quoted (string) or unquoted (integer).
+    var num_start = cur;
+    if (s[cur] == '"') {
+        cur += 1;
+        num_start = cur;
+        while (cur < s.len and s[cur] != '"') : (cur += 1) {}
+    } else {
+        while (cur < s.len and (s[cur] == '-' or (s[cur] >= '0' and s[cur] <= '9'))) : (cur += 1) {}
+    }
+    const max_str = s[num_start..cur];
+    const max: u32 = std.fmt.parseInt(u32, max_str, 10) catch return null;
+
+    const last_colon = std.mem.lastIndexOfScalar(u8, arn, ':') orelse return null;
+    return .{ .dlq_name = arn[last_colon + 1 ..], .max_receive_count = max };
 }
 
 pub fn sqsDeleteMessage(self: *Fs, in: storage.DeleteMessageInput) storage.Error!void {
