@@ -10,6 +10,7 @@ const storage = @import("../../storage/mod.zig");
 const errors = @import("../../wire/sqs/errors.zig");
 const queues_handler = @import("queues.zig");
 const messages_handler = @import("messages.zig");
+const tags_handler = @import("tags.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -74,6 +75,11 @@ pub fn handle(ctx: Context) Result {
     if (std.mem.eql(u8, target, "SendMessageBatch")) return messages_handler.sendMessageBatch(ctx);
     if (std.mem.eql(u8, target, "DeleteMessageBatch")) return messages_handler.deleteMessageBatch(ctx);
     if (std.mem.eql(u8, target, "ChangeMessageVisibilityBatch")) return messages_handler.changeMessageVisibilityBatch(ctx);
+
+    // Tags (Phase 5).
+    if (std.mem.eql(u8, target, "TagQueue")) return tags_handler.tagQueue(ctx);
+    if (std.mem.eql(u8, target, "UntagQueue")) return tags_handler.untagQueue(ctx);
+    if (std.mem.eql(u8, target, "ListQueueTags")) return tags_handler.listQueueTags(ctx);
 
     // Anything else: 400 with operation name in the message. Phase 2+
     // adds messages / batches / long polling.

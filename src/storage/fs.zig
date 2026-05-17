@@ -853,6 +853,9 @@ const sqs_vtable: storage.SqsBackend.VTable = .{
     .receiveMessage = vtSqsReceiveMessage,
     .deleteMessage = vtSqsDeleteMessage,
     .changeMessageVisibility = vtSqsChangeMessageVisibility,
+    .tagQueue = vtSqsTagQueue,
+    .untagQueue = vtSqsUntagQueue,
+    .listQueueTags = vtSqsListQueueTags,
 };
 
 fn vtSqsCreateQueue(ctx: *anyopaque, in: storage.CreateQueueInput) storage.Error!*const storage.SqsQueueSlot {
@@ -887,6 +890,15 @@ fn vtSqsDeleteMessage(ctx: *anyopaque, in: storage.DeleteMessageInput) storage.E
 }
 fn vtSqsChangeMessageVisibility(ctx: *anyopaque, in: storage.ChangeMessageVisibilityInput) storage.Error!void {
     return sqsChangeMessageVisibility(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtSqsTagQueue(ctx: *anyopaque, in: storage.TagQueueInput) storage.Error!void {
+    return sqsTagQueue(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtSqsUntagQueue(ctx: *anyopaque, in: storage.UntagQueueInput) storage.Error!void {
+    return sqsUntagQueue(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtSqsListQueueTags(ctx: *anyopaque, allocator: Allocator, queue_name: []const u8) storage.Error!storage.ListQueueTagsOutput {
+    return sqsListQueueTags(@ptrCast(@alignCast(ctx)), allocator, queue_name);
 }
 
 const dynamo_vtable: storage.DynamoBackend.VTable = .{
@@ -5498,6 +5510,8 @@ fn loadSingleQueue(self: *Fs, name: []const u8) !void {
         },
     };
 
+    loadQueueTags(self, slot_ptr);
+
     try self.sqs_queues.put(self.allocator, slot_ptr.name, slot_ptr);
 }
 
@@ -5966,6 +5980,117 @@ pub fn sqsDeleteMessage(self: *Fs, in: storage.DeleteMessageInput) storage.Error
     };
     m.deinit(self.allocator);
     self.allocator.destroy(m);
+}
+
+// ---------------------------------------------------------------------------
+// SQS tags (v0.3.0 Phase 5)
+
+fn queueTagsPath(self: *Fs, name: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/sqs/queues/{s}/tags.json", .{ self.base_dir, name });
+}
+
+fn writeQueueTags(self: *Fs, slot: *const storage.SqsQueueSlot) !void {
+    var dir_buf: [4096]u8 = undefined;
+    const dir_path = try queueDirPath(self, slot.name, &dir_buf);
+    try Io.Dir.cwd().createDirPath(self.io, dir_path);
+
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    var it = slot.tags.iterator();
+    while (it.next()) |entry| {
+        try s.objectField(entry.key_ptr.*);
+        try s.write(entry.value_ptr.*);
+    }
+    try s.endObject();
+    const body = try aw.toOwnedSlice();
+    defer self.allocator.free(body);
+
+    var path_buf: [4096]u8 = undefined;
+    const path = try queueTagsPath(self, slot.name, &path_buf);
+    try writeAtomic(self.io, path, body);
+}
+
+fn loadQueueTags(self: *Fs, slot: *storage.SqsQueueSlot) void {
+    var path_buf: [4096]u8 = undefined;
+    const path = queueTagsPath(self, slot.name, &path_buf) catch return;
+    const body = Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(64 * 1024)) catch return;
+    defer self.allocator.free(body);
+    var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        const k = self.allocator.dupe(u8, entry.key_ptr.*) catch return;
+        const v = self.allocator.dupe(u8, entry.value_ptr.*.string) catch {
+            self.allocator.free(k);
+            return;
+        };
+        slot.tags.put(self.allocator, k, v) catch {
+            self.allocator.free(k);
+            self.allocator.free(v);
+            return;
+        };
+    }
+}
+
+pub fn sqsTagQueue(self: *Fs, in: storage.TagQueueInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(in.queue_name) orelse return storage.Error.QueueNotFound;
+    for (in.tags) |t| {
+        // Replace if present (free old value), insert otherwise.
+        if (slot.tags.fetchRemove(t.key)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
+        }
+        if (slot.tags.count() >= 50) return storage.Error.TooManyEntries;
+        const k = self.allocator.dupe(u8, t.key) catch return storage.Error.OutOfMemory;
+        const v = self.allocator.dupe(u8, t.value) catch {
+            self.allocator.free(k);
+            return storage.Error.OutOfMemory;
+        };
+        slot.tags.put(self.allocator, k, v) catch {
+            self.allocator.free(k);
+            self.allocator.free(v);
+            return storage.Error.OutOfMemory;
+        };
+    }
+    writeQueueTags(self, slot) catch return storage.Error.Io;
+}
+
+pub fn sqsUntagQueue(self: *Fs, in: storage.UntagQueueInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(in.queue_name) orelse return storage.Error.QueueNotFound;
+    for (in.keys) |k| {
+        if (slot.tags.fetchRemove(k)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
+        }
+    }
+    writeQueueTags(self, slot) catch return storage.Error.Io;
+}
+
+pub fn sqsListQueueTags(self: *Fs, allocator: Allocator, queue_name: []const u8) storage.Error!storage.ListQueueTagsOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(queue_name) orelse return storage.Error.QueueNotFound;
+    var out = allocator.alloc(storage.Tag, slot.tags.count()) catch return storage.Error.OutOfMemory;
+    var i: usize = 0;
+    var it = slot.tags.iterator();
+    while (it.next()) |entry| : (i += 1) {
+        out[i] = .{
+            .key = allocator.dupe(u8, entry.key_ptr.*) catch return storage.Error.OutOfMemory,
+            .value = allocator.dupe(u8, entry.value_ptr.*) catch return storage.Error.OutOfMemory,
+        };
+    }
+    return .{ .tags = out };
 }
 
 pub fn sqsChangeMessageVisibility(self: *Fs, in: storage.ChangeMessageVisibilityInput) storage.Error!void {

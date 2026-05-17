@@ -1879,6 +1879,21 @@ pub const ChangeMessageVisibilityInput = struct {
     visibility_timeout: u32,
 };
 
+pub const TagQueueInput = struct {
+    queue_name: []const u8,
+    /// Each entry's `key` + `value` are owned by the caller's arena.
+    tags: []const Tag,
+};
+
+pub const UntagQueueInput = struct {
+    queue_name: []const u8,
+    keys: []const []const u8,
+};
+
+pub const ListQueueTagsOutput = struct {
+    tags: []const Tag,
+};
+
 pub const SqsBackend = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -1896,6 +1911,10 @@ pub const SqsBackend = struct {
         receiveMessage: *const fn (ctx: *anyopaque, allocator: Allocator, in: ReceiveMessageInput) Error!ReceiveMessageOutput,
         deleteMessage: *const fn (ctx: *anyopaque, in: DeleteMessageInput) Error!void,
         changeMessageVisibility: *const fn (ctx: *anyopaque, in: ChangeMessageVisibilityInput) Error!void,
+        // v0.3.0 Phase 5: tags.
+        tagQueue: *const fn (ctx: *anyopaque, in: TagQueueInput) Error!void,
+        untagQueue: *const fn (ctx: *anyopaque, in: UntagQueueInput) Error!void,
+        listQueueTags: *const fn (ctx: *anyopaque, allocator: Allocator, queue_name: []const u8) Error!ListQueueTagsOutput,
     };
 
     pub fn createQueue(self: SqsBackend, in: CreateQueueInput) Error!*const SqsQueueSlot {
@@ -1930,6 +1949,15 @@ pub const SqsBackend = struct {
     }
     pub fn changeMessageVisibility(self: SqsBackend, in: ChangeMessageVisibilityInput) Error!void {
         return self.vtable.changeMessageVisibility(self.ctx, in);
+    }
+    pub fn tagQueue(self: SqsBackend, in: TagQueueInput) Error!void {
+        return self.vtable.tagQueue(self.ctx, in);
+    }
+    pub fn untagQueue(self: SqsBackend, in: UntagQueueInput) Error!void {
+        return self.vtable.untagQueue(self.ctx, in);
+    }
+    pub fn listQueueTags(self: SqsBackend, allocator: Allocator, queue_name: []const u8) Error!ListQueueTagsOutput {
+        return self.vtable.listQueueTags(self.ctx, allocator, queue_name);
     }
 };
 
