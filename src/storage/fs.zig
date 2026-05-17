@@ -5848,6 +5848,32 @@ pub fn sqsSendMessage(self: *Fs, allocator: Allocator, in: storage.SendMessageIn
     }
 
     const now = nowUnixSeconds(self.io);
+
+    // FIFO dedup window. Compute effective dedup id (explicit, or
+    // sha256(body) under ContentBasedDeduplication). Prune expired
+    // entries first, then look up.
+    var effective_dedup: ?[]const u8 = null;
+    var content_hash_buf: [64]u8 = undefined;
+    if (slot.attrs.is_fifo) {
+        pruneDedupHistory(self, slot, now);
+        if (in.message_deduplication_id) |s| {
+            effective_dedup = s;
+        } else if (slot.attrs.content_based_dedup) {
+            effective_dedup = sha256Hex(in.body, &content_hash_buf);
+        }
+        if (effective_dedup) |key| {
+            if (slot.dedup_history.get(key)) |entry| {
+                // Return the original send's identifiers; the wire
+                // can't tell the dupe was suppressed.
+                return .{
+                    .message_id = allocator.dupe(u8, entry.message_id) catch return storage.Error.OutOfMemory,
+                    .md5_of_body = allocator.dupe(u8, &md5Hex(in.body)) catch return storage.Error.OutOfMemory,
+                    .sequence_number = entry.sequence_number,
+                };
+            }
+        }
+    }
+
     const delay: u32 = in.delay_seconds orelse slot.attrs.delay_seconds;
 
     const id_owned = generateMessageId(self.allocator, self.io) catch return storage.Error.OutOfMemory;
@@ -5896,6 +5922,23 @@ pub fn sqsSendMessage(self: *Fs, allocator: Allocator, in: storage.SendMessageIn
     if (slot.attrs.is_fifo) {
         // Persist the bumped sequence_counter so it survives restart.
         writeQueueAttrs(self, slot) catch return storage.Error.Io;
+        // Record the dedup id (if any) for the 5-minute window.
+        if (effective_dedup) |key| {
+            const key_owned = self.allocator.dupe(u8, key) catch return storage.Error.OutOfMemory;
+            const msg_id_owned = self.allocator.dupe(u8, id_owned) catch {
+                self.allocator.free(key_owned);
+                return storage.Error.OutOfMemory;
+            };
+            slot.dedup_history.put(self.allocator, key_owned, .{
+                .message_id = msg_id_owned,
+                .sequence_number = seq_number,
+                .expire_unix = now + dedup_window_seconds,
+            }) catch {
+                self.allocator.free(key_owned);
+                self.allocator.free(msg_id_owned);
+                return storage.Error.OutOfMemory;
+            };
+        }
     }
 
     return .{
@@ -5903,6 +5946,40 @@ pub fn sqsSendMessage(self: *Fs, allocator: Allocator, in: storage.SendMessageIn
         .md5_of_body = allocator.dupe(u8, &md5) catch return storage.Error.OutOfMemory,
         .sequence_number = if (slot.attrs.is_fifo) seq_number else null,
     };
+}
+
+const dedup_window_seconds: i64 = 300;
+
+/// Prune entries whose expire_unix <= now. Frees both the key + the
+/// stored message_id.
+fn pruneDedupHistory(self: *Fs, slot: *storage.SqsQueueSlot, now: i64) void {
+    var to_remove: std.ArrayList([]const u8) = .empty;
+    defer to_remove.deinit(self.allocator);
+    var it = slot.dedup_history.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.expire_unix <= now) {
+            to_remove.append(self.allocator, entry.key_ptr.*) catch return;
+        }
+    }
+    for (to_remove.items) |key| {
+        if (slot.dedup_history.fetchRemove(key)) |kv| {
+            self.allocator.free(kv.key);
+            self.allocator.free(kv.value.message_id);
+        }
+    }
+}
+
+/// SHA-256 of `data`, hex-encoded lowercase, written into `out_buf`
+/// (must be ≥64 bytes). Returns a slice referencing `out_buf`.
+fn sha256Hex(data: []const u8, out_buf: *[64]u8) []const u8 {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &hash, .{});
+    const hex = "0123456789abcdef";
+    for (hash, 0..) |b, i| {
+        out_buf[i * 2] = hex[(b >> 4) & 0xf];
+        out_buf[i * 2 + 1] = hex[b & 0xf];
+    }
+    return out_buf[0..];
 }
 
 pub fn sqsReceiveMessage(self: *Fs, allocator: Allocator, in: storage.ReceiveMessageInput) storage.Error!storage.ReceiveMessageOutput {

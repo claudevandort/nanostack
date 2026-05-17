@@ -319,6 +319,77 @@ def test_fifo_sequence_counter_survives_restart():
         proc.wait(timeout=5)
 
 
+# ---------- Phase C — dedup window + content-based dedup ----------
+
+
+def test_fifo_explicit_dedup_id_silently_dedupes(sqs):
+    """Two sends with the same MessageDeduplicationId within 5 minutes:
+    the second returns the first's MessageId + SequenceNumber and is
+    silently dropped."""
+    name = _fifo_name()
+    url = sqs.create_queue(QueueName=name, Attributes={"FifoQueue": "true"})["QueueUrl"]
+    try:
+        first = sqs.send_message(
+            QueueUrl=url, MessageBody="a", MessageGroupId="g1",
+            MessageDeduplicationId="dup-1",
+        )
+        second = sqs.send_message(
+            QueueUrl=url, MessageBody="a-different", MessageGroupId="g1",
+            MessageDeduplicationId="dup-1",
+        )
+        assert first["MessageId"] == second["MessageId"]
+        assert first["SequenceNumber"] == second["SequenceNumber"]
+        # Verify only one message is in the queue (the original).
+        recv = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)
+        assert len(recv.get("Messages", [])) == 1
+        assert recv["Messages"][0]["Body"] == "a"
+    finally:
+        sqs.delete_queue(QueueUrl=url)
+
+
+def test_fifo_content_based_dedup_uses_body_hash(sqs, fifo_queue):
+    """ContentBasedDeduplication=true on the queue makes identical
+    bodies dedupe even without explicit MessageDeduplicationId."""
+    _, url = fifo_queue
+    first = sqs.send_message(QueueUrl=url, MessageBody="payload", MessageGroupId="g1")
+    second = sqs.send_message(QueueUrl=url, MessageBody="payload", MessageGroupId="g1")
+    assert first["MessageId"] == second["MessageId"]
+
+
+def test_fifo_different_dedup_ids_same_body_both_delivered(sqs):
+    name = _fifo_name()
+    url = sqs.create_queue(QueueName=name, Attributes={"FifoQueue": "true"})["QueueUrl"]
+    try:
+        first = sqs.send_message(
+            QueueUrl=url, MessageBody="same", MessageGroupId="g1",
+            MessageDeduplicationId="d1",
+        )
+        second = sqs.send_message(
+            QueueUrl=url, MessageBody="same", MessageGroupId="g1",
+            MessageDeduplicationId="d2",
+        )
+        assert first["MessageId"] != second["MessageId"]
+    finally:
+        sqs.delete_queue(QueueUrl=url)
+
+
+def test_fifo_send_batch_dedupes_within_batch(sqs, fifo_queue):
+    """Two batch entries with the same effective dedup id (content-hash
+    fallback here) collapse to one delivered message."""
+    _, url = fifo_queue
+    out = sqs.send_message_batch(
+        QueueUrl=url,
+        Entries=[
+            {"Id": "a", "MessageBody": "batch-payload", "MessageGroupId": "g1"},
+            {"Id": "b", "MessageBody": "batch-payload", "MessageGroupId": "g1"},
+        ],
+    )
+    successful = {e["Id"]: e for e in out["Successful"]}
+    # Both entries succeed individually, but they reference the same
+    # underlying MessageId.
+    assert successful["a"]["MessageId"] == successful["b"]["MessageId"]
+
+
 def _pick_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
