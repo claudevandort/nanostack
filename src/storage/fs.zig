@@ -775,6 +775,7 @@ pub fn initWithOptions(allocator: Allocator, io: Io, base_dir: []const u8, opts:
     ensureS3Dir(self) catch return InitError.Io;
     loadRegistry(self) catch return InitError.Io;
     ensureDynamoDir(self) catch return InitError.Io;
+    ensureBackupsDir(self) catch return InitError.Io;
     loadDynamoTables(self) catch return InitError.Io;
 
     if (opts.spawn_ttl_sweeper) {
@@ -837,6 +838,11 @@ const dynamo_vtable: storage.DynamoBackend.VTable = .{
     .getRecords = vtDdbGetRecords,
     .updateTimeToLive = vtDdbUpdateTimeToLive,
     .describeTimeToLive = vtDdbDescribeTimeToLive,
+    .createBackup = vtDdbCreateBackup,
+    .listBackups = vtDdbListBackups,
+    .describeBackup = vtDdbDescribeBackup,
+    .deleteBackup = vtDdbDeleteBackup,
+    .restoreTableFromBackup = vtDdbRestoreFromBackup,
 };
 
 fn vtDdbListTables(ctx: *anyopaque, allocator: Allocator) storage.Error![]const []const u8 {
@@ -892,6 +898,21 @@ fn vtDdbUpdateTimeToLive(ctx: *anyopaque, in: storage.UpdateTimeToLiveInput) sto
 }
 fn vtDdbDescribeTimeToLive(ctx: *anyopaque, name: []const u8) storage.Error!?storage.dynamo_state.TimeToLiveSpec {
     return ddbDescribeTimeToLive(@ptrCast(@alignCast(ctx)), name);
+}
+fn vtDdbCreateBackup(ctx: *anyopaque, allocator: Allocator, in: storage.CreateBackupInput) storage.Error!storage.BackupSummary {
+    return ddbCreateBackup(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtDdbListBackups(ctx: *anyopaque, allocator: Allocator, in: storage.ListBackupsInput) storage.Error!storage.ListBackupsOutput {
+    return ddbListBackups(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtDdbDescribeBackup(ctx: *anyopaque, allocator: Allocator, arn: []const u8) storage.Error!storage.BackupDescription {
+    return ddbDescribeBackup(@ptrCast(@alignCast(ctx)), allocator, arn);
+}
+fn vtDdbDeleteBackup(ctx: *anyopaque, allocator: Allocator, arn: []const u8) storage.Error!storage.BackupDescription {
+    return ddbDeleteBackup(@ptrCast(@alignCast(ctx)), allocator, arn);
+}
+fn vtDdbRestoreFromBackup(ctx: *anyopaque, allocator: Allocator, in: storage.RestoreTableFromBackupInput) storage.Error!*const storage.TableSlot {
+    return ddbRestoreTableFromBackup(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 
 // ---------------------------------------------------------------------------
@@ -3204,6 +3225,12 @@ fn ensureDynamoDir(self: *Fs) !void {
     try Io.Dir.cwd().createDirPath(self.io, path);
 }
 
+fn ensureBackupsDir(self: *Fs) !void {
+    var buf: [4096]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/dynamodb/backups", .{self.base_dir});
+    try Io.Dir.cwd().createDirPath(self.io, path);
+}
+
 /// Serialise a TableSlot to the on-disk schema.json layout.
 /// Format is internal to nanostack; the wire layer translates to/from
 /// the AWS-PascalCase JSON shape on requests/responses.
@@ -4674,6 +4701,379 @@ fn sweepTableLocked(self: *Fs, slot: *storage.TableSlot, attr_name: []const u8, 
     for (victims.items) |*key_only| {
         applyDeleteLocked(self, slot, key_only, .ttl_sweeper) catch {};
     }
+}
+
+// ---------------------------------------------------------------------------
+// DynamoDB Backups (v0.2.5)
+//
+// Disk layout: `<base>/dynamodb/backups/<backup_id>/` holds:
+//   - manifest.json — source table name, backup ARN, type, status,
+//     creation_unix, size_bytes, item_count.
+//   - schema.json — snapshotted SchemaDoc (same shape as the live table's).
+//   - items/<sha256>.json — one file per item.
+//
+// Backups are independent of the source table: `DeleteTable` does not
+// cascade. Backup IDs are `<14-digit-unix-ms>-<8-hex-random>` (matches
+// AWS's opaque shape).
+
+const BackupManifest = struct {
+    backup_id: []const u8,
+    backup_name: []const u8,
+    source_table: []const u8,
+    creation_unix: i64,
+    status: []const u8, // "AVAILABLE" / "DELETED"
+    backup_type: []const u8, // "USER"
+    size_bytes: u64,
+    item_count: u64,
+};
+
+fn backupsRootPath(self: *Fs, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/dynamodb/backups", .{self.base_dir});
+}
+
+fn backupDirPath(self: *Fs, backup_id: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/dynamodb/backups/{s}", .{ self.base_dir, backup_id });
+}
+
+fn backupItemsDirPath(self: *Fs, backup_id: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/dynamodb/backups/{s}/items", .{ self.base_dir, backup_id });
+}
+
+/// `arn:aws:dynamodb:<region>:000000000000:table/<source>/backup/<id>`
+fn buildBackupArn(allocator: Allocator, region: []const u8, source_table: []const u8, backup_id: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "arn:aws:dynamodb:{s}:000000000000:table/{s}/backup/{s}", .{ region, source_table, backup_id });
+}
+
+/// Pull the backup ID from the trailing `/backup/<id>` segment.
+fn parseBackupId(arn: []const u8) storage.Error![]const u8 {
+    const marker = "/backup/";
+    const idx = std.mem.lastIndexOf(u8, arn, marker) orelse return storage.Error.InvalidBackupArn;
+    const id = arn[idx + marker.len ..];
+    if (id.len == 0) return storage.Error.InvalidBackupArn;
+    return id;
+}
+
+/// `<14-digit unix-ms>-<8-hex>`. The 8-hex tail is the low 32 bits of
+/// the sub-millisecond nanosecond remainder, which gives us
+/// monotonically-increasing IDs without an RNG dependency. Collision
+/// probability is negligible for a local-dev emulator (concurrent
+/// backups on the same nanosecond are not a realistic case).
+fn generateBackupId(allocator: Allocator, io: Io) ![]const u8 {
+    const ts = Io.Timestamp.now(io, .real);
+    const total_ns: u64 = @intCast(ts.nanoseconds);
+    const ms: u64 = total_ns / std.time.ns_per_ms;
+    const sub_ms_ns: u32 = @truncate(total_ns % std.time.ns_per_ms);
+    return std.fmt.allocPrint(allocator, "{d:0>14}-{x:0>8}", .{ ms, sub_ms_ns });
+}
+
+pub fn ddbCreateBackup(self: *Fs, allocator: Allocator, in: storage.CreateBackupInput) storage.Error!storage.BackupSummary {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.dynamo_tables.get(in.table_name) orelse return storage.Error.TableNotFound;
+
+    const backup_id = generateBackupId(self.allocator, self.io) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(backup_id);
+
+    var dir_buf: [4096]u8 = undefined;
+    const backup_dir = backupDirPath(self, backup_id, &dir_buf) catch return storage.Error.Io;
+    Io.Dir.cwd().createDirPath(self.io, backup_dir) catch return storage.Error.Io;
+
+    var items_buf: [4096]u8 = undefined;
+    const items_dir = backupItemsDirPath(self, backup_id, &items_buf) catch return storage.Error.Io;
+    Io.Dir.cwd().createDirPath(self.io, items_dir) catch return storage.Error.Io;
+
+    // schema.json — reuse slotToDoc.
+    {
+        const doc = slotToDoc(self.allocator, slot) catch return storage.Error.OutOfMemory;
+        defer freeDoc(self.allocator, doc);
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        std.json.Stringify.value(doc, .{}, &aw.writer) catch return storage.Error.OutOfMemory;
+        const body = aw.toOwnedSlice() catch return storage.Error.OutOfMemory;
+        defer self.allocator.free(body);
+        var schema_path_buf: [4096]u8 = undefined;
+        const schema_path = std.fmt.bufPrint(&schema_path_buf, "{s}/schema.json", .{backup_dir}) catch return storage.Error.Io;
+        writeAtomic(self.io, schema_path, body) catch return storage.Error.Io;
+    }
+
+    // Items: walk slot.items and persist a copy at the backup-items path.
+    var total_size: u64 = 0;
+    var item_count: u64 = 0;
+    {
+        var it = slot.items.iterator();
+        while (it.next()) |entry| {
+            const item_ptr = entry.value_ptr.*;
+            const key_str = entry.key_ptr.*;
+            const key_hash = itemKeyHash(key_str);
+
+            // Render via the existing item-JSON pattern.
+            var aw: std.Io.Writer.Allocating = .init(self.allocator);
+            defer aw.deinit();
+            var s: std.json.Stringify = .{ .writer = &aw.writer };
+            s.beginObject() catch return storage.Error.OutOfMemory;
+            for (item_ptr.names, item_ptr.values) |name, value| {
+                s.objectField(name) catch return storage.Error.OutOfMemory;
+                ddb_attr.renderValue(&s, self.allocator, value) catch return storage.Error.OutOfMemory;
+            }
+            s.endObject() catch return storage.Error.OutOfMemory;
+            const body = aw.toOwnedSlice() catch return storage.Error.OutOfMemory;
+            defer self.allocator.free(body);
+
+            var item_path_buf: [4096]u8 = undefined;
+            const item_path = std.fmt.bufPrint(&item_path_buf, "{s}/{s}.json", .{ items_dir, &key_hash }) catch return storage.Error.Io;
+            writeAtomic(self.io, item_path, body) catch return storage.Error.Io;
+            total_size += body.len;
+            item_count += 1;
+        }
+    }
+
+    const created_unix = nowUnixSeconds(self.io);
+    const backup_name_owned = self.allocator.dupe(u8, in.backup_name) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(backup_name_owned);
+    const source_table_owned = self.allocator.dupe(u8, slot.name) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(source_table_owned);
+
+    const manifest: BackupManifest = .{
+        .backup_id = backup_id,
+        .backup_name = backup_name_owned,
+        .source_table = source_table_owned,
+        .creation_unix = created_unix,
+        .status = "AVAILABLE",
+        .backup_type = "USER",
+        .size_bytes = total_size,
+        .item_count = item_count,
+    };
+    writeBackupManifest(self, backup_id, manifest) catch return storage.Error.Io;
+    self.allocator.free(backup_name_owned);
+    self.allocator.free(source_table_owned);
+
+    // Build the public-facing summary using the caller's allocator.
+    return .{
+        .arn = buildBackupArn(allocator, in.region, slot.name, backup_id) catch return storage.Error.OutOfMemory,
+        .backup_id = allocator.dupe(u8, backup_id) catch return storage.Error.OutOfMemory,
+        .name = allocator.dupe(u8, in.backup_name) catch return storage.Error.OutOfMemory,
+        .table_name = allocator.dupe(u8, slot.name) catch return storage.Error.OutOfMemory,
+        .creation_unix = created_unix,
+        .status = .available,
+        .backup_type = .user,
+        .size_bytes = total_size,
+    };
+}
+
+fn writeBackupManifest(self: *Fs, backup_id: []const u8, manifest: BackupManifest) !void {
+    var dir_buf: [4096]u8 = undefined;
+    const backup_dir = try backupDirPath(self, backup_id, &dir_buf);
+    var path_buf: [4096]u8 = undefined;
+    const manifest_path = try std.fmt.bufPrint(&path_buf, "{s}/manifest.json", .{backup_dir});
+
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(manifest, .{}, &aw.writer);
+    const body = try aw.toOwnedSlice();
+    defer self.allocator.free(body);
+    try writeAtomic(self.io, manifest_path, body);
+}
+
+fn readBackupManifest(self: *Fs, allocator: Allocator, backup_id: []const u8) storage.Error!BackupManifest {
+    var dir_buf: [4096]u8 = undefined;
+    const backup_dir = backupDirPath(self, backup_id, &dir_buf) catch return storage.Error.Io;
+    var path_buf: [4096]u8 = undefined;
+    const manifest_path = std.fmt.bufPrint(&path_buf, "{s}/manifest.json", .{backup_dir}) catch return storage.Error.Io;
+
+    const body = Io.Dir.cwd().readFileAlloc(self.io, manifest_path, allocator, .limited(64 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return storage.Error.BackupNotFound,
+        else => return storage.Error.Io,
+    };
+    defer allocator.free(body);
+
+    var parsed = std.json.parseFromSlice(BackupManifest, allocator, body, .{ .ignore_unknown_fields = true }) catch
+        return storage.Error.Io;
+    defer parsed.deinit();
+    const m = parsed.value;
+    // Re-allocate owned copies — caller owns these.
+    return .{
+        .backup_id = try allocator.dupe(u8, m.backup_id),
+        .backup_name = try allocator.dupe(u8, m.backup_name),
+        .source_table = try allocator.dupe(u8, m.source_table),
+        .creation_unix = m.creation_unix,
+        .status = try allocator.dupe(u8, m.status),
+        .backup_type = try allocator.dupe(u8, m.backup_type),
+        .size_bytes = m.size_bytes,
+        .item_count = m.item_count,
+    };
+}
+
+fn manifestToSummary(allocator: Allocator, region: []const u8, manifest: BackupManifest) !storage.BackupSummary {
+    return .{
+        .arn = try buildBackupArn(allocator, region, manifest.source_table, manifest.backup_id),
+        .backup_id = try allocator.dupe(u8, manifest.backup_id),
+        .name = try allocator.dupe(u8, manifest.backup_name),
+        .table_name = try allocator.dupe(u8, manifest.source_table),
+        .creation_unix = manifest.creation_unix,
+        .status = if (std.mem.eql(u8, manifest.status, "AVAILABLE")) .available else .deleted,
+        .backup_type = .user,
+        .size_bytes = manifest.size_bytes,
+    };
+}
+
+pub fn ddbListBackups(self: *Fs, allocator: Allocator, in: storage.ListBackupsInput) storage.Error!storage.ListBackupsOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    var summaries: std.ArrayList(storage.BackupSummary) = .empty;
+    errdefer summaries.deinit(allocator);
+
+    var root_buf: [4096]u8 = undefined;
+    const root = backupsRootPath(self, &root_buf) catch return storage.Error.Io;
+    var dir = Io.Dir.cwd().openDir(self.io, root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return .{ .backups = &.{}, .last_evaluated_backup_arn = null },
+        else => return storage.Error.Io,
+    };
+    defer dir.close(self.io);
+
+    var it = dir.iterate();
+    while (it.next(self.io) catch return storage.Error.Io) |entry| {
+        if (entry.kind != .directory) continue;
+        const manifest = self.readBackupManifest(allocator, entry.name) catch continue;
+        defer {
+            allocator.free(manifest.backup_id);
+            allocator.free(manifest.backup_name);
+            allocator.free(manifest.source_table);
+            allocator.free(manifest.status);
+            allocator.free(manifest.backup_type);
+        }
+        if (in.table_name) |filter| if (!std.mem.eql(u8, filter, manifest.source_table)) continue;
+        const summary = manifestToSummary(allocator, in.region, manifest) catch return storage.Error.OutOfMemory;
+        summaries.append(allocator, summary) catch return storage.Error.OutOfMemory;
+    }
+
+    // Sort by ARN for stable pagination.
+    std.mem.sort(storage.BackupSummary, summaries.items, {}, struct {
+        fn lt(_: void, a: storage.BackupSummary, b: storage.BackupSummary) bool {
+            return std.mem.lessThan(u8, a.arn, b.arn);
+        }
+    }.lt);
+
+    // Cursor: skip everything <= start_arn.
+    var start_idx: usize = 0;
+    if (in.exclusive_start_backup_arn) |cursor| {
+        for (summaries.items, 0..) |s, idx| {
+            if (std.mem.eql(u8, s.arn, cursor)) {
+                start_idx = idx + 1;
+                break;
+            }
+        }
+    }
+    const end_idx = @min(start_idx + in.limit, summaries.items.len);
+    const owned = summaries.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory;
+
+    // Free anything outside the requested page.
+    for (owned[0..start_idx]) |s| freeSummary(allocator, s);
+    for (owned[end_idx..]) |s| freeSummary(allocator, s);
+    const page = allocator.alloc(storage.BackupSummary, end_idx - start_idx) catch return storage.Error.OutOfMemory;
+    for (owned[start_idx..end_idx], 0..) |s, i| page[i] = s;
+    const next: ?[]const u8 = if (end_idx < owned.len)
+        allocator.dupe(u8, page[page.len - 1].arn) catch return storage.Error.OutOfMemory
+    else
+        null;
+    allocator.free(owned);
+    return .{ .backups = page, .last_evaluated_backup_arn = next };
+}
+
+fn freeSummary(allocator: Allocator, s: storage.BackupSummary) void {
+    allocator.free(s.arn);
+    allocator.free(s.backup_id);
+    allocator.free(s.name);
+    allocator.free(s.table_name);
+}
+
+pub fn ddbDescribeBackup(self: *Fs, allocator: Allocator, backup_arn: []const u8) storage.Error!storage.BackupDescription {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    return describeBackupLocked(self, allocator, backup_arn);
+}
+
+/// Caller must hold `self.mutex`.
+fn describeBackupLocked(self: *Fs, allocator: Allocator, backup_arn: []const u8) storage.Error!storage.BackupDescription {
+    const backup_id = try parseBackupId(backup_arn);
+    const manifest = try self.readBackupManifest(allocator, backup_id);
+    errdefer {
+        allocator.free(manifest.backup_id);
+        allocator.free(manifest.backup_name);
+        allocator.free(manifest.source_table);
+        allocator.free(manifest.status);
+        allocator.free(manifest.backup_type);
+    }
+
+    var dir_buf: [4096]u8 = undefined;
+    const backup_dir = backupDirPath(self, backup_id, &dir_buf) catch return storage.Error.Io;
+    var schema_path_buf: [4096]u8 = undefined;
+    const schema_path = std.fmt.bufPrint(&schema_path_buf, "{s}/schema.json", .{backup_dir}) catch return storage.Error.Io;
+    const body = Io.Dir.cwd().readFileAlloc(self.io, schema_path, allocator, .limited(1024 * 1024)) catch
+        return storage.Error.Io;
+    defer allocator.free(body);
+    var parsed = std.json.parseFromSlice(SchemaDoc, allocator, body, .{ .ignore_unknown_fields = true }) catch
+        return storage.Error.Io;
+    defer parsed.deinit();
+    const doc = parsed.value;
+
+    const ks = allocator.alloc(storage.dynamo_state.KeyAttribute, doc.key_schema.len) catch return storage.Error.OutOfMemory;
+    for (doc.key_schema, 0..) |k, i| ks[i] = .{
+        .name = allocator.dupe(u8, k.name) catch return storage.Error.OutOfMemory,
+        .key_type = storage.dynamo_state.KeyType.fromAws(k.key_type) orelse .hash,
+    };
+    const ad = allocator.alloc(storage.dynamo_state.AttributeDef, doc.attribute_definitions.len) catch return storage.Error.OutOfMemory;
+    for (doc.attribute_definitions, 0..) |a, i| ad[i] = .{
+        .name = allocator.dupe(u8, a.name) catch return storage.Error.OutOfMemory,
+        .type = storage.dynamo_state.ScalarType.fromAws(a.type) orelse .string,
+    };
+
+    return .{
+        .summary = .{
+            .arn = buildBackupArn(allocator, "us-east-1", manifest.source_table, manifest.backup_id) catch
+                return storage.Error.OutOfMemory,
+            .backup_id = manifest.backup_id,
+            .name = manifest.backup_name,
+            .table_name = allocator.dupe(u8, manifest.source_table) catch return storage.Error.OutOfMemory,
+            .creation_unix = manifest.creation_unix,
+            .status = .available,
+            .backup_type = .user,
+            .size_bytes = manifest.size_bytes,
+        },
+        .table_name = manifest.source_table,
+        .key_schema = ks,
+        .attribute_definitions = ad,
+        .billing_mode = storage.dynamo_state.BillingMode.fromAws(doc.billing_mode) orelse .pay_per_request,
+        .table_created_unix = doc.created_unix,
+        .item_count = manifest.item_count,
+    };
+}
+
+pub fn ddbDeleteBackup(self: *Fs, allocator: Allocator, backup_arn: []const u8) storage.Error!storage.BackupDescription {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    // Read the full description (manifest + schema) BEFORE deleting so
+    // the caller gets back the same shape DescribeBackup would have
+    // returned — with BackupStatus flipped to DELETED.
+    var desc = try describeBackupLocked(self, allocator, backup_arn);
+    desc.summary.status = .deleted;
+
+    const backup_id = try parseBackupId(backup_arn);
+    var dir_buf: [4096]u8 = undefined;
+    const backup_dir = backupDirPath(self, backup_id, &dir_buf) catch return storage.Error.Io;
+    Io.Dir.cwd().deleteTree(self.io, backup_dir) catch return storage.Error.Io;
+
+    return desc;
+}
+
+pub fn ddbRestoreTableFromBackup(self: *Fs, allocator: Allocator, in: storage.RestoreTableFromBackupInput) storage.Error!*const storage.TableSlot {
+    _ = self;
+    _ = allocator;
+    _ = in;
+    // Phase 2.
+    return storage.Error.BackupNotFound;
 }
 
 // ---------------------------------------------------------------------------

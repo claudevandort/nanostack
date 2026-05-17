@@ -469,6 +469,8 @@ pub fn mapStorageErr(e: storage.Error) errors.Code {
         storage.Error.ShardNotFound,
         storage.Error.InvalidStreamArn,
         storage.Error.InvalidShardIterator,
+        storage.Error.BackupNotFound,
+        storage.Error.InvalidBackupArn,
         => .internal_error,
         storage.Error.Io, storage.Error.OutOfMemory => .internal_error,
     };
