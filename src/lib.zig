@@ -31,6 +31,7 @@ pub const dynamodb_query = @import("services/dynamodb/query.zig");
 pub const dynamodb_scan = @import("services/dynamodb/scan.zig");
 pub const dynamodb_batch = @import("services/dynamodb/batch.zig");
 pub const dynamodb_transactions = @import("services/dynamodb/transactions.zig");
+pub const dynamodb_misc = @import("services/dynamodb/misc.zig");
 pub const dynamodb = @import("services/dynamodb/mod.zig");
 pub const dynamodb_tables = @import("services/dynamodb/tables.zig");
 pub const dynamodb_items = @import("services/dynamodb/items.zig");
@@ -123,6 +124,7 @@ test {
     _ = dynamodb_scan;
     _ = dynamodb_batch;
     _ = dynamodb_transactions;
+    _ = dynamodb_misc;
     _ = dynamodb;
     _ = dynamodb_tables;
     _ = dynamodb_items;
