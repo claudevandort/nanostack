@@ -3845,7 +3845,7 @@ pub fn ddbPutItem(self: *Fs, allocator: Allocator, in: storage.PutItemInput) sto
 
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
 
-    captureWrite(self, slot, if (had_existing) .modify else .insert, in.item, if (result.old_item) |*oi| oi else null, owned_ptr);
+    captureWrite(self, slot, if (had_existing) .modify else .insert, in.item, if (result.old_item) |*oi| oi else null, owned_ptr, .user);
     return result;
 }
 
@@ -3862,11 +3862,12 @@ fn captureWrite(
     key_src: *const storage.Item,
     old_item: ?*const storage.Item,
     new_item: ?*const storage.Item,
+    identity: storage.dynamo_streams.UserIdentity,
 ) void {
     const stream = slot.stream orelse return;
     var keys = storage.dynamo_state.projectKeys(self.allocator, slot, key_src) catch return;
     defer keys.deinit(self.allocator);
-    _ = stream.capture(kind, &keys, new_item, old_item, nowUnixSeconds(self.io)) catch {};
+    _ = stream.capture(kind, &keys, new_item, old_item, nowUnixSeconds(self.io), identity) catch {};
 }
 
 pub fn ddbGetItem(self: *Fs, allocator: Allocator, in: storage.GetItemInput) storage.Error!storage.GetItemResult {
@@ -3912,7 +3913,7 @@ pub fn ddbDeleteItem(self: *Fs, allocator: Allocator, in: storage.DeleteItemInpu
     removed.value.deinit(self.allocator);
     self.allocator.destroy(removed.value);
 
-    captureWrite(self, slot, .remove, in.key, &old, null);
+    captureWrite(self, slot, .remove, in.key, &old, null, .user);
     return .{ .old_item = old };
 }
 
@@ -3973,7 +3974,7 @@ pub fn ddbUpdateItem(self: *Fs, allocator: Allocator, in: storage.UpdateItemInpu
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
 
     const kind: storage.dynamo_streams.RecordKind = if (existing_ptr == null) .insert else .modify;
-    captureWrite(self, slot, kind, in.key, if (result.old_item) |*oi| oi else null, owned_ptr);
+    captureWrite(self, slot, kind, in.key, if (result.old_item) |*oi| oi else null, owned_ptr, .user);
     return result;
 }
 
@@ -4139,7 +4140,7 @@ pub fn ddbTransactWrite(
         const slot = self.dynamo_tables.get(op.table) orelse return storage.Error.Io;
         switch (op.kind) {
             .put => try applyPutLocked(self, slot, op.item_or_key),
-            .delete => try applyDeleteLocked(self, slot, op.item_or_key),
+            .delete => try applyDeleteLocked(self, slot, op.item_or_key, .user),
             .update => try applyUpdateLocked(self, allocator, slot, op.item_or_key, op.apply_fn.?, op.apply_ctx.?),
             .condition_check => {}, // validated, nothing to apply
         }
@@ -4174,10 +4175,15 @@ fn applyPutLocked(self: *Fs, slot: *storage.TableSlot, item: *const storage.Item
 
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
 
-    captureWrite(self, slot, if (had_existing) .modify else .insert, item, if (had_existing) &old_snapshot else null, owned_ptr);
+    captureWrite(self, slot, if (had_existing) .modify else .insert, item, if (had_existing) &old_snapshot else null, owned_ptr, .user);
 }
 
-fn applyDeleteLocked(self: *Fs, slot: *storage.TableSlot, key_item: *const storage.Item) storage.Error!void {
+fn applyDeleteLocked(
+    self: *Fs,
+    slot: *storage.TableSlot,
+    key_item: *const storage.Item,
+    identity: storage.dynamo_streams.UserIdentity,
+) storage.Error!void {
     const key_str = storage.dynamo_state.buildKeyFromAttrs(self.allocator, slot, key_item) catch
         return storage.Error.OutOfMemory;
     defer self.allocator.free(key_str);
@@ -4199,7 +4205,7 @@ fn applyDeleteLocked(self: *Fs, slot: *storage.TableSlot, key_item: *const stora
     removed.value.deinit(self.allocator);
     self.allocator.destroy(removed.value);
 
-    captureWrite(self, slot, .remove, key_item, &old_snapshot, null);
+    captureWrite(self, slot, .remove, key_item, &old_snapshot, null, identity);
 }
 
 fn applyUpdateLocked(
@@ -4245,7 +4251,7 @@ fn applyUpdateLocked(
     }
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
 
-    captureWrite(self, slot, if (had_existing) .modify else .insert, key_item, if (had_existing) &old_snapshot else null, owned_ptr);
+    captureWrite(self, slot, if (had_existing) .modify else .insert, key_item, if (had_existing) &old_snapshot else null, owned_ptr, .user);
 }
 
 // ---------------------------------------------------------------------------
@@ -4480,6 +4486,7 @@ pub fn ddbGetRecords(self: *Fs, allocator: Allocator, in: storage.GetRecordsInpu
             .new_image = if (src.new_image) |ni| try storage.dynamo_state.cloneItem(allocator, &ni) else null,
             .old_image = if (src.old_image) |oi| try storage.dynamo_state.cloneItem(allocator, &oi) else null,
             .created_unix = src.created_unix,
+            .identity = src.identity,
         };
         produced = i + 1;
     }
@@ -4665,7 +4672,7 @@ fn sweepTableLocked(self: *Fs, slot: *storage.TableSlot, attr_name: []const u8, 
     }
 
     for (victims.items) |*key_only| {
-        applyDeleteLocked(self, slot, key_only) catch {};
+        applyDeleteLocked(self, slot, key_only, .ttl_sweeper) catch {};
     }
 }
 

@@ -286,6 +286,21 @@ pub fn renderGetRecords(allocator: Allocator, out: storage.GetRecordsOutput) ![]
         try s.write("aws:dynamodb");
         try s.objectField("awsRegion");
         try s.write("us-east-1");
+        // AWS emits a `userIdentity` object only for evictions driven
+        // by an AWS service (currently just the TTL sweeper). User-
+        // driven REMOVE records have no userIdentity field.
+        switch (r.identity) {
+            .user => {},
+            .ttl_sweeper => {
+                try s.objectField("userIdentity");
+                try s.beginObject();
+                try s.objectField("Type");
+                try s.write("Service");
+                try s.objectField("PrincipalId");
+                try s.write("dynamodb.amazonaws.com");
+                try s.endObject();
+            },
+        }
         try s.objectField("dynamodb");
         try s.beginObject();
         try s.objectField("ApproximateCreationDateTime");

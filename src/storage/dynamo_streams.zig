@@ -41,6 +41,17 @@ pub const RecordKind = enum {
     }
 };
 
+/// Source of a stream record. `.user` is the default — produced by
+/// PutItem / UpdateItem / DeleteItem / BatchWriteItem / TransactWriteItems.
+/// `.ttl_sweeper` marks evictions from the TTL background sweeper, which
+/// AWS renders as `userIdentity: {type: "Service", principalId:
+/// "dynamodb.amazonaws.com"}` in the stream record (and lets consumers
+/// distinguish those from user-driven deletes).
+pub const UserIdentity = enum {
+    user,
+    ttl_sweeper,
+};
+
 pub const StreamRecord = struct {
     seq: u64,
     kind: RecordKind,
@@ -53,6 +64,9 @@ pub const StreamRecord = struct {
     /// and the op had an existing item (MODIFY or REMOVE).
     old_image: ?Item,
     created_unix: i64,
+    /// Default `.user`. The wire renderer only emits the `userIdentity`
+    /// JSON field when this is non-user.
+    identity: UserIdentity = .user,
 
     pub fn deinit(self: *StreamRecord, allocator: Allocator) void {
         self.keys.deinit(allocator);
@@ -110,6 +124,7 @@ pub const Stream = struct {
         new_src: ?*const Item,
         old_src: ?*const Item,
         now_unix: i64,
+        identity: UserIdentity,
     ) !u64 {
         const keys_clone = try dynamo_state.cloneItem(self.allocator, keys_src);
         errdefer {
@@ -162,6 +177,7 @@ pub const Stream = struct {
             .new_image = new_image,
             .old_image = old_image,
             .created_unix = now_unix,
+            .identity = identity,
         });
         return seq;
     }
@@ -218,6 +234,7 @@ pub const Stream = struct {
                 .new_image = if (src.new_image) |ni| try dynamo_state.cloneItem(allocator, &ni) else null,
                 .old_image = if (src.old_image) |oi| try dynamo_state.cloneItem(allocator, &oi) else null,
                 .created_unix = src.created_unix,
+                .identity = src.identity,
             };
             produced = i + 1;
         }
@@ -295,8 +312,8 @@ test "Stream: capture appends in order, assigns monotonic seq" {
     var k2 = try makeItem(testing.allocator, "id", "b");
     defer k2.deinit(testing.allocator);
 
-    const s1 = try stream.capture(.insert, &k1, &k1, null, 1000);
-    const s2 = try stream.capture(.insert, &k2, &k2, null, 1001);
+    const s1 = try stream.capture(.insert, &k1, &k1, null, 1000, .user);
+    const s2 = try stream.capture(.insert, &k2, &k2, null, 1001, .user);
     try testing.expectEqual(@as(u64, 1), s1);
     try testing.expectEqual(@as(u64, 2), s2);
     try testing.expectEqual(@as(usize, 2), stream.records.items.len);
@@ -310,7 +327,7 @@ test "Stream: view_type=KEYS_ONLY drops both images" {
     var img = try makeItem(testing.allocator, "id", "a");
     defer img.deinit(testing.allocator);
 
-    _ = try stream.capture(.modify, &k, &img, &img, 100);
+    _ = try stream.capture(.modify, &k, &img, &img, 100, .user);
     try testing.expect(stream.records.items[0].new_image == null);
     try testing.expect(stream.records.items[0].old_image == null);
 }
@@ -323,7 +340,7 @@ test "Stream: view_type=NEW_IMAGE drops old, keeps new" {
     var img = try makeItem(testing.allocator, "id", "a");
     defer img.deinit(testing.allocator);
 
-    _ = try stream.capture(.modify, &k, &img, &img, 100);
+    _ = try stream.capture(.modify, &k, &img, &img, 100, .user);
     try testing.expect(stream.records.items[0].new_image != null);
     try testing.expect(stream.records.items[0].old_image == null);
 }
@@ -336,7 +353,7 @@ test "Stream: view_type=OLD_IMAGE drops new, keeps old" {
     var img = try makeItem(testing.allocator, "id", "a");
     defer img.deinit(testing.allocator);
 
-    _ = try stream.capture(.modify, &k, &img, &img, 100);
+    _ = try stream.capture(.modify, &k, &img, &img, 100, .user);
     try testing.expect(stream.records.items[0].new_image == null);
     try testing.expect(stream.records.items[0].old_image != null);
 }
@@ -352,11 +369,11 @@ test "Stream: ring bound evicts oldest" {
     // Fill to ring_bound, then add one more.
     var i: usize = 0;
     while (i < ring_bound) : (i += 1) {
-        _ = try stream.capture(.insert, &k, &k, null, @intCast(i));
+        _ = try stream.capture(.insert, &k, &k, null, @intCast(i), .user);
     }
     try testing.expectEqual(@as(usize, ring_bound), stream.records.items.len);
     const first_seq_before = stream.records.items[0].seq;
-    _ = try stream.capture(.insert, &k, &k, null, @intCast(ring_bound));
+    _ = try stream.capture(.insert, &k, &k, null, @intCast(ring_bound), .user);
     try testing.expectEqual(@as(usize, ring_bound), stream.records.items.len);
     // After eviction the oldest seq advances by one.
     try testing.expectEqual(first_seq_before + 1, stream.records.items[0].seq);
@@ -367,9 +384,9 @@ test "Stream: read TRIM_HORIZON returns oldest first" {
     defer stream.deinit();
     var k = try makeItem(testing.allocator, "id", "a");
     defer k.deinit(testing.allocator);
-    _ = try stream.capture(.insert, &k, &k, null, 1);
-    _ = try stream.capture(.modify, &k, &k, &k, 2);
-    _ = try stream.capture(.remove, &k, null, &k, 3);
+    _ = try stream.capture(.insert, &k, &k, null, 1, .user);
+    _ = try stream.capture(.modify, &k, &k, &k, 2, .user);
+    _ = try stream.capture(.remove, &k, null, &k, 3, .user);
 
     var res = try stream.read(testing.allocator, .trim_horizon, 10);
     defer res.deinit(testing.allocator);
@@ -385,9 +402,9 @@ test "Stream: read AT_SEQ starts at that seq" {
     defer stream.deinit();
     var k = try makeItem(testing.allocator, "id", "a");
     defer k.deinit(testing.allocator);
-    _ = try stream.capture(.insert, &k, &k, null, 1);
-    _ = try stream.capture(.insert, &k, &k, null, 2);
-    _ = try stream.capture(.insert, &k, &k, null, 3);
+    _ = try stream.capture(.insert, &k, &k, null, 1, .user);
+    _ = try stream.capture(.insert, &k, &k, null, 2, .user);
+    _ = try stream.capture(.insert, &k, &k, null, 3, .user);
 
     var res = try stream.read(testing.allocator, .{ .at_seq = 2 }, 10);
     defer res.deinit(testing.allocator);
@@ -401,9 +418,9 @@ test "Stream: read AFTER_SEQ skips that seq" {
     defer stream.deinit();
     var k = try makeItem(testing.allocator, "id", "a");
     defer k.deinit(testing.allocator);
-    _ = try stream.capture(.insert, &k, &k, null, 1);
-    _ = try stream.capture(.insert, &k, &k, null, 2);
-    _ = try stream.capture(.insert, &k, &k, null, 3);
+    _ = try stream.capture(.insert, &k, &k, null, 1, .user);
+    _ = try stream.capture(.insert, &k, &k, null, 2, .user);
+    _ = try stream.capture(.insert, &k, &k, null, 3, .user);
 
     var res = try stream.read(testing.allocator, .{ .after_seq = 2 }, 10);
     defer res.deinit(testing.allocator);
@@ -416,9 +433,9 @@ test "Stream: read respects limit" {
     defer stream.deinit();
     var k = try makeItem(testing.allocator, "id", "a");
     defer k.deinit(testing.allocator);
-    _ = try stream.capture(.insert, &k, &k, null, 1);
-    _ = try stream.capture(.insert, &k, &k, null, 2);
-    _ = try stream.capture(.insert, &k, &k, null, 3);
+    _ = try stream.capture(.insert, &k, &k, null, 1, .user);
+    _ = try stream.capture(.insert, &k, &k, null, 2, .user);
+    _ = try stream.capture(.insert, &k, &k, null, 3, .user);
 
     var res = try stream.read(testing.allocator, .trim_horizon, 2);
     defer res.deinit(testing.allocator);
@@ -431,12 +448,12 @@ test "Stream: trim drops records older than threshold" {
     defer stream.deinit();
     var k = try makeItem(testing.allocator, "id", "a");
     defer k.deinit(testing.allocator);
-    _ = try stream.capture(.insert, &k, &k, null, 100);
-    _ = try stream.capture(.insert, &k, &k, null, 200);
-    _ = try stream.capture(.insert, &k, &k, null, 300);
+    _ = try stream.capture(.insert, &k, &k, null, 100, .user);
+    _ = try stream.capture(.insert, &k, &k, null, 200, .user);
+    _ = try stream.capture(.insert, &k, &k, null, 300, .user);
 
     // Now insert at a time that pushes threshold past 200.
-    _ = try stream.capture(.insert, &k, &k, null, 200 + retention_secs + 1);
+    _ = try stream.capture(.insert, &k, &k, null, 200 + retention_secs + 1, .user);
     // Only seq 3 + seq 4 remain (seq 1 & 2 were older than retention).
     try testing.expectEqual(@as(usize, 2), stream.records.items.len);
     try testing.expectEqual(@as(u64, 3), stream.records.items[0].seq);

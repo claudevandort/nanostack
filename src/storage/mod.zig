@@ -1528,6 +1528,9 @@ pub const StreamRecordOut = struct {
     new_image: ?Item,
     old_image: ?Item,
     created_unix: i64,
+    /// Default `.user`. The wire renderer emits the AWS `userIdentity`
+    /// object only when this is non-user (currently just `.ttl_sweeper`).
+    identity: dynamo_streams.UserIdentity = .user,
 };
 
 pub const GetRecordsOutput = struct {

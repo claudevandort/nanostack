@@ -264,6 +264,57 @@ def test_sweeper_ignores_disabled_tables(sweep_nanostack):
     assert ddb.scan(TableName=name)["Count"] == 1
 
 
+def test_sweeper_evicted_record_carries_user_identity(sweep_nanostack):
+    """Phase 3: sweeper-driven REMOVE records in the stream carry
+    userIdentity = {type: Service, principalId: dynamodb.amazonaws.com}.
+    User-driven deletes carry no userIdentity field."""
+    ddb = _make_ddb(sweep_nanostack)
+    streams = boto3.client(
+        "dynamodbstreams",
+        endpoint_url=sweep_nanostack,
+        region_name="us-east-1",
+        aws_access_key_id="test", aws_secret_access_key="test",
+        config=Config(retries={"max_attempts": 1}),
+    )
+    name = _unique_table("strm_ttl")
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )
+    ddb.update_time_to_live(
+        TableName=name,
+        TimeToLiveSpecification={"Enabled": True, "AttributeName": "exp"},
+    )
+    # Put a user-deletable item + an already-expired item.
+    past = int(time.time()) - 60
+    ddb.put_item(TableName=name, Item={"id": {"S": "user_del"}})
+    ddb.put_item(TableName=name, Item={"id": {"S": "ttl_evict"}, "exp": {"N": str(past)}})
+    # User-driven delete on the first.
+    ddb.delete_item(TableName=name, Key={"id": {"S": "user_del"}})
+    # Sweeper runs at 1s; allow >= 1.6s.
+    time.sleep(1.6)
+
+    arn = streams.list_streams(TableName=name)["Streams"][0]["StreamArn"]
+    shard = streams.describe_stream(StreamArn=arn)["StreamDescription"]["Shards"][0]["ShardId"]
+    it = streams.get_shard_iterator(StreamArn=arn, ShardId=shard, ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+    recs = streams.get_records(ShardIterator=it)["Records"]
+
+    by_key = {r["dynamodb"]["Keys"]["id"]["S"]: r for r in recs if r["eventName"] == "REMOVE"}
+    assert "user_del" in by_key
+    assert "ttl_evict" in by_key
+    # User-driven REMOVE has no userIdentity.
+    assert "userIdentity" not in by_key["user_del"]
+    # TTL-driven REMOVE has the service principal. boto3 deserialises
+    # `Type` / `PrincipalId` from the AWS Streams Identity shape.
+    ui = by_key["ttl_evict"]["userIdentity"]
+    assert ui["Type"] == "Service"
+    assert ui["PrincipalId"] == "dynamodb.amazonaws.com"
+    ddb.delete_table(TableName=name)
+
+
 def test_sweeper_evicts_multiple_items_one_tick(sweep_nanostack):
     ddb = _make_ddb(sweep_nanostack)
     name = _ttl_table(ddb)
