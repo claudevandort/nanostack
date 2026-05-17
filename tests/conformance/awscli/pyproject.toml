@@ -14,5 +14,8 @@ testpaths = ["."]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+# Put the conformance dir on sys.path so subdir tests (s3/, dynamodb/) can
+# still `from conftest import run_aws`.
+pythonpath = ["."]
 # Quiet output by default; verbose runs use `-v`.
 addopts = "-ra"
