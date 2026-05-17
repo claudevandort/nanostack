@@ -19,6 +19,7 @@ const scan_handler = @import("scan.zig");
 const batch_handler = @import("batch.zig");
 const tx_handler = @import("transactions.zig");
 const misc_handler = @import("misc.zig");
+const streams_handler = @import("streams.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -130,6 +131,11 @@ fn handleCore(ctx: Context) Result {
 /// silently accept them.
 fn handleStreams(ctx: Context) Result {
     const target = ctx.request.target;
+    if (std.mem.eql(u8, target, "ListStreams")) return streams_handler.listStreams(ctx);
+    if (std.mem.eql(u8, target, "DescribeStream")) return streams_handler.describeStream(ctx);
+    if (std.mem.eql(u8, target, "GetShardIterator")) return streams_handler.getShardIterator(ctx);
+    if (std.mem.eql(u8, target, "GetRecords")) return streams_handler.getRecords(ctx);
+
     if (std.mem.eql(u8, target, "EnableKinesisStreamingDestination") or
         std.mem.eql(u8, target, "DisableKinesisStreamingDestination"))
     {
@@ -172,7 +178,23 @@ const StubBackend = struct {
             .query = stubQuery,
             .transactGetItems = stubTxGet,
             .transactWriteItems = stubTxWrite,
+            .listStreams = stubListStreams,
+            .describeStream = stubDescribeStream,
+            .getShardIterator = stubGetShardIterator,
+            .getRecords = stubGetRecords,
         } };
+    }
+    fn stubListStreams(_: *anyopaque, _: Allocator, _: storage.ListStreamsInput) storage.Error!storage.ListStreamsOutput {
+        unreachable;
+    }
+    fn stubDescribeStream(_: *anyopaque, _: Allocator, _: storage.DescribeStreamInput) storage.Error!storage.DescribeStreamOutput {
+        unreachable;
+    }
+    fn stubGetShardIterator(_: *anyopaque, _: Allocator, _: storage.GetShardIteratorInput) storage.Error![]const u8 {
+        unreachable;
+    }
+    fn stubGetRecords(_: *anyopaque, _: Allocator, _: storage.GetRecordsInput) storage.Error!storage.GetRecordsOutput {
+        unreachable;
     }
     fn stubQuery(_: *anyopaque, _: Allocator, _: storage.QueryInput) storage.Error!storage.QueryResult {
         unreachable;

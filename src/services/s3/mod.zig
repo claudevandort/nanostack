@@ -461,7 +461,15 @@ pub fn mapStorageErr(e: storage.Error) errors.Code {
         storage.Error.InvalidTag => .invalid_tag,
         // DynamoDB error variants — S3 should never see them; if it does,
         // treat as internal_error (defensive).
-        storage.Error.TableAlreadyExists, storage.Error.TableNotFound, storage.Error.ConditionalCheckFailed, storage.Error.TransactionCanceled => .internal_error,
+        storage.Error.TableAlreadyExists,
+        storage.Error.TableNotFound,
+        storage.Error.ConditionalCheckFailed,
+        storage.Error.TransactionCanceled,
+        storage.Error.StreamNotFound,
+        storage.Error.ShardNotFound,
+        storage.Error.InvalidStreamArn,
+        storage.Error.InvalidShardIterator,
+        => .internal_error,
         storage.Error.Io, storage.Error.OutOfMemory => .internal_error,
     };
 }
