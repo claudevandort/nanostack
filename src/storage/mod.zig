@@ -37,6 +37,7 @@ pub const Error = error{
     TableAlreadyExists,
     TableNotFound,
     ConditionalCheckFailed,
+    TransactionCanceled,
     Io,
     OutOfMemory,
 };
@@ -1371,6 +1372,51 @@ pub const QueryResult = struct {
     last_evaluated_key: ?[]const u8 = null,
 };
 
+// ---------------------------------------------------------------------------
+// Transactions (M15-tx)
+
+pub const TxGetItem = struct {
+    table: []const u8,
+    key: *const Item,
+};
+
+/// Result of TransactGetItems. Items are in the same order as the input
+/// list. A missing item is represented as a null entry.
+pub const TxGetResult = struct {
+    items: []?Item,
+};
+
+pub const TxWriteKind = enum { put, delete, update, condition_check };
+
+pub const TxWriteOp = struct {
+    kind: TxWriteKind,
+    table: []const u8,
+    /// Put: full item. Delete/Update/ConditionCheck: just the key attrs.
+    item_or_key: *const Item,
+    /// Optional ConditionExpression predicate (called with the existing
+    /// item if any).
+    condition: ?ConditionPredicate = null,
+    /// Update-only: mutates a writable item in place. Returns false on
+    /// applier-internal failure (treated as cancellation).
+    apply_fn: ?*const fn (ctx: *anyopaque, item: *Item) bool = null,
+    apply_ctx: ?*anyopaque = null,
+};
+
+/// Returns when the transaction succeeds. On cancellation, the backend
+/// returns Error.TransactionCanceled and sets `cancellation_reasons`
+/// on the input slice via the caller-supplied buffer.
+pub const TxWriteResult = struct {
+    /// Per-op cancellation reason strings. Parallel to the input ops.
+    /// On success this is empty; on cancellation, all ops have a reason
+    /// ("None" for ops that didn't fail).
+    cancellation_reasons: []?[]const u8 = &.{},
+};
+
+pub const TxCancellationReason = struct {
+    code: []const u8,
+    message: ?[]const u8 = null,
+};
+
 
 pub const DynamoBackend = struct {
     ctx: *anyopaque,
@@ -1388,6 +1434,8 @@ pub const DynamoBackend = struct {
         deleteItem: *const fn (ctx: *anyopaque, allocator: Allocator, in: DeleteItemInput) Error!DeleteItemResult,
         updateItem: *const fn (ctx: *anyopaque, allocator: Allocator, in: UpdateItemInput) Error!UpdateItemResult,
         query: *const fn (ctx: *anyopaque, allocator: Allocator, in: QueryInput) Error!QueryResult,
+        transactGetItems: *const fn (ctx: *anyopaque, allocator: Allocator, ops: []const TxGetItem) Error!TxGetResult,
+        transactWriteItems: *const fn (ctx: *anyopaque, allocator: Allocator, ops: []const TxWriteOp, reasons_out: *[]?[]const u8) Error!void,
     };
 
     pub fn listTables(self: DynamoBackend, allocator: Allocator) Error![]const []const u8 {
@@ -1419,6 +1467,17 @@ pub const DynamoBackend = struct {
     }
     pub fn query(self: DynamoBackend, allocator: Allocator, in: QueryInput) Error!QueryResult {
         return self.vtable.query(self.ctx, allocator, in);
+    }
+    pub fn transactGetItems(self: DynamoBackend, allocator: Allocator, ops: []const TxGetItem) Error!TxGetResult {
+        return self.vtable.transactGetItems(self.ctx, allocator, ops);
+    }
+    pub fn transactWriteItems(
+        self: DynamoBackend,
+        allocator: Allocator,
+        ops: []const TxWriteOp,
+        reasons_out: *[]?[]const u8,
+    ) Error!void {
+        return self.vtable.transactWriteItems(self.ctx, allocator, ops, reasons_out);
     }
 };
 

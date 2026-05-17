@@ -89,6 +89,8 @@ DynamoDB is the second AWS service nanostack covers, opt-in via `--services s3,d
 | BatchGetItem | supported (up to 100 keys; cross-table; `UnprocessedKeys` always empty — succeed-or-fail) | M15-batch |
 | BatchWriteItem | supported (up to 25 Put/Delete ops; cross-table; `UnprocessedItems` always empty) | M15-batch |
 | Query on GSI / LSI (via `IndexName`) | supported (ALL / KEYS_ONLY / INCLUDE projection types; ScanIndexForward; FilterExpression after projection; ExclusiveStartKey/LastEvaluatedKey cursor) | M15-gsi |
+| TransactGetItems | supported (up to 100 ops; atomic snapshot under the Fs mutex) | M15-tx |
+| TransactWriteItems | supported (Put / Update / Delete / ConditionCheck; up to 100 ops; all-or-nothing atomicity; per-op CancellationReasons on failure) | M15-tx |
 | GetItem / PutItem / DeleteItem | planned | M15-items |
 | UpdateItem (with UpdateExpression) | planned | M15-expressions |
 | Query (incl. GSI/LSI) | planned | M15-query / M15-gsi |
