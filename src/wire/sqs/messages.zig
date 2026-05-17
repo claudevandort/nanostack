@@ -216,6 +216,245 @@ pub fn parseChangeMessageVisibility(allocator: Allocator, body: []const u8) Pars
 }
 
 // ---------------------------------------------------------------------------
+// Batch ops: SendMessageBatch / DeleteMessageBatch / ChangeMessageVisibilityBatch
+
+pub const SendBatchEntry = struct {
+    id: []const u8,
+    body: []const u8,
+    delay_seconds: ?u32 = null,
+    raw_attributes_json: ?[]const u8 = null,
+};
+
+pub const SendBatchRequest = struct {
+    queue_name: []const u8,
+    entries: []SendBatchEntry,
+};
+
+pub fn parseSendMessageBatch(allocator: Allocator, body: []const u8) ParseError!SendBatchRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const root = parsed.value.object;
+    const url_v = root.get("QueueUrl") orelse return ParseError.Malformed;
+    if (url_v != .string) return ParseError.Malformed;
+    const entries_v = root.get("Entries") orelse return ParseError.Malformed;
+    if (entries_v != .array) return ParseError.Malformed;
+    const items = entries_v.array.items;
+    if (items.len == 0 or items.len > 10) return ParseError.InvalidAttribute;
+
+    const out = try allocator.alloc(SendBatchEntry, items.len);
+    for (items, 0..) |entry, i| {
+        if (entry != .object) return ParseError.Malformed;
+        const id_v = entry.object.get("Id") orelse return ParseError.Malformed;
+        const body_v = entry.object.get("MessageBody") orelse return ParseError.Malformed;
+        if (id_v != .string or body_v != .string) return ParseError.Malformed;
+        var delay: ?u32 = null;
+        if (entry.object.get("DelaySeconds")) |v| switch (v) {
+            .integer => |n| {
+                if (n < 0 or n > 900) return ParseError.InvalidAttribute;
+                delay = @intCast(n);
+            },
+            .string => |s| {
+                const n = std.fmt.parseInt(i64, s, 10) catch return ParseError.InvalidAttribute;
+                if (n < 0 or n > 900) return ParseError.InvalidAttribute;
+                delay = @intCast(n);
+            },
+            else => return ParseError.Malformed,
+        };
+        var attrs_json: ?[]const u8 = null;
+        if (entry.object.get("MessageAttributes")) |v| {
+            if (v != .object) return ParseError.Malformed;
+            var aw: std.Io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            std.json.Stringify.value(v, .{}, &aw.writer) catch return ParseError.OutOfMemory;
+            attrs_json = aw.toOwnedSlice() catch return ParseError.OutOfMemory;
+        }
+        out[i] = .{
+            .id = try allocator.dupe(u8, id_v.string),
+            .body = try allocator.dupe(u8, body_v.string),
+            .delay_seconds = delay,
+            .raw_attributes_json = attrs_json,
+        };
+    }
+    return .{
+        .queue_name = try allocator.dupe(u8, queues_wire.queueNameFromUrl(url_v.string)),
+        .entries = out,
+    };
+}
+
+pub const DeleteBatchEntry = struct {
+    id: []const u8,
+    receipt_handle: []const u8,
+};
+
+pub const DeleteBatchRequest = struct {
+    queue_name: []const u8,
+    entries: []DeleteBatchEntry,
+};
+
+pub fn parseDeleteMessageBatch(allocator: Allocator, body: []const u8) ParseError!DeleteBatchRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const root = parsed.value.object;
+    const url_v = root.get("QueueUrl") orelse return ParseError.Malformed;
+    if (url_v != .string) return ParseError.Malformed;
+    const entries_v = root.get("Entries") orelse return ParseError.Malformed;
+    if (entries_v != .array) return ParseError.Malformed;
+    const items = entries_v.array.items;
+    if (items.len == 0 or items.len > 10) return ParseError.InvalidAttribute;
+
+    const out = try allocator.alloc(DeleteBatchEntry, items.len);
+    for (items, 0..) |entry, i| {
+        if (entry != .object) return ParseError.Malformed;
+        const id_v = entry.object.get("Id") orelse return ParseError.Malformed;
+        const handle_v = entry.object.get("ReceiptHandle") orelse return ParseError.Malformed;
+        if (id_v != .string or handle_v != .string) return ParseError.Malformed;
+        out[i] = .{
+            .id = try allocator.dupe(u8, id_v.string),
+            .receipt_handle = try allocator.dupe(u8, handle_v.string),
+        };
+    }
+    return .{
+        .queue_name = try allocator.dupe(u8, queues_wire.queueNameFromUrl(url_v.string)),
+        .entries = out,
+    };
+}
+
+pub const VisBatchEntry = struct {
+    id: []const u8,
+    receipt_handle: []const u8,
+    visibility_timeout: u32,
+};
+
+pub const VisBatchRequest = struct {
+    queue_name: []const u8,
+    entries: []VisBatchEntry,
+};
+
+pub fn parseChangeMessageVisibilityBatch(allocator: Allocator, body: []const u8) ParseError!VisBatchRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const root = parsed.value.object;
+    const url_v = root.get("QueueUrl") orelse return ParseError.Malformed;
+    if (url_v != .string) return ParseError.Malformed;
+    const entries_v = root.get("Entries") orelse return ParseError.Malformed;
+    if (entries_v != .array) return ParseError.Malformed;
+    const items = entries_v.array.items;
+    if (items.len == 0 or items.len > 10) return ParseError.InvalidAttribute;
+
+    const out = try allocator.alloc(VisBatchEntry, items.len);
+    for (items, 0..) |entry, i| {
+        if (entry != .object) return ParseError.Malformed;
+        const id_v = entry.object.get("Id") orelse return ParseError.Malformed;
+        const handle_v = entry.object.get("ReceiptHandle") orelse return ParseError.Malformed;
+        const vt_v = entry.object.get("VisibilityTimeout") orelse return ParseError.Malformed;
+        if (id_v != .string or handle_v != .string) return ParseError.Malformed;
+        const vt: i64 = switch (vt_v) {
+            .integer => |n| n,
+            .string => |s| std.fmt.parseInt(i64, s, 10) catch return ParseError.InvalidAttribute,
+            else => return ParseError.Malformed,
+        };
+        if (vt < 0 or vt > 43200) return ParseError.InvalidAttribute;
+        out[i] = .{
+            .id = try allocator.dupe(u8, id_v.string),
+            .receipt_handle = try allocator.dupe(u8, handle_v.string),
+            .visibility_timeout = @intCast(vt),
+        };
+    }
+    return .{
+        .queue_name = try allocator.dupe(u8, queues_wire.queueNameFromUrl(url_v.string)),
+        .entries = out,
+    };
+}
+
+pub const SendBatchResultEntry = struct {
+    id: []const u8,
+    message_id: []const u8,
+    md5_of_body: []const u8,
+};
+
+pub const BatchFailedEntry = struct {
+    id: []const u8,
+    code: []const u8,
+    message: []const u8,
+    sender_fault: bool,
+};
+
+pub fn renderSendMessageBatch(
+    allocator: Allocator,
+    successful: []const SendBatchResultEntry,
+    failed: []const BatchFailedEntry,
+) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    try s.objectField("Successful");
+    try s.beginArray();
+    for (successful) |e| {
+        try s.beginObject();
+        try s.objectField("Id");
+        try s.write(e.id);
+        try s.objectField("MessageId");
+        try s.write(e.message_id);
+        try s.objectField("MD5OfMessageBody");
+        try s.write(e.md5_of_body);
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.objectField("Failed");
+    try writeFailed(&s, failed);
+    try s.endObject();
+    return aw.toOwnedSlice();
+}
+
+pub fn renderIdOnlyBatch(
+    allocator: Allocator,
+    successful_ids: []const []const u8,
+    failed: []const BatchFailedEntry,
+) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    try s.objectField("Successful");
+    try s.beginArray();
+    for (successful_ids) |id| {
+        try s.beginObject();
+        try s.objectField("Id");
+        try s.write(id);
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.objectField("Failed");
+    try writeFailed(&s, failed);
+    try s.endObject();
+    return aw.toOwnedSlice();
+}
+
+fn writeFailed(s: *std.json.Stringify, failed: []const BatchFailedEntry) !void {
+    try s.beginArray();
+    for (failed) |f| {
+        try s.beginObject();
+        try s.objectField("Id");
+        try s.write(f.id);
+        try s.objectField("Code");
+        try s.write(f.code);
+        try s.objectField("Message");
+        try s.write(f.message);
+        try s.objectField("SenderFault");
+        try s.write(f.sender_fault);
+        try s.endObject();
+    }
+    try s.endArray();
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 
 const testing = std.testing;

@@ -70,6 +70,11 @@ pub fn handle(ctx: Context) Result {
     if (std.mem.eql(u8, target, "DeleteMessage")) return messages_handler.deleteMessage(ctx);
     if (std.mem.eql(u8, target, "ChangeMessageVisibility")) return messages_handler.changeMessageVisibility(ctx);
 
+    // Batches (Phase 3).
+    if (std.mem.eql(u8, target, "SendMessageBatch")) return messages_handler.sendMessageBatch(ctx);
+    if (std.mem.eql(u8, target, "DeleteMessageBatch")) return messages_handler.deleteMessageBatch(ctx);
+    if (std.mem.eql(u8, target, "ChangeMessageVisibilityBatch")) return messages_handler.changeMessageVisibilityBatch(ctx);
+
     // Anything else: 400 with operation name in the message. Phase 2+
     // adds messages / batches / long polling.
     var msg_buf: [256]u8 = undefined;
