@@ -1849,8 +1849,16 @@ pub const SendMessageInput = struct {
     body: []const u8,
     /// Optional per-message delay (0..=900). null = use queue's default.
     delay_seconds: ?u32 = null,
+    /// True when the client provided DelaySeconds (even =0). FIFO queues
+    /// reject any explicit per-message DelaySeconds.
+    delay_seconds_specified: bool = false,
     /// MessageAttributes JSON, raw — verbatim round-trip in v0.3.0.
     raw_attributes_json: ?[]const u8 = null,
+    /// FIFO-only: required on FIFO sends, rejected on Standard sends.
+    message_group_id: ?[]const u8 = null,
+    /// FIFO-only: explicit dedup id. May be null if the queue has
+    /// ContentBasedDeduplication=true.
+    message_deduplication_id: ?[]const u8 = null,
 };
 
 pub const SendMessageOutput = struct {
@@ -1858,6 +1866,8 @@ pub const SendMessageOutput = struct {
     message_id: []const u8,
     /// Hex-encoded MD5 of the body. Owned by caller's allocator.
     md5_of_body: []const u8,
+    /// FIFO-only: monotonic per-queue u128. null on Standard sends.
+    sequence_number: ?u128 = null,
 };
 
 pub const ReceiveMessageInput = struct {

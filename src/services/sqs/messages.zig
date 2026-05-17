@@ -20,7 +20,10 @@ pub fn sendMessage(ctx: Context) Result {
         .queue_name = req.queue_name,
         .body = req.body,
         .delay_seconds = req.delay_seconds,
+        .delay_seconds_specified = req.delay_seconds_specified,
         .raw_attributes_json = req.raw_attributes_json,
+        .message_group_id = req.message_group_id,
+        .message_deduplication_id = req.message_deduplication_id,
     }) catch |err| return .{ .err = mapStorageErr(err) };
 
     const body = wire.renderSendMessage(ctx.allocator, out) catch
@@ -121,7 +124,10 @@ pub fn sendMessageBatch(ctx: Context) Result {
             .queue_name = req.queue_name,
             .body = entry.body,
             .delay_seconds = entry.delay_seconds,
+            .delay_seconds_specified = entry.delay_seconds_specified,
             .raw_attributes_json = entry.raw_attributes_json,
+            .message_group_id = entry.message_group_id,
+            .message_deduplication_id = entry.message_deduplication_id,
         }) catch |err| {
             const eb = mapStorageErr(err);
             failed.append(ctx.allocator, .{
@@ -136,6 +142,7 @@ pub fn sendMessageBatch(ctx: Context) Result {
             .id = entry.id,
             .message_id = out.message_id,
             .md5_of_body = out.md5_of_body,
+            .sequence_number = out.sequence_number,
         }) catch return .{ .err = .{ .code = .internal_server_error } };
     }
 

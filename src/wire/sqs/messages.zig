@@ -17,6 +17,12 @@ pub const SendMessageRequest = struct {
     body: []const u8,
     delay_seconds: ?u32 = null,
     raw_attributes_json: ?[]const u8 = null,
+    message_group_id: ?[]const u8 = null,
+    message_deduplication_id: ?[]const u8 = null,
+    /// True when the client provided a DelaySeconds field. Used by the
+    /// handler to distinguish "missing" (allowed on FIFO) from "set to 0"
+    /// (also allowed) from "set to >0" (rejected on FIFO).
+    delay_seconds_specified: bool = false,
 };
 
 pub fn parseSendMessage(allocator: Allocator, body: []const u8) ParseError!SendMessageRequest {
@@ -31,15 +37,18 @@ pub fn parseSendMessage(allocator: Allocator, body: []const u8) ParseError!SendM
     if (url_v != .string or body_v != .string) return ParseError.Malformed;
 
     var delay: ?u32 = null;
+    var delay_specified = false;
     if (root.get("DelaySeconds")) |v| switch (v) {
         .integer => |n| {
             if (n < 0 or n > 900) return ParseError.InvalidAttribute;
             delay = @intCast(n);
+            delay_specified = true;
         },
         .string => |s| {
             const n = std.fmt.parseInt(i64, s, 10) catch return ParseError.InvalidAttribute;
             if (n < 0 or n > 900) return ParseError.InvalidAttribute;
             delay = @intCast(n);
+            delay_specified = true;
         },
         else => return ParseError.Malformed,
     };
@@ -55,11 +64,25 @@ pub fn parseSendMessage(allocator: Allocator, body: []const u8) ParseError!SendM
         attrs_json = aw.toOwnedSlice() catch return ParseError.OutOfMemory;
     }
 
+    var group_id: ?[]const u8 = null;
+    if (root.get("MessageGroupId")) |v| {
+        if (v != .string) return ParseError.Malformed;
+        group_id = try allocator.dupe(u8, v.string);
+    }
+    var dedup_id: ?[]const u8 = null;
+    if (root.get("MessageDeduplicationId")) |v| {
+        if (v != .string) return ParseError.Malformed;
+        dedup_id = try allocator.dupe(u8, v.string);
+    }
+
     return .{
         .queue_name = try allocator.dupe(u8, queues_wire.queueNameFromUrl(url_v.string)),
         .body = try allocator.dupe(u8, body_v.string),
         .delay_seconds = delay,
+        .delay_seconds_specified = delay_specified,
         .raw_attributes_json = attrs_json,
+        .message_group_id = group_id,
+        .message_deduplication_id = dedup_id,
     };
 }
 
@@ -72,6 +95,12 @@ pub fn renderSendMessage(allocator: Allocator, out: storage.SendMessageOutput) !
     try s.write(out.message_id);
     try s.objectField("MD5OfMessageBody");
     try s.write(out.md5_of_body);
+    if (out.sequence_number) |seq| {
+        try s.objectField("SequenceNumber");
+        var buf: [40]u8 = undefined;
+        const txt = try std.fmt.bufPrint(&buf, "{d:0>20}", .{seq});
+        try s.write(txt);
+    }
     try s.endObject();
     return aw.toOwnedSlice();
 }
@@ -222,7 +251,10 @@ pub const SendBatchEntry = struct {
     id: []const u8,
     body: []const u8,
     delay_seconds: ?u32 = null,
+    delay_seconds_specified: bool = false,
     raw_attributes_json: ?[]const u8 = null,
+    message_group_id: ?[]const u8 = null,
+    message_deduplication_id: ?[]const u8 = null,
 };
 
 pub const SendBatchRequest = struct {
@@ -250,15 +282,18 @@ pub fn parseSendMessageBatch(allocator: Allocator, body: []const u8) ParseError!
         const body_v = entry.object.get("MessageBody") orelse return ParseError.Malformed;
         if (id_v != .string or body_v != .string) return ParseError.Malformed;
         var delay: ?u32 = null;
+        var delay_specified = false;
         if (entry.object.get("DelaySeconds")) |v| switch (v) {
             .integer => |n| {
                 if (n < 0 or n > 900) return ParseError.InvalidAttribute;
                 delay = @intCast(n);
+                delay_specified = true;
             },
             .string => |s| {
                 const n = std.fmt.parseInt(i64, s, 10) catch return ParseError.InvalidAttribute;
                 if (n < 0 or n > 900) return ParseError.InvalidAttribute;
                 delay = @intCast(n);
+                delay_specified = true;
             },
             else => return ParseError.Malformed,
         };
@@ -270,11 +305,24 @@ pub fn parseSendMessageBatch(allocator: Allocator, body: []const u8) ParseError!
             std.json.Stringify.value(v, .{}, &aw.writer) catch return ParseError.OutOfMemory;
             attrs_json = aw.toOwnedSlice() catch return ParseError.OutOfMemory;
         }
+        var group_id: ?[]const u8 = null;
+        if (entry.object.get("MessageGroupId")) |v| {
+            if (v != .string) return ParseError.Malformed;
+            group_id = try allocator.dupe(u8, v.string);
+        }
+        var dedup_id: ?[]const u8 = null;
+        if (entry.object.get("MessageDeduplicationId")) |v| {
+            if (v != .string) return ParseError.Malformed;
+            dedup_id = try allocator.dupe(u8, v.string);
+        }
         out[i] = .{
             .id = try allocator.dupe(u8, id_v.string),
             .body = try allocator.dupe(u8, body_v.string),
             .delay_seconds = delay,
+            .delay_seconds_specified = delay_specified,
             .raw_attributes_json = attrs_json,
+            .message_group_id = group_id,
+            .message_deduplication_id = dedup_id,
         };
     }
     return .{
@@ -376,6 +424,7 @@ pub const SendBatchResultEntry = struct {
     id: []const u8,
     message_id: []const u8,
     md5_of_body: []const u8,
+    sequence_number: ?u128 = null,
 };
 
 pub const BatchFailedEntry = struct {
@@ -404,6 +453,12 @@ pub fn renderSendMessageBatch(
         try s.write(e.message_id);
         try s.objectField("MD5OfMessageBody");
         try s.write(e.md5_of_body);
+        if (e.sequence_number) |seq| {
+            try s.objectField("SequenceNumber");
+            var buf: [40]u8 = undefined;
+            const txt = try std.fmt.bufPrint(&buf, "{d:0>20}", .{seq});
+            try s.write(txt);
+        }
         try s.endObject();
     }
     try s.endArray();

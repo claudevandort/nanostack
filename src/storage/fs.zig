@@ -5834,6 +5834,19 @@ pub fn sqsSendMessage(self: *Fs, allocator: Allocator, in: storage.SendMessageIn
     const slot = self.sqs_queues.get(in.queue_name) orelse return storage.Error.QueueNotFound;
     if (in.body.len > slot.attrs.maximum_message_size) return storage.Error.InvalidMessageBody;
 
+    // FIFO vs Standard parameter validation.
+    if (slot.attrs.is_fifo) {
+        if (in.message_group_id == null) return storage.Error.MissingParameter;
+        // Per-message DelaySeconds is rejected on FIFO (any explicit value).
+        if (in.delay_seconds_specified) return storage.Error.InvalidParameterValue;
+        // FIFO requires either ContentBasedDeduplication or an explicit dedup id.
+        if (in.message_deduplication_id == null and !slot.attrs.content_based_dedup)
+            return storage.Error.InvalidParameterValue;
+    } else {
+        if (in.message_group_id != null) return storage.Error.InvalidParameterValue;
+        if (in.message_deduplication_id != null) return storage.Error.InvalidParameterValue;
+    }
+
     const now = nowUnixSeconds(self.io);
     const delay: u32 = in.delay_seconds orelse slot.attrs.delay_seconds;
 
@@ -5846,6 +5859,22 @@ pub fn sqsSendMessage(self: *Fs, allocator: Allocator, in: storage.SendMessageIn
     else
         null;
     errdefer if (attrs_owned) |s| self.allocator.free(s);
+    const group_owned: ?[]const u8 = if (in.message_group_id) |s|
+        (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory)
+    else
+        null;
+    errdefer if (group_owned) |s| self.allocator.free(s);
+    const dedup_owned: ?[]const u8 = if (in.message_deduplication_id) |s|
+        (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory)
+    else
+        null;
+    errdefer if (dedup_owned) |s| self.allocator.free(s);
+
+    var seq_number: u128 = 0;
+    if (slot.attrs.is_fifo) {
+        slot.attrs.sequence_counter += 1;
+        seq_number = slot.attrs.sequence_counter;
+    }
 
     const md5 = md5Hex(in.body);
     const msg_ptr = self.allocator.create(storage.Message) catch return storage.Error.OutOfMemory;
@@ -5858,13 +5887,21 @@ pub fn sqsSendMessage(self: *Fs, allocator: Allocator, in: storage.SendMessageIn
         .receive_count = 0,
         .md5_of_body = md5,
         .raw_attributes_json = attrs_owned,
+        .message_group_id = group_owned,
+        .message_deduplication_id = dedup_owned,
+        .sequence_number = seq_number,
     };
     writeMessageJson(self, slot.name, msg_ptr) catch return storage.Error.Io;
     slot.messages.append(self.allocator, msg_ptr) catch return storage.Error.OutOfMemory;
+    if (slot.attrs.is_fifo) {
+        // Persist the bumped sequence_counter so it survives restart.
+        writeQueueAttrs(self, slot) catch return storage.Error.Io;
+    }
 
     return .{
         .message_id = allocator.dupe(u8, id_owned) catch return storage.Error.OutOfMemory,
         .md5_of_body = allocator.dupe(u8, &md5) catch return storage.Error.OutOfMemory,
+        .sequence_number = if (slot.attrs.is_fifo) seq_number else null,
     };
 }
 

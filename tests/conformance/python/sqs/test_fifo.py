@@ -160,6 +160,165 @@ def test_fifo_attribute_survives_restart():
         proc.wait(timeout=5)
 
 
+# ---------- Phase B — SendMessage FIFO validation + SequenceNumber ----------
+
+
+@pytest.fixture
+def fifo_queue(sqs):
+    name = _fifo_name()
+    out = sqs.create_queue(
+        QueueName=name,
+        Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "true"},
+    )
+    yield name, out["QueueUrl"]
+    sqs.delete_queue(QueueUrl=out["QueueUrl"])
+
+
+@pytest.fixture
+def std_queue(sqs):
+    name = _std_name()
+    out = sqs.create_queue(QueueName=name)
+    yield name, out["QueueUrl"]
+    sqs.delete_queue(QueueUrl=out["QueueUrl"])
+
+
+def test_fifo_send_without_group_id_rejected(sqs, fifo_queue):
+    _, url = fifo_queue
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        sqs.send_message(QueueUrl=url, MessageBody="hi")
+    assert exc.value.response["Error"]["Code"] == "MissingParameter"
+
+
+def test_fifo_send_with_per_message_delay_rejected(sqs, fifo_queue):
+    _, url = fifo_queue
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        sqs.send_message(
+            QueueUrl=url,
+            MessageBody="hi",
+            MessageGroupId="g1",
+            DelaySeconds=5,
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+
+def test_standard_send_with_group_id_rejected(sqs, std_queue):
+    _, url = std_queue
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        sqs.send_message(QueueUrl=url, MessageBody="hi", MessageGroupId="g1")
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+
+def test_fifo_send_returns_sequence_number(sqs, fifo_queue):
+    _, url = fifo_queue
+    out = sqs.send_message(QueueUrl=url, MessageBody="hi", MessageGroupId="g1")
+    assert "MessageId" in out
+    assert "SequenceNumber" in out
+    # AWS docs say "up to 39 digits" but always a long decimal; ours is
+    # zero-padded width-20 for u128. Verify it parses as an integer.
+    int(out["SequenceNumber"])
+
+
+def test_fifo_sequence_numbers_monotonic(sqs, fifo_queue):
+    _, url = fifo_queue
+    sn1 = int(
+        sqs.send_message(QueueUrl=url, MessageBody="a", MessageGroupId="g1")[
+            "SequenceNumber"
+        ]
+    )
+    sn2 = int(
+        sqs.send_message(QueueUrl=url, MessageBody="b", MessageGroupId="g1")[
+            "SequenceNumber"
+        ]
+    )
+    sn3 = int(
+        sqs.send_message(QueueUrl=url, MessageBody="c", MessageGroupId="g2")[
+            "SequenceNumber"
+        ]
+    )
+    assert sn1 < sn2 < sn3
+
+
+def test_fifo_send_without_dedup_id_or_content_dedup_rejected():
+    """A FIFO queue without ContentBasedDeduplication=true requires explicit
+    MessageDeduplicationId on every send."""
+    sqs = _make_sqs()
+    name = _fifo_name()
+    out = sqs.create_queue(QueueName=name, Attributes={"FifoQueue": "true"})
+    try:
+        with pytest.raises(botocore.exceptions.ClientError) as exc:
+            sqs.send_message(QueueUrl=out["QueueUrl"], MessageBody="hi", MessageGroupId="g1")
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    finally:
+        sqs.delete_queue(QueueUrl=out["QueueUrl"])
+
+
+def test_fifo_send_batch_per_entry_sequence_numbers(sqs, fifo_queue):
+    _, url = fifo_queue
+    out = sqs.send_message_batch(
+        QueueUrl=url,
+        Entries=[
+            {"Id": "a", "MessageBody": "a", "MessageGroupId": "g1"},
+            {"Id": "b", "MessageBody": "b", "MessageGroupId": "g1"},
+            {"Id": "c", "MessageBody": "c", "MessageGroupId": "g2"},
+        ],
+    )
+    assert "Failed" not in out or len(out["Failed"]) == 0
+    seqs = sorted(int(e["SequenceNumber"]) for e in out["Successful"])
+    assert seqs[0] < seqs[1] < seqs[2]
+
+
+def test_fifo_sequence_counter_survives_restart():
+    """Sequence counter is persisted on disk so re-sends after restart
+    can't collide with pre-restart sequence numbers."""
+    bin_path = os.environ.get("NANOSTACK_BIN")
+    if not bin_path:
+        pytest.skip("NANOSTACK_BIN not set")
+
+    data_dir = tempfile.mkdtemp(prefix="ns-fifo-seq-")
+    port = _pick_port()
+    ep = f"http://127.0.0.1:{port}"
+
+    def spawn():
+        return subprocess.Popen(
+            [bin_path, "--port", str(port), "--data-dir", data_dir, "--services", "sqs"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    name = _fifo_name()
+    proc = spawn()
+    try:
+        _wait_ready(port)
+        sqs = _make_sqs(ep)
+        url = sqs.create_queue(
+            QueueName=name,
+            Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "true"},
+        )["QueueUrl"]
+        sn1 = int(
+            sqs.send_message(QueueUrl=url, MessageBody="a", MessageGroupId="g1")[
+                "SequenceNumber"
+            ]
+        )
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+    proc = spawn()
+    try:
+        _wait_ready(port)
+        sqs = _make_sqs(ep)
+        url = sqs.get_queue_url(QueueName=name)["QueueUrl"]
+        sn2 = int(
+            sqs.send_message(QueueUrl=url, MessageBody="b", MessageGroupId="g1")[
+                "SequenceNumber"
+            ]
+        )
+        assert sn2 > sn1
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
 def _pick_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
