@@ -331,3 +331,186 @@ def test_update_expression_reserved_word_rejected(ddb, table):
             ExpressionAttributeValues={":v": {"S": "Alice"}},
         )
     assert ei.value.response["Error"]["Code"] == "ValidationException"
+
+
+# ---------------------------------------------------------------------------
+# Backfill (v0.2.1): expression shapes implemented in v0.2.0 but untested.
+
+def test_condition_ne(ddb, table):
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "v": {"S": "x"}})
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="SET flag = :on",
+        ConditionExpression="v <> :different",
+        ExpressionAttributeValues={":on": {"S": "y"}, ":different": {"S": "other"}},
+    )
+    got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})
+    assert got["Item"]["flag"] == {"S": "y"}
+
+
+def test_condition_le_and_ge(ddb, table):
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "n": {"N": "5"}})
+    # <= passes
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="SET tag = :t",
+        ConditionExpression="n <= :hi",
+        ExpressionAttributeValues={":t": {"S": "le"}, ":hi": {"N": "5"}},
+    )
+    # >= passes
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="SET tag = :t",
+        ConditionExpression="n >= :lo",
+        ExpressionAttributeValues={":t": {"S": "ge"}, ":lo": {"N": "5"}},
+    )
+    got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})
+    assert got["Item"]["tag"] == {"S": "ge"}
+
+
+def test_condition_or_chain(ddb, table):
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "a": {"S": "x"}, "b": {"S": "y"}})
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="SET ok = :v",
+        ConditionExpression="a = :wrong OR b = :right",
+        ExpressionAttributeValues={":v": {"S": "yes"}, ":wrong": {"S": "z"}, ":right": {"S": "y"}},
+    )
+    got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})
+    assert got["Item"]["ok"] == {"S": "yes"}
+
+
+def test_condition_not_inverts(ddb, table):
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "v": {"S": "x"}})
+    # NOT v = :other → true → passes
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="SET ok = :v",
+        ConditionExpression="NOT v = :other",
+        ExpressionAttributeValues={":v": {"S": "yes"}, ":other": {"S": "z"}},
+    )
+    got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})
+    assert got["Item"]["ok"] == {"S": "yes"}
+
+
+def test_condition_parens_precedence(ddb, table):
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "a": {"S": "x"}, "b": {"S": "y"}})
+    # (a = :wrong OR b = :right) AND a = :wrong → false (because (T) AND F = F)
+    # Without parens AND binds tighter: a = :wrong OR (b = :right AND a = :wrong) → T OR F = T
+    with pytest.raises(botocore.exceptions.ClientError):
+        ddb.update_item(
+            TableName=table, Key={"id": {"S": "k"}},
+            UpdateExpression="SET ok = :v",
+            ConditionExpression="(a = :wrong OR b = :right) AND a = :wrong",
+            ExpressionAttributeValues={":v": {"S": "x"}, ":wrong": {"S": "z"}, ":right": {"S": "y"}},
+        )
+
+
+def test_condition_in_operator(ddb, table):
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "tier": {"S": "gold"}})
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="SET ok = :v",
+        ConditionExpression="tier IN (:a, :b, :c)",
+        ExpressionAttributeValues={":v": {"S": "y"}, ":a": {"S": "bronze"}, ":b": {"S": "silver"}, ":c": {"S": "gold"}},
+    )
+    got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})
+    assert got["Item"]["ok"] == {"S": "y"}
+
+
+def test_condition_attribute_type(ddb, table):
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "n": {"N": "5"}})
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="SET ok = :v",
+        ConditionExpression="attribute_type(n, :t)",
+        ExpressionAttributeValues={":v": {"S": "y"}, ":t": {"S": "N"}},
+    )
+    got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})
+    assert got["Item"]["ok"] == {"S": "y"}
+
+
+def test_condition_contains_string(ddb, table):
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "title": {"S": "hello world"}})
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="SET ok = :v",
+        ConditionExpression="contains(title, :needle)",
+        ExpressionAttributeValues={":v": {"S": "y"}, ":needle": {"S": "world"}},
+    )
+    got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})
+    assert got["Item"]["ok"] == {"S": "y"}
+
+
+def test_condition_contains_string_set(ddb, table):
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "tags": {"SS": ["red", "blue"]}})
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="SET ok = :v",
+        ConditionExpression="contains(tags, :elem)",
+        ExpressionAttributeValues={":v": {"S": "y"}, ":elem": {"S": "blue"}},
+    )
+    got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})
+    assert got["Item"]["ok"] == {"S": "y"}
+
+
+def test_update_list_append(ddb, table):
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "elements": {"L": [{"S": "a"}]}})
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="SET elements = list_append(elements, :more)",
+        ExpressionAttributeValues={":more": {"L": [{"S": "b"}, {"S": "c"}]}},
+    )
+    got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})["Item"]
+    elements = [e["S"] for e in got["elements"]["L"]]
+    assert elements == ["a", "b", "c"]
+
+
+def test_update_set_subtraction(ddb, table):
+    """SET x = x - :v."""
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "tally": {"N": "10"}})
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="SET tally = tally - :n",
+        ExpressionAttributeValues={":n": {"N": "3"}},
+    )
+    got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})["Item"]
+    assert got["tally"]["N"] in {"7", "7.0"}
+
+
+def test_update_add_on_string_set(ddb, table):
+    """ADD on string set = set-union."""
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "tags": {"SS": ["red"]}})
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="ADD tags :more",
+        ExpressionAttributeValues={":more": {"SS": ["blue", "red", "green"]}},
+    )
+    got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})["Item"]
+    assert set(got["tags"]["SS"]) == {"red", "blue", "green"}
+
+
+def test_update_delete_from_set(ddb, table):
+    """DELETE on string set = set-subtract."""
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "tags": {"SS": ["red", "blue", "green"]}})
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="DELETE tags :gone",
+        ExpressionAttributeValues={":gone": {"SS": ["red", "blue"]}},
+    )
+    got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})["Item"]
+    assert got["tags"]["SS"] == ["green"]
+
+
+def test_update_multi_section_set_and_remove(ddb, table):
+    """SET ... REMOVE ... in one expression."""
+    ddb.put_item(TableName=table, Item={"id": {"S": "k"}, "keep": {"S": "x"}, "discard": {"S": "y"}})
+    ddb.update_item(
+        TableName=table, Key={"id": {"S": "k"}},
+        UpdateExpression="SET added = :v REMOVE discard",
+        ExpressionAttributeValues={":v": {"S": "new"}},
+    )
+    got = ddb.get_item(TableName=table, Key={"id": {"S": "k"}})["Item"]
+    assert got["added"] == {"S": "new"}
+    assert got["keep"] == {"S": "x"}
+    assert "discard" not in got
