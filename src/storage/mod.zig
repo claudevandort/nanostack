@@ -56,6 +56,9 @@ pub const Error = error{
     QueueDeletedRecently,
     InvalidAttributeValue,
     TooManyEntries,
+    // SQS FIFO (v0.3.1).
+    InvalidParameterValue,
+    MissingParameter,
     Io,
     OutOfMemory,
 };
@@ -1793,6 +1796,11 @@ pub const CreateQueueInput = struct {
     name: []const u8,
     attrs: QueueAttributes = .{},
     tags: []const Tag = &.{},
+    /// Whether the client explicitly passed the `FifoQueue` attribute.
+    /// Used by the FIFO reconciliation rule: `.fifo` name + omitted
+    /// attribute is fine (we derive `is_fifo=true`), but `.fifo` name +
+    /// `FifoQueue=false` is an error.
+    fifo_attribute_specified: bool = false,
 };
 
 pub const QueueUrlInput = struct {
@@ -1827,6 +1835,13 @@ pub const PartialAttributes = struct {
     /// `null` = leave as-is. To clear, pass empty string.
     redrive_policy: ?[]const u8 = null,
     policy: ?[]const u8 = null,
+    /// FIFO-only. `null` = leave as-is. Trying to mutate this on an
+    /// existing FIFO queue is rejected (AWS-exact).
+    content_based_dedup: ?bool = null,
+    /// `FifoQueue` cannot be mutated post-creation. We surface a
+    /// dedicated flag so the SetQueueAttributes parser can detect the
+    /// attribute and reject it.
+    fifo_attribute_specified: bool = false,
 };
 
 pub const SendMessageInput = struct {
@@ -1834,8 +1849,16 @@ pub const SendMessageInput = struct {
     body: []const u8,
     /// Optional per-message delay (0..=900). null = use queue's default.
     delay_seconds: ?u32 = null,
+    /// True when the client provided DelaySeconds (even =0). FIFO queues
+    /// reject any explicit per-message DelaySeconds.
+    delay_seconds_specified: bool = false,
     /// MessageAttributes JSON, raw — verbatim round-trip in v0.3.0.
     raw_attributes_json: ?[]const u8 = null,
+    /// FIFO-only: required on FIFO sends, rejected on Standard sends.
+    message_group_id: ?[]const u8 = null,
+    /// FIFO-only: explicit dedup id. May be null if the queue has
+    /// ContentBasedDeduplication=true.
+    message_deduplication_id: ?[]const u8 = null,
 };
 
 pub const SendMessageOutput = struct {
@@ -1843,6 +1866,8 @@ pub const SendMessageOutput = struct {
     message_id: []const u8,
     /// Hex-encoded MD5 of the body. Owned by caller's allocator.
     md5_of_body: []const u8,
+    /// FIFO-only: monotonic per-queue u128. null on Standard sends.
+    sequence_number: ?u128 = null,
 };
 
 pub const ReceiveMessageInput = struct {

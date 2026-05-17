@@ -480,6 +480,8 @@ pub fn mapStorageErr(e: storage.Error) errors.Code {
         storage.Error.QueueDeletedRecently,
         storage.Error.InvalidAttributeValue,
         storage.Error.TooManyEntries,
+        storage.Error.InvalidParameterValue,
+        storage.Error.MissingParameter,
         => .internal_error,
         storage.Error.Io, storage.Error.OutOfMemory => .internal_error,
     };

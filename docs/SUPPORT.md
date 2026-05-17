@@ -140,22 +140,22 @@ Documented divergences (intentional):
 
 ## SQS
 
-SQS is the third AWS service nanostack covers, opt-in via `--services sqs` (or `--services s3,dynamodb,sqs` to enable all three). v0.3.0 ships 17 ops: queue CRUD, message send/receive/delete with visibility timeout enforcement, batch ops (send / delete / change-visibility), long-polling on ReceiveMessage, dead-letter queues, and tags. Standard queues only; FIFO is deferred.
+SQS is the third AWS service nanostack covers, opt-in via `--services sqs` (or `--services s3,dynamodb,sqs` to enable all three). v0.3.0 shipped 17 ops: queue CRUD, message send/receive/delete with visibility timeout enforcement, batch ops (send / delete / change-visibility), long-polling on ReceiveMessage, dead-letter queues, and tags. v0.3.1 adds **FIFO queues**: per-group strict ordering, MessageGroupId / MessageDeduplicationId / ContentBasedDeduplication 5-minute dedup window, monotonic per-queue SequenceNumber, per-message DelaySeconds rejection.
 
 | Operation | Status | Milestone |
 |---|---|---|
-| CreateQueue | supported (Attributes parsed for VisibilityTimeout / DelaySeconds / ReceiveMessageWaitTimeSeconds / MessageRetentionPeriod / MaximumMessageSize / RedrivePolicy / Policy; duplicate-name calls are idempotent) | v0.3.0 |
+| CreateQueue | supported (Attributes parsed for VisibilityTimeout / DelaySeconds / ReceiveMessageWaitTimeSeconds / MessageRetentionPeriod / MaximumMessageSize / RedrivePolicy / Policy / **FifoQueue** / **ContentBasedDeduplication**; duplicate-name calls are idempotent; FIFO names must end in `.fifo`) | v0.3.0, FIFO attrs v0.3.1 |
 | DeleteQueue | supported (immediate; removes disk + in-memory state) | v0.3.0 |
 | ListQueues | supported (QueueNamePrefix filter; MaxResults + NextToken cursor; lex-ascending) | v0.3.0 |
 | GetQueueUrl | supported | v0.3.0 |
-| GetQueueAttributes | supported (All / per-attribute selection; QueueArn synthesised; CreatedTimestamp from cold-start time) | v0.3.0 |
-| SetQueueAttributes | supported (mutates VisibilityTimeout / DelaySeconds / ReceiveMessageWaitTimeSeconds / MessageRetentionPeriod / MaximumMessageSize / RedrivePolicy / Policy) | v0.3.0 |
+| GetQueueAttributes | supported (All / per-attribute selection; QueueArn synthesised; CreatedTimestamp from cold-start time; **FifoQueue** + **ContentBasedDeduplication** emitted on FIFO queues only) | v0.3.0, FIFO attrs v0.3.1 |
+| SetQueueAttributes | supported (mutates VisibilityTimeout / DelaySeconds / ReceiveMessageWaitTimeSeconds / MessageRetentionPeriod / MaximumMessageSize / RedrivePolicy / Policy / **ContentBasedDeduplication**; FifoQueue is immutable post-creation) | v0.3.0, FIFO attrs v0.3.1 |
 | PurgeQueue | supported (clears in-memory + on-disk messages) | v0.3.0 |
-| SendMessage | supported (real MD5 of body; per-message DelaySeconds override; MessageAttributes round-trip verbatim) | v0.3.0 |
-| ReceiveMessage | supported (MaxNumberOfMessages 1..10; per-call VisibilityTimeout override; WaitTimeSeconds 0..20 long polling; visibility-timeout enforced via on-read promotion of expired in-flight messages) | v0.3.0 |
+| SendMessage | supported (real MD5 of body; per-message DelaySeconds override on Standard; MessageAttributes round-trip verbatim; FIFO **MessageGroupId** required, **MessageDeduplicationId** + dedup-window enforcement, per-queue monotonic **SequenceNumber** returned) | v0.3.0, FIFO v0.3.1 |
+| ReceiveMessage | supported (MaxNumberOfMessages 1..10; per-call VisibilityTimeout override; WaitTimeSeconds 0..20 long polling; visibility-timeout enforced via on-read promotion of expired in-flight messages; **FIFO per-group head-of-line blocking** — only one in-flight message per MessageGroupId at a time) | v0.3.0, FIFO ordering v0.3.1 |
 | DeleteMessage | supported (receipt-handle decoded + validated; idempotent on already-deleted, matches AWS) | v0.3.0 |
 | ChangeMessageVisibility | supported (0..43200 seconds; 0 immediately re-releases) | v0.3.0 |
-| SendMessageBatch | supported (up to 10 entries; per-entry Successful / Failed split) | v0.3.0 |
+| SendMessageBatch | supported (up to 10 entries; per-entry Successful / Failed split; per-entry SequenceNumber on FIFO; in-batch dedup collapses to one delivered message) | v0.3.0, FIFO v0.3.1 |
 | DeleteMessageBatch | supported (up to 10 entries; per-entry Successful / Failed split) | v0.3.0 |
 | ChangeMessageVisibilityBatch | supported (up to 10 entries; per-entry Successful / Failed split) | v0.3.0 |
 | TagQueue | supported (max 50 tags per queue; overwrites existing keys; persisted to tags.json) | v0.3.0 |
@@ -177,7 +177,9 @@ These AWS SQS operations are part of the full surface but currently unrouted —
 
 Documented divergences (intentional):
 - **JSON wire only.** boto3 v1.34+, JS SDK v3, and CLI v2 all use the JSON wire by default. The legacy query-string / XML form is **out of scope** — users on older SDKs should upgrade.
-- **FIFO queues deferred to v0.3.1.** MessageGroupId / MessageDeduplicationId / ContentBasedDeduplication / per-group ordering land in the next patch. CreateQueue on a `.fifo` name name-validates but no FIFO semantics are applied yet.
+- **FIFO high-throughput mode deferred.** `DeduplicationScope=messageGroup` and `FifoThroughputLimit=perMessageGroupId` (the per-group-throughput accounting mode AWS added for high-volume FIFO workloads) are not modelled — attributes accepted & round-tripped but the accounting isn't built. v0.3.x patch if a user asks.
+- **FIFO dedup history is in-memory only.** The 5-minute dedup window (MessageDeduplicationId → original send) survives within a process but not across restart. Same trade-off as DDB Streams ring buffers.
+- **FIFO SequenceNumber width**: 20-digit zero-padded decimal (u128). AWS docs say "up to 39 digits". Strict-width parsers may need to relax.
 - **Long polling = in-handler sleep loop.** ReceiveMessage with `WaitTimeSeconds > 0` blocks the handler thread, polling the queue every 100ms until a message arrives or the deadline expires. AWS-real uses a server-side event loop; we don't. Wastes one handler thread per long-poll; acceptable for local dev.
 - **No connection-cancellation detection on long polling.** A client that drops mid-poll keeps the handler sleeping until the deadline. AWS-real would notice and return immediately.
 - **No rate limits.** AWS enforces per-account caps on queues + sends/sec. We accept everything.

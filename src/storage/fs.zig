@@ -5432,6 +5432,9 @@ const AttributesDoc = struct {
     created_unix: i64,
     redrive_policy: ?[]const u8 = null,
     policy: ?[]const u8 = null,
+    is_fifo: bool = false,
+    content_based_dedup: bool = false,
+    sequence_counter: u128 = 0,
 };
 
 fn writeQueueAttrs(self: *Fs, slot: *const storage.SqsQueueSlot) !void {
@@ -5448,6 +5451,9 @@ fn writeQueueAttrs(self: *Fs, slot: *const storage.SqsQueueSlot) !void {
         .created_unix = slot.created_unix,
         .redrive_policy = slot.attrs.redrive_policy,
         .policy = slot.attrs.policy,
+        .is_fifo = slot.attrs.is_fifo,
+        .content_based_dedup = slot.attrs.content_based_dedup,
+        .sequence_counter = slot.attrs.sequence_counter,
     };
 
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
@@ -5507,6 +5513,9 @@ fn loadSingleQueue(self: *Fs, name: []const u8) !void {
             .maximum_message_size = doc.maximum_message_size,
             .redrive_policy = if (doc.redrive_policy) |s| try self.allocator.dupe(u8, s) else null,
             .policy = if (doc.policy) |s| try self.allocator.dupe(u8, s) else null,
+            .is_fifo = doc.is_fifo,
+            .content_based_dedup = doc.content_based_dedup,
+            .sequence_counter = doc.sequence_counter,
         },
     };
 
@@ -5518,6 +5527,23 @@ fn loadSingleQueue(self: *Fs, name: []const u8) !void {
 pub fn sqsCreateQueue(self: *Fs, in: storage.CreateQueueInput) storage.Error!*const storage.SqsQueueSlot {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
+
+    // FIFO reconciliation: the `.fifo` name suffix and the `FifoQueue`
+    // attribute must agree. AWS-exact: a non-`.fifo` name with
+    // FifoQueue=true → InvalidAttributeValue; a `.fifo` name with
+    // FifoQueue=false → InvalidAttributeValue. If the attribute is
+    // omitted, we derive it from the name.
+    const name_is_fifo = sqs_state_mod.hasFifoSuffix(in.name);
+    if (in.attrs.is_fifo and !name_is_fifo) return storage.Error.InvalidAttributeValue;
+    if (name_is_fifo and !in.attrs.is_fifo and in.fifo_attribute_specified)
+        return storage.Error.InvalidAttributeValue;
+    const effective_fifo = name_is_fifo;
+    // ContentBasedDeduplication is FIFO-only — reject on Standard.
+    if (in.attrs.content_based_dedup and !effective_fifo)
+        return storage.Error.InvalidAttributeValue;
+    // FIFO queues forbid per-queue DelaySeconds > 0.
+    if (effective_fifo and in.attrs.delay_seconds > 0)
+        return storage.Error.InvalidAttributeValue;
 
     if (self.sqs_queues.get(in.name)) |existing| {
         // AWS idempotency: CreateQueue with the same name + matching
@@ -5543,6 +5569,9 @@ pub fn sqsCreateQueue(self: *Fs, in: storage.CreateQueueInput) storage.Error!*co
             .maximum_message_size = in.attrs.maximum_message_size,
             .redrive_policy = if (in.attrs.redrive_policy) |s| (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory) else null,
             .policy = if (in.attrs.policy) |s| (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory) else null,
+            .is_fifo = effective_fifo,
+            .content_based_dedup = in.attrs.content_based_dedup,
+            .sequence_counter = 0,
         },
     };
     writeQueueAttrs(self, slot_ptr) catch return storage.Error.Io;
@@ -5581,6 +5610,17 @@ pub fn sqsSetQueueAttributes(self: *Fs, in: storage.SetQueueAttributesInput) sto
     defer self.mutex.unlock(self.io);
 
     const slot = self.sqs_queues.get(in.name) orelse return storage.Error.QueueNotFound;
+    // FifoQueue is immutable post-creation. Reject any attempt to set
+    // it (even to the current value) — AWS-exact.
+    if (in.attrs.fifo_attribute_specified) return storage.Error.InvalidAttributeValue;
+    // ContentBasedDeduplication is FIFO-only.
+    if (in.attrs.content_based_dedup != null and !slot.attrs.is_fifo)
+        return storage.Error.InvalidAttributeValue;
+    // FIFO queues forbid DelaySeconds > 0.
+    if (in.attrs.delay_seconds) |v| {
+        if (slot.attrs.is_fifo and v > 0) return storage.Error.InvalidAttributeValue;
+    }
+
     if (in.attrs.visibility_timeout) |v| slot.attrs.visibility_timeout = v;
     if (in.attrs.delay_seconds) |v| slot.attrs.delay_seconds = v;
     if (in.attrs.receive_message_wait_time_seconds) |v| slot.attrs.receive_message_wait_time_seconds = v;
@@ -5600,6 +5640,7 @@ pub fn sqsSetQueueAttributes(self: *Fs, in: storage.SetQueueAttributesInput) sto
         else
             null;
     }
+    if (in.attrs.content_based_dedup) |v| slot.attrs.content_based_dedup = v;
     writeQueueAttrs(self, slot) catch return storage.Error.Io;
 }
 
@@ -5753,6 +5794,9 @@ const MessageDoc = struct {
     receive_count: u32,
     md5_of_body: []const u8,
     raw_attributes_json: ?[]const u8 = null,
+    message_group_id: ?[]const u8 = null,
+    message_deduplication_id: ?[]const u8 = null,
+    sequence_number: u128 = 0,
 };
 
 fn writeMessageJson(self: *Fs, queue_name: []const u8, m: *const storage.Message) !void {
@@ -5768,6 +5812,9 @@ fn writeMessageJson(self: *Fs, queue_name: []const u8, m: *const storage.Message
         .receive_count = m.receive_count,
         .md5_of_body = &m.md5_of_body,
         .raw_attributes_json = m.raw_attributes_json,
+        .message_group_id = m.message_group_id,
+        .message_deduplication_id = m.message_deduplication_id,
+        .sequence_number = m.sequence_number,
     };
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
     defer aw.deinit();
@@ -5787,7 +5834,46 @@ pub fn sqsSendMessage(self: *Fs, allocator: Allocator, in: storage.SendMessageIn
     const slot = self.sqs_queues.get(in.queue_name) orelse return storage.Error.QueueNotFound;
     if (in.body.len > slot.attrs.maximum_message_size) return storage.Error.InvalidMessageBody;
 
+    // FIFO vs Standard parameter validation.
+    if (slot.attrs.is_fifo) {
+        if (in.message_group_id == null) return storage.Error.MissingParameter;
+        // Per-message DelaySeconds is rejected on FIFO (any explicit value).
+        if (in.delay_seconds_specified) return storage.Error.InvalidParameterValue;
+        // FIFO requires either ContentBasedDeduplication or an explicit dedup id.
+        if (in.message_deduplication_id == null and !slot.attrs.content_based_dedup)
+            return storage.Error.InvalidParameterValue;
+    } else {
+        if (in.message_group_id != null) return storage.Error.InvalidParameterValue;
+        if (in.message_deduplication_id != null) return storage.Error.InvalidParameterValue;
+    }
+
     const now = nowUnixSeconds(self.io);
+
+    // FIFO dedup window. Compute effective dedup id (explicit, or
+    // sha256(body) under ContentBasedDeduplication). Prune expired
+    // entries first, then look up.
+    var effective_dedup: ?[]const u8 = null;
+    var content_hash_buf: [64]u8 = undefined;
+    if (slot.attrs.is_fifo) {
+        pruneDedupHistory(self, slot, now);
+        if (in.message_deduplication_id) |s| {
+            effective_dedup = s;
+        } else if (slot.attrs.content_based_dedup) {
+            effective_dedup = sha256Hex(in.body, &content_hash_buf);
+        }
+        if (effective_dedup) |key| {
+            if (slot.dedup_history.get(key)) |entry| {
+                // Return the original send's identifiers; the wire
+                // can't tell the dupe was suppressed.
+                return .{
+                    .message_id = allocator.dupe(u8, entry.message_id) catch return storage.Error.OutOfMemory,
+                    .md5_of_body = allocator.dupe(u8, &md5Hex(in.body)) catch return storage.Error.OutOfMemory,
+                    .sequence_number = entry.sequence_number,
+                };
+            }
+        }
+    }
+
     const delay: u32 = in.delay_seconds orelse slot.attrs.delay_seconds;
 
     const id_owned = generateMessageId(self.allocator, self.io) catch return storage.Error.OutOfMemory;
@@ -5799,6 +5885,22 @@ pub fn sqsSendMessage(self: *Fs, allocator: Allocator, in: storage.SendMessageIn
     else
         null;
     errdefer if (attrs_owned) |s| self.allocator.free(s);
+    const group_owned: ?[]const u8 = if (in.message_group_id) |s|
+        (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory)
+    else
+        null;
+    errdefer if (group_owned) |s| self.allocator.free(s);
+    const dedup_owned: ?[]const u8 = if (in.message_deduplication_id) |s|
+        (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory)
+    else
+        null;
+    errdefer if (dedup_owned) |s| self.allocator.free(s);
+
+    var seq_number: u128 = 0;
+    if (slot.attrs.is_fifo) {
+        slot.attrs.sequence_counter += 1;
+        seq_number = slot.attrs.sequence_counter;
+    }
 
     const md5 = md5Hex(in.body);
     const msg_ptr = self.allocator.create(storage.Message) catch return storage.Error.OutOfMemory;
@@ -5811,14 +5913,73 @@ pub fn sqsSendMessage(self: *Fs, allocator: Allocator, in: storage.SendMessageIn
         .receive_count = 0,
         .md5_of_body = md5,
         .raw_attributes_json = attrs_owned,
+        .message_group_id = group_owned,
+        .message_deduplication_id = dedup_owned,
+        .sequence_number = seq_number,
     };
     writeMessageJson(self, slot.name, msg_ptr) catch return storage.Error.Io;
     slot.messages.append(self.allocator, msg_ptr) catch return storage.Error.OutOfMemory;
+    if (slot.attrs.is_fifo) {
+        // Persist the bumped sequence_counter so it survives restart.
+        writeQueueAttrs(self, slot) catch return storage.Error.Io;
+        // Record the dedup id (if any) for the 5-minute window.
+        if (effective_dedup) |key| {
+            const key_owned = self.allocator.dupe(u8, key) catch return storage.Error.OutOfMemory;
+            const msg_id_owned = self.allocator.dupe(u8, id_owned) catch {
+                self.allocator.free(key_owned);
+                return storage.Error.OutOfMemory;
+            };
+            slot.dedup_history.put(self.allocator, key_owned, .{
+                .message_id = msg_id_owned,
+                .sequence_number = seq_number,
+                .expire_unix = now + dedup_window_seconds,
+            }) catch {
+                self.allocator.free(key_owned);
+                self.allocator.free(msg_id_owned);
+                return storage.Error.OutOfMemory;
+            };
+        }
+    }
 
     return .{
         .message_id = allocator.dupe(u8, id_owned) catch return storage.Error.OutOfMemory,
         .md5_of_body = allocator.dupe(u8, &md5) catch return storage.Error.OutOfMemory,
+        .sequence_number = if (slot.attrs.is_fifo) seq_number else null,
     };
+}
+
+const dedup_window_seconds: i64 = 300;
+
+/// Prune entries whose expire_unix <= now. Frees both the key + the
+/// stored message_id.
+fn pruneDedupHistory(self: *Fs, slot: *storage.SqsQueueSlot, now: i64) void {
+    var to_remove: std.ArrayList([]const u8) = .empty;
+    defer to_remove.deinit(self.allocator);
+    var it = slot.dedup_history.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.expire_unix <= now) {
+            to_remove.append(self.allocator, entry.key_ptr.*) catch return;
+        }
+    }
+    for (to_remove.items) |key| {
+        if (slot.dedup_history.fetchRemove(key)) |kv| {
+            self.allocator.free(kv.key);
+            self.allocator.free(kv.value.message_id);
+        }
+    }
+}
+
+/// SHA-256 of `data`, hex-encoded lowercase, written into `out_buf`
+/// (must be ≥64 bytes). Returns a slice referencing `out_buf`.
+fn sha256Hex(data: []const u8, out_buf: *[64]u8) []const u8 {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &hash, .{});
+    const hex = "0123456789abcdef";
+    for (hash, 0..) |b, i| {
+        out_buf[i * 2] = hex[(b >> 4) & 0xf];
+        out_buf[i * 2 + 1] = hex[b & 0xf];
+    }
+    return out_buf[0..];
 }
 
 pub fn sqsReceiveMessage(self: *Fs, allocator: Allocator, in: storage.ReceiveMessageInput) storage.Error!storage.ReceiveMessageOutput {
@@ -5846,12 +6007,41 @@ pub fn sqsReceiveMessage(self: *Fs, allocator: Allocator, in: storage.ReceiveMes
         out.deinit(allocator);
     }
 
+    // FIFO queues use a "claimed groups" set so that a group with a
+    // currently-in-flight message blocks delivery of later messages in
+    // the same group. The set lives only for this scan.
+    var claimed_groups = std.StringHashMapUnmanaged(void){};
+    defer claimed_groups.deinit(self.allocator);
+
     // Iterate via index because we may need to remove (DLQ route) mid-pass.
     var i: usize = 0;
     while (i < slot.messages.items.len) {
         if (out.items.len >= max) break;
         const m = slot.messages.items[i];
-        if (m.visible_unix > now) {
+
+        // FIFO group-lock semantics: a group is "claimed" by the first
+        // visible-or-in-flight message we see. Subsequent messages in
+        // the same group are skipped.
+        if (slot.attrs.is_fifo) {
+            const gid = m.message_group_id orelse {
+                // Shouldn't happen on a FIFO queue, but skip defensively.
+                i += 1;
+                continue;
+            };
+            if (claimed_groups.contains(gid)) {
+                i += 1;
+                continue;
+            }
+            if (m.visible_unix > now) {
+                // This group's head is in-flight — claim and skip.
+                claimed_groups.put(self.allocator, gid, {}) catch return storage.Error.OutOfMemory;
+                i += 1;
+                continue;
+            }
+            // m is visible and its group has no head-of-line block.
+            // Claim the group before delivering.
+            claimed_groups.put(self.allocator, gid, {}) catch return storage.Error.OutOfMemory;
+        } else if (m.visible_unix > now) {
             i += 1;
             continue;
         }
