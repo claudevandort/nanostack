@@ -95,6 +95,7 @@ DynamoDB is the second AWS service nanostack covers, opt-in via `--services s3,d
 | DescribeLimits | supported (returns synthetic AWS-default account limits) | M15-polish |
 | TagResource / UntagResource / ListTagsOfResource | supported (metadata-only; not persisted across nanostack restart) | M15-polish |
 | **StreamSpecification on CreateTable / UpdateTable** | supported (all four view types — NEW_IMAGE / OLD_IMAGE / NEW_AND_OLD_IMAGES / KEYS_ONLY; spec persists across restart; LatestStreamLabel + LatestStreamArn echoed on DescribeTable) | v0.2.2 |
+| **UpdateTimeToLive / DescribeTimeToLive** | supported (background sweeper evicts items where the TTL attribute is a Number ≤ now(); spec persists across restart; sweeper-driven REMOVE records on the stream carry `userIdentity = {Type: "Service", PrincipalId: "dynamodb.amazonaws.com"}`) | v0.2.3 |
 
 ### DynamoDBStreams sub-service (v0.2.2)
 
@@ -111,11 +112,14 @@ Target prefix `DynamoDBStreams_20120810.*`. Opt-in via the same `--services s3,d
 
 Documented divergences (intentional):
 - **Bucket-policy-style `Condition` blocks are skipped** in IAM policies (same caveat as S3 M14). Not applicable to DynamoDB resource policies since we don't model IAM at all.
-- **PartiQL, Backups/PITR, Global Tables, DAX, Imports/Exports, TTL background sweeper** — out of scope. Returned as `ValidationException` (unknown target) for now. PartiQL / PITR / TTL are candidates for future v0.2.x patches.
+- **PartiQL, Backups/PITR, Imports/Exports** — out of scope for v0.2.x. Returned as `ValidationException` (unknown target) for now. Candidates for future v0.2.x patches if there's demand.
+- **Global Tables, DAX** — out of scope indefinitely. Global Tables is meaningless on a single-region emulator; DAX is a separate cache service with its own binary protocol, wrong shape for an emulator.
 - **Parallel scan (`TotalSegments > 1`)** will return `ValidationException`.
 - **GSI auto-fetch-from-base-table** for non-projected attrs is a client-SDK behavior; nanostack returns only the projected attrs.
 - **Streams: single open shard per stream** (no shard splitting / closed-shard semantics). Sequence numbers are a monotonic per-stream counter rendered as 21-digit zero-padded decimals. Re-enabling a stream rotates the shard ID (matches AWS's "label changes on re-enable").
 - **Streams: 24h retention is approximate** — records older than 24h are dropped on next consult, but a write-heavy stream may evict records younger than 24h once the 1000-record bound is hit.
+- **TTL: sweep interval defaults to 5 seconds** (vs AWS "best-effort within 48h"). Tunable via `--ttl-sweep-interval-seconds N` (range 1..=3600). 5s is right for local-dev tests; production-faithful retry-after-eviction-delay simulations would set this higher.
+- **TTL: status transitions snap immediately.** AWS shows ENABLING / DISABLING transients for ~1h after each call; we move straight to ENABLED / DISABLED. Tests asserting on transient states won't match.
 
 ## S3
 
