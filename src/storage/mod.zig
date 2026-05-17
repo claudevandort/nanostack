@@ -1258,13 +1258,16 @@ pub const CreateTableInput = struct {
     global_secondary_indexes: []const dynamo_state.GsiDef = &.{},
     local_secondary_indexes: []const dynamo_state.LsiDef = &.{},
     tags: []const dynamo_state.Tag = &.{},
+    stream_spec: ?dynamo_state.StreamSpecification = null,
 };
 
-/// Inputs for UpdateTable. Phase 2 supports BillingMode metadata changes
-/// only; other fields are accepted-and-ignored (documented divergence).
+/// Inputs for UpdateTable. Supports BillingMode and StreamSpecification
+/// mutations; other fields are accepted-and-ignored (documented
+/// divergence).
 pub const UpdateTableInput = struct {
     name: []const u8,
     billing_mode: ?dynamo_state.BillingMode = null,
+    stream_spec: ?dynamo_state.StreamSpecification = null,
 };
 
 /// A pre-evaluated condition predicate. Storage holds the mutex and

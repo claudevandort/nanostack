@@ -92,6 +92,39 @@ pub const BillingMode = enum {
     }
 };
 
+/// DynamoDB Streams view-type, controls what each StreamRecord carries.
+pub const StreamViewType = enum {
+    new_image,
+    old_image,
+    new_and_old_images,
+    keys_only,
+
+    pub fn toAws(self: StreamViewType) []const u8 {
+        return switch (self) {
+            .new_image => "NEW_IMAGE",
+            .old_image => "OLD_IMAGE",
+            .new_and_old_images => "NEW_AND_OLD_IMAGES",
+            .keys_only => "KEYS_ONLY",
+        };
+    }
+
+    pub fn fromAws(s: []const u8) ?StreamViewType {
+        if (std.mem.eql(u8, s, "NEW_IMAGE")) return .new_image;
+        if (std.mem.eql(u8, s, "OLD_IMAGE")) return .old_image;
+        if (std.mem.eql(u8, s, "NEW_AND_OLD_IMAGES")) return .new_and_old_images;
+        if (std.mem.eql(u8, s, "KEYS_ONLY")) return .keys_only;
+        return null;
+    }
+};
+
+/// StreamSpecification on a table. AWS allows `StreamEnabled=false` with
+/// or without a view-type; when `enabled=true` the view-type is required
+/// (default `NEW_AND_OLD_IMAGES`).
+pub const StreamSpecification = struct {
+    enabled: bool,
+    view_type: StreamViewType,
+};
+
 /// One entry in a `KeySchema` list. AWS keys are exactly 1 HASH or
 /// (1 HASH + 1 RANGE); the validator enforces that on Put.
 pub const KeyAttribute = struct {
@@ -162,6 +195,13 @@ pub const TableSlot = struct {
     global_secondary_indexes: []const GsiDef = &.{},
     local_secondary_indexes: []const LsiDef = &.{},
     tags: []const Tag = &.{},
+    /// Streams config + the wall-clock time the spec was last set.
+    /// `stream_enabled_unix` is null when streams were never enabled;
+    /// non-null even after a disable so the latest label/ARN can still
+    /// be derived. DescribeTable only emits LatestStreamLabel / ARN
+    /// when `stream_spec != null and stream_spec.enabled`.
+    stream_spec: ?StreamSpecification = null,
+    stream_enabled_unix: ?i64 = null,
     created_unix: i64,
     /// In-memory item store, keyed on a stable composite "<pk>|<sk?>"
     /// string. Populated by ddbPutItem on every write and rebuilt on
@@ -334,6 +374,15 @@ test "KeyType.fromAws / toAws round-trip" {
     try testing.expectEqual(KeyType.hash, KeyType.fromAws("HASH").?);
     try testing.expectEqual(KeyType.range, KeyType.fromAws("RANGE").?);
     try testing.expectEqual(@as(?KeyType, null), KeyType.fromAws("hash")); // case-sensitive
+}
+
+test "StreamViewType.fromAws / toAws round-trip" {
+    try testing.expectEqual(StreamViewType.new_image, StreamViewType.fromAws("NEW_IMAGE").?);
+    try testing.expectEqual(StreamViewType.old_image, StreamViewType.fromAws("OLD_IMAGE").?);
+    try testing.expectEqual(StreamViewType.new_and_old_images, StreamViewType.fromAws("NEW_AND_OLD_IMAGES").?);
+    try testing.expectEqual(StreamViewType.keys_only, StreamViewType.fromAws("KEYS_ONLY").?);
+    try testing.expectEqual(@as(?StreamViewType, null), StreamViewType.fromAws("OTHER"));
+    try testing.expectEqualStrings("NEW_AND_OLD_IMAGES", StreamViewType.new_and_old_images.toAws());
 }
 
 test "ProjectionType.fromAws" {

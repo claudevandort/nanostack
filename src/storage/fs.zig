@@ -3160,6 +3160,12 @@ const SchemaDoc = struct {
     local_secondary_indexes: []const IndexDoc,
     tags: []const TagDoc,
     created_unix: i64,
+    /// Streams config. `stream_enabled = null` ⇔ never configured.
+    /// `stream_enabled_unix` is non-null whenever a spec has ever been
+    /// applied (used to derive LatestStreamLabel / ARN).
+    stream_enabled: ?bool = null,
+    stream_view_type: ?[]const u8 = null,
+    stream_enabled_unix: ?i64 = null,
 };
 const KeyAttrDoc = struct { name: []const u8, key_type: []const u8 };
 const AttributeDefDoc = struct { name: []const u8, type: []const u8 };
@@ -3230,6 +3236,9 @@ fn slotToDoc(allocator: Allocator, slot: *const storage.TableSlot) !SchemaDoc {
         .local_secondary_indexes = lsi_doc,
         .tags = tags_doc,
         .created_unix = slot.created_unix,
+        .stream_enabled = if (slot.stream_spec) |sp| sp.enabled else null,
+        .stream_view_type = if (slot.stream_spec) |sp| sp.view_type.toAws() else null,
+        .stream_enabled_unix = slot.stream_enabled_unix,
     };
 }
 
@@ -3413,6 +3422,14 @@ fn docToSlot(allocator: Allocator, doc: SchemaDoc) !storage.TableSlot {
         };
     }
 
+    const stream_spec: ?ddb.dynamo_state.StreamSpecification = if (doc.stream_enabled) |enabled| .{
+        .enabled = enabled,
+        .view_type = if (doc.stream_view_type) |vt|
+            ddb.dynamo_state.StreamViewType.fromAws(vt) orelse .new_and_old_images
+        else
+            .new_and_old_images,
+    } else null;
+
     return .{
         .name = name,
         .key_schema = ks,
@@ -3421,6 +3438,8 @@ fn docToSlot(allocator: Allocator, doc: SchemaDoc) !storage.TableSlot {
         .global_secondary_indexes = gsis,
         .local_secondary_indexes = lsis,
         .tags = tags,
+        .stream_spec = stream_spec,
+        .stream_enabled_unix = doc.stream_enabled_unix,
         .created_unix = doc.created_unix,
     };
 }
@@ -3545,6 +3564,8 @@ fn cloneTableSlot(allocator: Allocator, in: storage.CreateTableInput, created_un
         .global_secondary_indexes = gsis,
         .local_secondary_indexes = lsis,
         .tags = tags,
+        .stream_spec = in.stream_spec,
+        .stream_enabled_unix = if (in.stream_spec) |sp| (if (sp.enabled) created_unix else null) else null,
         .created_unix = created_unix,
     };
 }
@@ -3593,6 +3614,15 @@ pub fn ddbUpdateTable(self: *Fs, in: storage.UpdateTableInput) storage.Error!*co
 
     const slot = self.dynamo_tables.get(in.name) orelse return storage.Error.TableNotFound;
     if (in.billing_mode) |bm| slot.billing_mode = bm;
+    if (in.stream_spec) |sp| {
+        slot.stream_spec = sp;
+        // Re-stamp the enable timestamp on any enable→enable or
+        // disable→enable transition so the LatestStreamLabel matches
+        // observed AWS behaviour. Disable leaves the prior timestamp
+        // in place — AWS keeps the label around until streams are
+        // re-enabled.
+        if (sp.enabled) slot.stream_enabled_unix = nowUnixSeconds(self.io);
+    }
     writeSchemaJson(self, slot) catch return storage.Error.Io;
     return slot;
 }
