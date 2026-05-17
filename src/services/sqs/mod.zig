@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const storage = @import("../../storage/mod.zig");
 const errors = @import("../../wire/sqs/errors.zig");
 const queues_handler = @import("queues.zig");
+const messages_handler = @import("messages.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -62,6 +63,12 @@ pub fn handle(ctx: Context) Result {
     if (std.mem.eql(u8, target, "GetQueueAttributes")) return queues_handler.getQueueAttributes(ctx);
     if (std.mem.eql(u8, target, "SetQueueAttributes")) return queues_handler.setQueueAttributes(ctx);
     if (std.mem.eql(u8, target, "PurgeQueue")) return queues_handler.purgeQueue(ctx);
+
+    // Messages (Phase 2).
+    if (std.mem.eql(u8, target, "SendMessage")) return messages_handler.sendMessage(ctx);
+    if (std.mem.eql(u8, target, "ReceiveMessage")) return messages_handler.receiveMessage(ctx);
+    if (std.mem.eql(u8, target, "DeleteMessage")) return messages_handler.deleteMessage(ctx);
+    if (std.mem.eql(u8, target, "ChangeMessageVisibility")) return messages_handler.changeMessageVisibility(ctx);
 
     // Anything else: 400 with operation name in the message. Phase 2+
     // adds messages / batches / long polling.

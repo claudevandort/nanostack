@@ -1829,6 +1829,56 @@ pub const PartialAttributes = struct {
     policy: ?[]const u8 = null,
 };
 
+pub const SendMessageInput = struct {
+    queue_name: []const u8,
+    body: []const u8,
+    /// Optional per-message delay (0..=900). null = use queue's default.
+    delay_seconds: ?u32 = null,
+    /// MessageAttributes JSON, raw — verbatim round-trip in v0.3.0.
+    raw_attributes_json: ?[]const u8 = null,
+};
+
+pub const SendMessageOutput = struct {
+    /// Owned by caller's allocator.
+    message_id: []const u8,
+    /// Hex-encoded MD5 of the body. Owned by caller's allocator.
+    md5_of_body: []const u8,
+};
+
+pub const ReceiveMessageInput = struct {
+    queue_name: []const u8,
+    max_messages: u32 = 1,
+    /// Per-call override for VisibilityTimeout. null = queue default.
+    visibility_timeout: ?u32 = null,
+    /// Receive-side wait time. 0 = poll-now. Phase 3 adds long polling.
+    wait_time_seconds: u32 = 0,
+};
+
+pub const ReceivedMessage = struct {
+    /// Owned by caller's allocator.
+    message_id: []const u8,
+    receipt_handle: []const u8,
+    body: []const u8,
+    md5_of_body: []const u8,
+    /// Pass-through; null = no attributes were sent.
+    raw_attributes_json: ?[]const u8,
+};
+
+pub const ReceiveMessageOutput = struct {
+    messages: []ReceivedMessage,
+};
+
+pub const DeleteMessageInput = struct {
+    queue_name: []const u8,
+    receipt_handle: []const u8,
+};
+
+pub const ChangeMessageVisibilityInput = struct {
+    queue_name: []const u8,
+    receipt_handle: []const u8,
+    visibility_timeout: u32,
+};
+
 pub const SqsBackend = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -1841,6 +1891,11 @@ pub const SqsBackend = struct {
         getQueueAttributes: *const fn (ctx: *anyopaque, name: []const u8) Error!QueueAttributes,
         setQueueAttributes: *const fn (ctx: *anyopaque, in: SetQueueAttributesInput) Error!void,
         purgeQueue: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
+        // v0.3.0 Phase 2.
+        sendMessage: *const fn (ctx: *anyopaque, allocator: Allocator, in: SendMessageInput) Error!SendMessageOutput,
+        receiveMessage: *const fn (ctx: *anyopaque, allocator: Allocator, in: ReceiveMessageInput) Error!ReceiveMessageOutput,
+        deleteMessage: *const fn (ctx: *anyopaque, in: DeleteMessageInput) Error!void,
+        changeMessageVisibility: *const fn (ctx: *anyopaque, in: ChangeMessageVisibilityInput) Error!void,
     };
 
     pub fn createQueue(self: SqsBackend, in: CreateQueueInput) Error!*const SqsQueueSlot {
@@ -1863,6 +1918,18 @@ pub const SqsBackend = struct {
     }
     pub fn purgeQueue(self: SqsBackend, name: []const u8) Error!void {
         return self.vtable.purgeQueue(self.ctx, name);
+    }
+    pub fn sendMessage(self: SqsBackend, allocator: Allocator, in: SendMessageInput) Error!SendMessageOutput {
+        return self.vtable.sendMessage(self.ctx, allocator, in);
+    }
+    pub fn receiveMessage(self: SqsBackend, allocator: Allocator, in: ReceiveMessageInput) Error!ReceiveMessageOutput {
+        return self.vtable.receiveMessage(self.ctx, allocator, in);
+    }
+    pub fn deleteMessage(self: SqsBackend, in: DeleteMessageInput) Error!void {
+        return self.vtable.deleteMessage(self.ctx, in);
+    }
+    pub fn changeMessageVisibility(self: SqsBackend, in: ChangeMessageVisibilityInput) Error!void {
+        return self.vtable.changeMessageVisibility(self.ctx, in);
     }
 };
 
