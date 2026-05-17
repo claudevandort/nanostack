@@ -16,6 +16,31 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-17
+
+**Patch release: DynamoDB polish — closes four post-ship gaps.**
+
+Per the [versioning scheme](#versioning-scheme), patches mark "significant pinned cuts of work". v0.2.0 shipped DynamoDB with 18 ops; a post-ship audit surfaced four issues this release closes:
+
+### Added
+- **Items persist across nanostack restart.** v0.2.0's cold-start loader rebuilt the per-table schemas but never read items back from `<table>/items/<sha>.json`. `loadTableItems` now walks each table's items directory, parses each via `attribute_value.parseValue`, and re-inserts into `slot.items` keyed on the same composite key the write path uses. Corrupted files are skipped with a `std.log.warn`, matching the schema-load policy.
+- **Reserved-words enforcement** for ConditionExpression / UpdateExpression / KeyConditionExpression / FilterExpression. New `src/wire/dynamodb/expressions/reserved_words.zig` carries the full 573-word AWS list (case-insensitive). Identifier tokens in operand position are rejected with `ValidationException` if they match; function-call identifiers (e.g. `attribute_exists`, `begins_with`, `list_append`) route through separate parse paths and remain legal. Error messages point at `ExpressionAttributeNames` as the fix.
+- **JS conformance suite for DynamoDB** at `tests/conformance/js/dynamodb_*.test.ts` — 4 new test files (~14 tests) using `@aws-sdk/client-dynamodb` v3 + `@aws-sdk/util-dynamodb` marshall/unmarshall. Validates that the wire format works with the JS SDK's specific encoding of Sets, numbers, and binary.
+- **AWS CLI v2 conformance suite for DynamoDB** at `tests/conformance/awscli/test_ddb_*.py` — 3 new test files (~9 tests) driving the real `aws dynamodb` v2 CLI via subprocess. Covers `create-table` / `describe-table` / `list-tables` / `put-item` / `get-item` / `update-item` / `delete-item` / `query` / `scan` with the CLI's flag-shape conventions.
+
+### Changed
+- **Python conformance backfill**: 15 new tests for expression shapes implemented in v0.2.0 but never exercised — `<>`, `<=`, `>=`, `OR`, `NOT`, parentheses, `IN`, `attribute_type`, `contains` (string + SS), `list_append`, SET subtraction, ADD on string set, DELETE from set, multi-section `SET ... REMOVE ...`, sort-key `<`/`<=`/`>=`, mixed-op TransactWriteItems (Put + Update + Delete + ConditionCheck atomically).
+- **Pre-existing tests migrated off reserved attribute names** (`name`, `count`, `missing`, `items`, `drop`) to non-reserved equivalents (`label`, `tally`, `extra`, `elements`, `discard`) — these only surfaced as failures once reserved-word enforcement landed.
+
+### Tests
+- Python conformance: 286 → 308 (+22 — 1 restart + 3 reserved-word + 15 expression-shape + 1 mixed-tx + 2 fixture-derived).
+- JS conformance: 51 → 65 (+14 DDB).
+- AWS CLI conformance: 10 → 19 (+9 DDB).
+- Zig unit tests: 461 → 465 (+4 reserved-word lookup unit tests).
+
+### Strategic note
+After v0.2.1, DynamoDB matches S3's three-SDK coverage promise — every shipped op is verified against Python (boto3), JS (aws-sdk-js v3), and the AWS CLI v2. The "accuracy beats LocalStack" claim survives SDK-specific quirks.
+
 ## [0.2.0] — 2026-05-17
 
 **First minor release: DynamoDB joins S3.**
