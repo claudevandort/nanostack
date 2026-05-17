@@ -5432,6 +5432,9 @@ const AttributesDoc = struct {
     created_unix: i64,
     redrive_policy: ?[]const u8 = null,
     policy: ?[]const u8 = null,
+    is_fifo: bool = false,
+    content_based_dedup: bool = false,
+    sequence_counter: u128 = 0,
 };
 
 fn writeQueueAttrs(self: *Fs, slot: *const storage.SqsQueueSlot) !void {
@@ -5448,6 +5451,9 @@ fn writeQueueAttrs(self: *Fs, slot: *const storage.SqsQueueSlot) !void {
         .created_unix = slot.created_unix,
         .redrive_policy = slot.attrs.redrive_policy,
         .policy = slot.attrs.policy,
+        .is_fifo = slot.attrs.is_fifo,
+        .content_based_dedup = slot.attrs.content_based_dedup,
+        .sequence_counter = slot.attrs.sequence_counter,
     };
 
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
@@ -5507,6 +5513,9 @@ fn loadSingleQueue(self: *Fs, name: []const u8) !void {
             .maximum_message_size = doc.maximum_message_size,
             .redrive_policy = if (doc.redrive_policy) |s| try self.allocator.dupe(u8, s) else null,
             .policy = if (doc.policy) |s| try self.allocator.dupe(u8, s) else null,
+            .is_fifo = doc.is_fifo,
+            .content_based_dedup = doc.content_based_dedup,
+            .sequence_counter = doc.sequence_counter,
         },
     };
 
@@ -5518,6 +5527,23 @@ fn loadSingleQueue(self: *Fs, name: []const u8) !void {
 pub fn sqsCreateQueue(self: *Fs, in: storage.CreateQueueInput) storage.Error!*const storage.SqsQueueSlot {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
+
+    // FIFO reconciliation: the `.fifo` name suffix and the `FifoQueue`
+    // attribute must agree. AWS-exact: a non-`.fifo` name with
+    // FifoQueue=true → InvalidAttributeValue; a `.fifo` name with
+    // FifoQueue=false → InvalidAttributeValue. If the attribute is
+    // omitted, we derive it from the name.
+    const name_is_fifo = sqs_state_mod.hasFifoSuffix(in.name);
+    if (in.attrs.is_fifo and !name_is_fifo) return storage.Error.InvalidAttributeValue;
+    if (name_is_fifo and !in.attrs.is_fifo and in.fifo_attribute_specified)
+        return storage.Error.InvalidAttributeValue;
+    const effective_fifo = name_is_fifo;
+    // ContentBasedDeduplication is FIFO-only — reject on Standard.
+    if (in.attrs.content_based_dedup and !effective_fifo)
+        return storage.Error.InvalidAttributeValue;
+    // FIFO queues forbid per-queue DelaySeconds > 0.
+    if (effective_fifo and in.attrs.delay_seconds > 0)
+        return storage.Error.InvalidAttributeValue;
 
     if (self.sqs_queues.get(in.name)) |existing| {
         // AWS idempotency: CreateQueue with the same name + matching
@@ -5543,6 +5569,9 @@ pub fn sqsCreateQueue(self: *Fs, in: storage.CreateQueueInput) storage.Error!*co
             .maximum_message_size = in.attrs.maximum_message_size,
             .redrive_policy = if (in.attrs.redrive_policy) |s| (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory) else null,
             .policy = if (in.attrs.policy) |s| (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory) else null,
+            .is_fifo = effective_fifo,
+            .content_based_dedup = in.attrs.content_based_dedup,
+            .sequence_counter = 0,
         },
     };
     writeQueueAttrs(self, slot_ptr) catch return storage.Error.Io;
@@ -5581,6 +5610,17 @@ pub fn sqsSetQueueAttributes(self: *Fs, in: storage.SetQueueAttributesInput) sto
     defer self.mutex.unlock(self.io);
 
     const slot = self.sqs_queues.get(in.name) orelse return storage.Error.QueueNotFound;
+    // FifoQueue is immutable post-creation. Reject any attempt to set
+    // it (even to the current value) — AWS-exact.
+    if (in.attrs.fifo_attribute_specified) return storage.Error.InvalidAttributeValue;
+    // ContentBasedDeduplication is FIFO-only.
+    if (in.attrs.content_based_dedup != null and !slot.attrs.is_fifo)
+        return storage.Error.InvalidAttributeValue;
+    // FIFO queues forbid DelaySeconds > 0.
+    if (in.attrs.delay_seconds) |v| {
+        if (slot.attrs.is_fifo and v > 0) return storage.Error.InvalidAttributeValue;
+    }
+
     if (in.attrs.visibility_timeout) |v| slot.attrs.visibility_timeout = v;
     if (in.attrs.delay_seconds) |v| slot.attrs.delay_seconds = v;
     if (in.attrs.receive_message_wait_time_seconds) |v| slot.attrs.receive_message_wait_time_seconds = v;
@@ -5600,6 +5640,7 @@ pub fn sqsSetQueueAttributes(self: *Fs, in: storage.SetQueueAttributesInput) sto
         else
             null;
     }
+    if (in.attrs.content_based_dedup) |v| slot.attrs.content_based_dedup = v;
     writeQueueAttrs(self, slot) catch return storage.Error.Io;
 }
 
@@ -5753,6 +5794,9 @@ const MessageDoc = struct {
     receive_count: u32,
     md5_of_body: []const u8,
     raw_attributes_json: ?[]const u8 = null,
+    message_group_id: ?[]const u8 = null,
+    message_deduplication_id: ?[]const u8 = null,
+    sequence_number: u128 = 0,
 };
 
 fn writeMessageJson(self: *Fs, queue_name: []const u8, m: *const storage.Message) !void {
@@ -5768,6 +5812,9 @@ fn writeMessageJson(self: *Fs, queue_name: []const u8, m: *const storage.Message
         .receive_count = m.receive_count,
         .md5_of_body = &m.md5_of_body,
         .raw_attributes_json = m.raw_attributes_json,
+        .message_group_id = m.message_group_id,
+        .message_deduplication_id = m.message_deduplication_id,
+        .sequence_number = m.sequence_number,
     };
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
     defer aw.deinit();

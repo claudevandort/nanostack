@@ -23,6 +23,10 @@ pub const ParseError = error{
 pub const CreateQueueRequest = struct {
     queue_name: []const u8,
     attrs: storage.QueueAttributes,
+    /// Set when the client included a `FifoQueue` attribute (regardless
+    /// of its value). The storage layer uses this to decide between
+    /// "derive from name suffix" and "reject mismatch".
+    fifo_attribute_specified: bool = false,
 };
 
 pub fn parseCreateQueue(allocator: Allocator, body: []const u8) ParseError!CreateQueueRequest {
@@ -38,17 +42,18 @@ pub fn parseCreateQueue(allocator: Allocator, body: []const u8) ParseError!Creat
     const name = try allocator.dupe(u8, name_v.string);
 
     var attrs: storage.QueueAttributes = .{};
+    var fifo_specified = false;
     if (root.get("Attributes")) |attrs_v| {
         if (attrs_v != .object) return ParseError.Malformed;
-        try applyAttributes(allocator, attrs_v.object, &attrs);
+        try applyAttributes(allocator, attrs_v.object, &attrs, &fifo_specified);
     }
-    return .{ .queue_name = name, .attrs = attrs };
+    return .{ .queue_name = name, .attrs = attrs, .fifo_attribute_specified = fifo_specified };
 }
 
 /// Apply a JSON object of `Attributes` onto a `QueueAttributes` value.
 /// Used by both CreateQueue and SetQueueAttributes. Each known key is
 /// parsed; unknown keys are silently dropped (matches AWS).
-fn applyAttributes(allocator: Allocator, obj: std.json.ObjectMap, attrs: *storage.QueueAttributes) ParseError!void {
+fn applyAttributes(allocator: Allocator, obj: std.json.ObjectMap, attrs: *storage.QueueAttributes, fifo_specified: *bool) ParseError!void {
     if (obj.get("VisibilityTimeout")) |v| attrs.visibility_timeout = try parseU32(v, 0, 43200);
     if (obj.get("DelaySeconds")) |v| attrs.delay_seconds = try parseU32(v, 0, 900);
     if (obj.get("ReceiveMessageWaitTimeSeconds")) |v| attrs.receive_message_wait_time_seconds = try parseU32(v, 0, 20);
@@ -64,6 +69,25 @@ fn applyAttributes(allocator: Allocator, obj: std.json.ObjectMap, attrs: *storag
         if (attrs.policy) |old| allocator.free(old);
         attrs.policy = try allocator.dupe(u8, v.string);
     }
+    if (obj.get("FifoQueue")) |v| {
+        attrs.is_fifo = try parseBool(v);
+        fifo_specified.* = true;
+    }
+    if (obj.get("ContentBasedDeduplication")) |v| {
+        attrs.content_based_dedup = try parseBool(v);
+    }
+}
+
+fn parseBool(v: std.json.Value) ParseError!bool {
+    return switch (v) {
+        .bool => |b| b,
+        .string => |s| blk: {
+            if (std.ascii.eqlIgnoreCase(s, "true")) break :blk true;
+            if (std.ascii.eqlIgnoreCase(s, "false")) break :blk false;
+            return ParseError.InvalidAttribute;
+        },
+        else => ParseError.InvalidAttribute,
+    };
 }
 
 /// Attribute values arrive as JSON strings (AWS-real wire) OR integers
@@ -265,6 +289,18 @@ pub fn renderGetQueueAttributes(
         try s.objectField("CreatedTimestamp");
         try writeI64Stringy(&s, created_unix);
     }
+    if (attrs.is_fifo) {
+        // AWS only emits these on FIFO queues — Standard queues omit
+        // them entirely.
+        if (requestedHas(requested, "All") or requested.len == 0 or requestedHas(requested, "FifoQueue")) {
+            try s.objectField("FifoQueue");
+            try s.write("true");
+        }
+        if (requestedHas(requested, "All") or requested.len == 0 or requestedHas(requested, "ContentBasedDeduplication")) {
+            try s.objectField("ContentBasedDeduplication");
+            try s.write(if (attrs.content_based_dedup) "true" else "false");
+        }
+    }
     try s.endObject();
     try s.endObject();
     return aw.toOwnedSlice();
@@ -321,6 +357,14 @@ pub fn parseSetQueueAttributes(allocator: Allocator, body: []const u8) ParseErro
     if (attrs_v.object.get("Policy")) |v| {
         if (v != .string) return ParseError.InvalidAttribute;
         partial.policy = try allocator.dupe(u8, v.string);
+    }
+    if (attrs_v.object.get("FifoQueue")) |_| {
+        // FifoQueue is immutable post-creation. Surface the attempt so
+        // the storage layer can return InvalidAttributeValue.
+        partial.fifo_attribute_specified = true;
+    }
+    if (attrs_v.object.get("ContentBasedDeduplication")) |v| {
+        partial.content_based_dedup = try parseBool(v);
     }
     return .{ .queue_name = name, .attrs = partial };
 }

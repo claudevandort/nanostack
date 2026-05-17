@@ -220,6 +220,9 @@ fn mapStorageErr(e: storage.Error) ErrorBody {
         storage.Error.InvalidReceiptHandle => .{ .code = .receipt_handle_is_invalid },
         storage.Error.InvalidMessageBody => .{ .code = .invalid_message_contents },
         storage.Error.MessageNotFound => .{ .code = .receipt_handle_is_invalid },
+        storage.Error.InvalidParameterValue => .{ .code = .invalid_parameter_value },
+        storage.Error.MissingParameter => .{ .code = .missing_parameter },
+        storage.Error.InvalidAttributeValue => .{ .code = .invalid_attribute_value },
         storage.Error.OutOfMemory, storage.Error.Io => .{ .code = .internal_server_error },
         else => .{ .code = .internal_server_error },
     };

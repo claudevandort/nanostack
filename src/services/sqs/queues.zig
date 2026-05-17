@@ -21,6 +21,7 @@ pub fn createQueue(ctx: Context) Result {
     const slot = ctx.backend.createQueue(.{
         .name = req.queue_name,
         .attrs = req.attrs,
+        .fifo_attribute_specified = req.fifo_attribute_specified,
     }) catch |err| return .{ .err = mapStorageErr(err) };
 
     const body = wire.renderQueueUrl(ctx.allocator, ctx.base_url, ctx.account_id, slot.name) catch
@@ -112,7 +113,9 @@ fn mapStorageErr(e: storage.Error) ErrorBody {
         storage.Error.QueueAlreadyExists => .{ .code = .queue_name_exists },
         storage.Error.QueueDeletedRecently => .{ .code = .queue_deleted_recently },
         storage.Error.InvalidQueueName => .{ .code = .invalid_parameter_value, .message = "Queue name is invalid." },
-        storage.Error.InvalidAttributeValue => .{ .code = .invalid_parameter_value, .message = "An attribute value is invalid." },
+        storage.Error.InvalidAttributeValue => .{ .code = .invalid_attribute_value, .message = "An attribute value is invalid." },
+        storage.Error.InvalidParameterValue => .{ .code = .invalid_parameter_value },
+        storage.Error.MissingParameter => .{ .code = .missing_parameter },
         storage.Error.OutOfMemory => .{ .code = .internal_server_error },
         storage.Error.Io => .{ .code = .internal_server_error },
         else => .{ .code = .internal_server_error },

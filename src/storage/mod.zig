@@ -56,6 +56,9 @@ pub const Error = error{
     QueueDeletedRecently,
     InvalidAttributeValue,
     TooManyEntries,
+    // SQS FIFO (v0.3.1).
+    InvalidParameterValue,
+    MissingParameter,
     Io,
     OutOfMemory,
 };
@@ -1793,6 +1796,11 @@ pub const CreateQueueInput = struct {
     name: []const u8,
     attrs: QueueAttributes = .{},
     tags: []const Tag = &.{},
+    /// Whether the client explicitly passed the `FifoQueue` attribute.
+    /// Used by the FIFO reconciliation rule: `.fifo` name + omitted
+    /// attribute is fine (we derive `is_fifo=true`), but `.fifo` name +
+    /// `FifoQueue=false` is an error.
+    fifo_attribute_specified: bool = false,
 };
 
 pub const QueueUrlInput = struct {
@@ -1827,6 +1835,13 @@ pub const PartialAttributes = struct {
     /// `null` = leave as-is. To clear, pass empty string.
     redrive_policy: ?[]const u8 = null,
     policy: ?[]const u8 = null,
+    /// FIFO-only. `null` = leave as-is. Trying to mutate this on an
+    /// existing FIFO queue is rejected (AWS-exact).
+    content_based_dedup: ?bool = null,
+    /// `FifoQueue` cannot be mutated post-creation. We surface a
+    /// dedicated flag so the SetQueueAttributes parser can detect the
+    /// attribute and reject it.
+    fifo_attribute_specified: bool = false,
 };
 
 pub const SendMessageInput = struct {

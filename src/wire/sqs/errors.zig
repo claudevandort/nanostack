@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Code = enum {
     invalid_parameter_value,
+    missing_parameter,
     queue_does_not_exist,
     queue_name_exists,
     queue_deleted_recently,
@@ -19,12 +20,14 @@ pub const Code = enum {
     too_many_entries_in_batch_request,
     batch_entry_ids_not_distinct,
     empty_batch_request,
+    invalid_attribute_value,
     not_implemented,
     internal_server_error,
 
     pub fn awsCode(self: Code) []const u8 {
         return switch (self) {
             .invalid_parameter_value => "InvalidParameterValue",
+            .missing_parameter => "MissingParameter",
             .queue_does_not_exist => "AWS.SimpleQueueService.NonExistentQueue",
             .queue_name_exists => "AWS.SimpleQueueService.QueueNameExists",
             .queue_deleted_recently => "AWS.SimpleQueueService.QueueDeletedRecently",
@@ -33,6 +36,7 @@ pub const Code = enum {
             .too_many_entries_in_batch_request => "AWS.SimpleQueueService.TooManyEntriesInBatchRequest",
             .batch_entry_ids_not_distinct => "AWS.SimpleQueueService.BatchEntryIdsNotDistinct",
             .empty_batch_request => "AWS.SimpleQueueService.EmptyBatchRequest",
+            .invalid_attribute_value => "InvalidAttributeValue",
             .not_implemented => "InternalFailure",
             .internal_server_error => "InternalFailure",
         };
@@ -41,6 +45,7 @@ pub const Code = enum {
     pub fn defaultMessage(self: Code) []const u8 {
         return switch (self) {
             .invalid_parameter_value => "The request contains an invalid parameter value.",
+            .missing_parameter => "The request is missing a required parameter.",
             .queue_does_not_exist => "The specified queue does not exist.",
             .queue_name_exists => "A queue with this name already exists.",
             .queue_deleted_recently => "You must wait 60 seconds after deleting a queue before you can create another with the same name.",
@@ -49,6 +54,7 @@ pub const Code = enum {
             .too_many_entries_in_batch_request => "The batch request contains more entries than permissible (10).",
             .batch_entry_ids_not_distinct => "Two or more batch entries have the same Id.",
             .empty_batch_request => "The batch request doesn't contain any entries.",
+            .invalid_attribute_value => "The specified attribute value is invalid.",
             .not_implemented => "This operation is not implemented in nanostack.",
             .internal_server_error => "An error occurred on the server side.",
         };
