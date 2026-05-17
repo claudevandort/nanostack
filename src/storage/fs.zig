@@ -798,6 +798,10 @@ const dynamo_vtable: storage.DynamoBackend.VTable = .{
     .query = vtDdbQuery,
     .transactGetItems = vtDdbTransactGet,
     .transactWriteItems = vtDdbTransactWrite,
+    .listStreams = vtDdbListStreams,
+    .describeStream = vtDdbDescribeStream,
+    .getShardIterator = vtDdbGetShardIterator,
+    .getRecords = vtDdbGetRecords,
 };
 
 fn vtDdbListTables(ctx: *anyopaque, allocator: Allocator) storage.Error![]const []const u8 {
@@ -835,6 +839,18 @@ fn vtDdbTransactGet(ctx: *anyopaque, allocator: Allocator, ops: []const storage.
 }
 fn vtDdbTransactWrite(ctx: *anyopaque, allocator: Allocator, ops: []const storage.TxWriteOp, reasons_out: *[]?[]const u8) storage.Error!void {
     return ddbTransactWrite(@ptrCast(@alignCast(ctx)), allocator, ops, reasons_out);
+}
+fn vtDdbListStreams(ctx: *anyopaque, allocator: Allocator, in: storage.ListStreamsInput) storage.Error!storage.ListStreamsOutput {
+    return ddbListStreams(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtDdbDescribeStream(ctx: *anyopaque, allocator: Allocator, in: storage.DescribeStreamInput) storage.Error!storage.DescribeStreamOutput {
+    return ddbDescribeStream(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtDdbGetShardIterator(ctx: *anyopaque, allocator: Allocator, in: storage.GetShardIteratorInput) storage.Error![]const u8 {
+    return ddbGetShardIterator(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtDdbGetRecords(ctx: *anyopaque, allocator: Allocator, in: storage.GetRecordsInput) storage.Error!storage.GetRecordsOutput {
+    return ddbGetRecords(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 
 // ---------------------------------------------------------------------------
@@ -3160,6 +3176,12 @@ const SchemaDoc = struct {
     local_secondary_indexes: []const IndexDoc,
     tags: []const TagDoc,
     created_unix: i64,
+    /// Streams config. `stream_enabled = null` ⇔ never configured.
+    /// `stream_enabled_unix` is non-null whenever a spec has ever been
+    /// applied (used to derive LatestStreamLabel / ARN).
+    stream_enabled: ?bool = null,
+    stream_view_type: ?[]const u8 = null,
+    stream_enabled_unix: ?i64 = null,
 };
 const KeyAttrDoc = struct { name: []const u8, key_type: []const u8 };
 const AttributeDefDoc = struct { name: []const u8, type: []const u8 };
@@ -3230,6 +3252,9 @@ fn slotToDoc(allocator: Allocator, slot: *const storage.TableSlot) !SchemaDoc {
         .local_secondary_indexes = lsi_doc,
         .tags = tags_doc,
         .created_unix = slot.created_unix,
+        .stream_enabled = if (slot.stream_spec) |sp| sp.enabled else null,
+        .stream_view_type = if (slot.stream_spec) |sp| sp.view_type.toAws() else null,
+        .stream_enabled_unix = slot.stream_enabled_unix,
     };
 }
 
@@ -3292,6 +3317,12 @@ fn loadSingleTable(self: *Fs, name: []const u8) !void {
     const slot = try docToSlot(self.allocator, doc);
     const slot_ptr = try self.allocator.create(storage.TableSlot);
     slot_ptr.* = slot;
+
+    // Streams: spec persists, records do not. If the spec is enabled,
+    // attach a fresh (empty) ring buffer.
+    if (slot_ptr.stream_spec) |spec| if (spec.enabled) {
+        attachStream(self, slot_ptr) catch {};
+    };
 
     // Map key shares ownership with slot.name.
     try self.dynamo_tables.put(self.allocator, slot_ptr.name, slot_ptr);
@@ -3413,6 +3444,14 @@ fn docToSlot(allocator: Allocator, doc: SchemaDoc) !storage.TableSlot {
         };
     }
 
+    const stream_spec: ?ddb.dynamo_state.StreamSpecification = if (doc.stream_enabled) |enabled| .{
+        .enabled = enabled,
+        .view_type = if (doc.stream_view_type) |vt|
+            ddb.dynamo_state.StreamViewType.fromAws(vt) orelse .new_and_old_images
+        else
+            .new_and_old_images,
+    } else null;
+
     return .{
         .name = name,
         .key_schema = ks,
@@ -3421,6 +3460,8 @@ fn docToSlot(allocator: Allocator, doc: SchemaDoc) !storage.TableSlot {
         .global_secondary_indexes = gsis,
         .local_secondary_indexes = lsis,
         .tags = tags,
+        .stream_spec = stream_spec,
+        .stream_enabled_unix = doc.stream_enabled_unix,
         .created_unix = doc.created_unix,
     };
 }
@@ -3487,6 +3528,15 @@ pub fn ddbCreateTable(self: *Fs, in: storage.CreateTableInput) storage.Error!voi
     };
     slot_ptr.* = slot;
 
+    // If streams were enabled at create, allocate the in-memory ring.
+    if (slot_ptr.stream_spec) |spec| if (spec.enabled) {
+        attachStream(self, slot_ptr) catch {
+            slot_ptr.deinit(self.allocator);
+            self.allocator.destroy(slot_ptr);
+            return storage.Error.OutOfMemory;
+        };
+    };
+
     writeSchemaJson(self, slot_ptr) catch {
         slot_ptr.deinit(self.allocator);
         self.allocator.destroy(slot_ptr);
@@ -3498,6 +3548,25 @@ pub fn ddbCreateTable(self: *Fs, in: storage.CreateTableInput) storage.Error!voi
         // next startup will load it via loadDynamoTables. Surface OOM.
         return storage.Error.OutOfMemory;
     };
+}
+
+/// Allocate + attach a Stream to a slot. Caller must guarantee
+/// `slot.stream_spec.?.enabled and slot.stream_enabled_unix != null`.
+/// Tears down any prior stream on the same slot.
+fn attachStream(self: *Fs, slot: *storage.TableSlot) !void {
+    if (slot.stream) |old| {
+        old.deinit();
+        self.allocator.destroy(old);
+        slot.stream = null;
+    }
+    const enable_unix = slot.stream_enabled_unix orelse return;
+    const view_type = slot.stream_spec.?.view_type;
+    const shard_id = try storage.dynamo_streams.formatShardId(self.allocator, enable_unix);
+    defer self.allocator.free(shard_id);
+    const stream_ptr = try self.allocator.create(storage.Stream);
+    errdefer self.allocator.destroy(stream_ptr);
+    stream_ptr.* = try storage.Stream.init(self.allocator, view_type, shard_id);
+    slot.stream = stream_ptr;
 }
 
 fn cloneTableSlot(allocator: Allocator, in: storage.CreateTableInput, created_unix: i64) !storage.TableSlot {
@@ -3545,6 +3614,8 @@ fn cloneTableSlot(allocator: Allocator, in: storage.CreateTableInput, created_un
         .global_secondary_indexes = gsis,
         .local_secondary_indexes = lsis,
         .tags = tags,
+        .stream_spec = in.stream_spec,
+        .stream_enabled_unix = if (in.stream_spec) |sp| (if (sp.enabled) created_unix else null) else null,
         .created_unix = created_unix,
     };
 }
@@ -3593,6 +3664,22 @@ pub fn ddbUpdateTable(self: *Fs, in: storage.UpdateTableInput) storage.Error!*co
 
     const slot = self.dynamo_tables.get(in.name) orelse return storage.Error.TableNotFound;
     if (in.billing_mode) |bm| slot.billing_mode = bm;
+    if (in.stream_spec) |sp| {
+        slot.stream_spec = sp;
+        // Re-stamp the enable timestamp on any enable→enable or
+        // disable→enable transition so the LatestStreamLabel matches
+        // observed AWS behaviour. Disable leaves the prior timestamp
+        // in place — AWS keeps the label around until streams are
+        // re-enabled.
+        if (sp.enabled) {
+            slot.stream_enabled_unix = nowUnixSeconds(self.io);
+            attachStream(self, slot) catch return storage.Error.OutOfMemory;
+        } else if (slot.stream) |old| {
+            old.deinit();
+            self.allocator.destroy(old);
+            slot.stream = null;
+        }
+    }
     writeSchemaJson(self, slot) catch return storage.Error.Io;
     return slot;
 }
@@ -3606,6 +3693,7 @@ pub fn ddbUpdateTable(self: *Fs, in: storage.UpdateTableInput) storage.Error!*co
 // the dir flat.
 
 const ddb_attr = @import("../wire/dynamodb/attribute_value.zig");
+const wire_tables = @import("../wire/dynamodb/tables.zig");
 
 fn itemKeyHash(key: []const u8) [64]u8 {
     var sha = std.crypto.hash.sha2.Sha256.init(.{});
@@ -3646,61 +3734,7 @@ fn renderItem(s: *std.json.Stringify, allocator: Allocator, item: *const storage
 }
 
 fn cloneItem(allocator: Allocator, item: *const storage.Item) !storage.Item {
-    const names = try allocator.alloc([]const u8, item.names.len);
-    var names_done: usize = 0;
-    errdefer {
-        for (names[0..names_done]) |n| allocator.free(n);
-        allocator.free(names);
-    }
-    const values = try allocator.alloc(ddb_attr.AttributeValue, item.values.len);
-    var values_done: usize = 0;
-    errdefer {
-        for (values[0..values_done]) |*v| {
-            var copy = v.*;
-            ddb_attr.deinit(allocator, &copy);
-        }
-        allocator.free(values);
-    }
-    for (item.names, 0..) |n, i| {
-        names[i] = try allocator.dupe(u8, n);
-        names_done = i + 1;
-    }
-    for (item.values, 0..) |v, i| {
-        values[i] = try cloneAttributeValue(allocator, v);
-        values_done = i + 1;
-    }
-    return .{ .names = names, .values = values };
-}
-
-fn cloneAttributeValue(allocator: Allocator, v: ddb_attr.AttributeValue) !ddb_attr.AttributeValue {
-    return switch (v) {
-        .s => |s| .{ .s = try allocator.dupe(u8, s) },
-        .n => |s| .{ .n = try allocator.dupe(u8, s) },
-        .b => |bytes| .{ .b = try allocator.dupe(u8, bytes) },
-        .bool => |b| .{ .bool = b },
-        .null => .null,
-        .list => |items| blk: {
-            const out = try allocator.alloc(ddb_attr.AttributeValue, items.len);
-            for (items, 0..) |child, i| out[i] = try cloneAttributeValue(allocator, child);
-            break :blk .{ .list = out };
-        },
-        .map => |m| blk: {
-            const names = try allocator.alloc([]const u8, m.names.len);
-            for (m.names, 0..) |n, i| names[i] = try allocator.dupe(u8, n);
-            const values = try allocator.alloc(ddb_attr.AttributeValue, m.values.len);
-            for (m.values, 0..) |child, i| values[i] = try cloneAttributeValue(allocator, child);
-            break :blk .{ .map = .{ .names = names, .values = values } };
-        },
-        .ss => |elems| .{ .ss = try dupSlices(allocator, elems) },
-        .ns => |elems| .{ .ns = try dupSlices(allocator, elems) },
-        .bs => |elems| .{ .bs = try dupSlices(allocator, elems) },
-    };
-}
-
-fn dupSlices(allocator: Allocator, src: []const []const u8) ![]const []const u8 {
-    const out = try allocator.alloc([]const u8, src.len);
-    for (src, 0..) |s, i| out[i] = try allocator.dupe(u8, s);
-    return out;
+    return storage.dynamo_state.cloneItem(allocator, item);
 }
 
 pub fn ddbPutItem(self: *Fs, allocator: Allocator, in: storage.PutItemInput) storage.Error!storage.PutItemResult {
@@ -3721,10 +3755,12 @@ pub fn ddbPutItem(self: *Fs, allocator: Allocator, in: storage.PutItemInput) sto
     }
 
     var result: storage.PutItemResult = .{};
+    var had_existing = false;
 
     // If an item already exists at this key, surface it as old_item (using
     // the caller's allocator) and free the in-memory copy.
     if (slot.items.fetchRemove(key_str)) |existing| {
+        had_existing = true;
         result.old_item = cloneItem(allocator, existing.value) catch return storage.Error.OutOfMemory;
         self.allocator.free(existing.key);
         existing.value.deinit(self.allocator);
@@ -3745,7 +3781,29 @@ pub fn ddbPutItem(self: *Fs, allocator: Allocator, in: storage.PutItemInput) sto
     };
 
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
+
+    captureWrite(self, slot, if (had_existing) .modify else .insert, in.item, if (result.old_item) |*oi| oi else null, owned_ptr);
     return result;
+}
+
+/// Stream capture wrapper — no-op when the slot has no attached stream.
+/// `kind` is the AWS-flavoured INSERT / MODIFY / REMOVE; `key_src`
+/// supplies the keys (we project them down to the table's KeySchema);
+/// `old_item` / `new_item` are the pre-/post-images (either may be
+/// null for inserts / deletes respectively). The Stream itself decides
+/// what to keep based on view-type.
+fn captureWrite(
+    self: *Fs,
+    slot: *storage.TableSlot,
+    kind: storage.dynamo_streams.RecordKind,
+    key_src: *const storage.Item,
+    old_item: ?*const storage.Item,
+    new_item: ?*const storage.Item,
+) void {
+    const stream = slot.stream orelse return;
+    var keys = storage.dynamo_state.projectKeys(self.allocator, slot, key_src) catch return;
+    defer keys.deinit(self.allocator);
+    _ = stream.capture(kind, &keys, new_item, old_item, nowUnixSeconds(self.io)) catch {};
 }
 
 pub fn ddbGetItem(self: *Fs, allocator: Allocator, in: storage.GetItemInput) storage.Error!storage.GetItemResult {
@@ -3790,6 +3848,8 @@ pub fn ddbDeleteItem(self: *Fs, allocator: Allocator, in: storage.DeleteItemInpu
     self.allocator.free(removed.key);
     removed.value.deinit(self.allocator);
     self.allocator.destroy(removed.value);
+
+    captureWrite(self, slot, .remove, in.key, &old, null);
     return .{ .old_item = old };
 }
 
@@ -3848,6 +3908,9 @@ pub fn ddbUpdateItem(self: *Fs, allocator: Allocator, in: storage.UpdateItemInpu
         self.allocator.destroy(old.value);
     }
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
+
+    const kind: storage.dynamo_streams.RecordKind = if (existing_ptr == null) .insert else .modify;
+    captureWrite(self, slot, kind, in.key, if (result.old_item) |*oi| oi else null, owned_ptr);
     return result;
 }
 
@@ -4026,11 +4089,18 @@ fn applyPutLocked(self: *Fs, slot: *storage.TableSlot, item: *const storage.Item
         return storage.Error.OutOfMemory;
     errdefer self.allocator.free(key_str);
 
+    // Snapshot the existing item before mutation so capture can carry
+    // it as old_image on a MODIFY.
+    var had_existing = false;
+    var old_snapshot: storage.Item = undefined;
     if (slot.items.fetchRemove(key_str)) |existing| {
+        had_existing = true;
+        old_snapshot = cloneItem(self.allocator, existing.value) catch return storage.Error.OutOfMemory;
         self.allocator.free(existing.key);
         existing.value.deinit(self.allocator);
         self.allocator.destroy(existing.value);
     }
+    defer if (had_existing) old_snapshot.deinit(self.allocator);
 
     const owned = cloneItem(self.allocator, item) catch return storage.Error.OutOfMemory;
     const owned_ptr = self.allocator.create(storage.Item) catch return storage.Error.OutOfMemory;
@@ -4040,6 +4110,8 @@ fn applyPutLocked(self: *Fs, slot: *storage.TableSlot, item: *const storage.Item
     writeItemJson(self, slot.name, &key_hash, owned_ptr) catch return storage.Error.Io;
 
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
+
+    captureWrite(self, slot, if (had_existing) .modify else .insert, item, if (had_existing) &old_snapshot else null, owned_ptr);
 }
 
 fn applyDeleteLocked(self: *Fs, slot: *storage.TableSlot, key_item: *const storage.Item) storage.Error!void {
@@ -4055,9 +4127,16 @@ fn applyDeleteLocked(self: *Fs, slot: *storage.TableSlot, key_item: *const stora
         error.FileNotFound => {},
         else => return storage.Error.Io,
     };
+
+    // Snapshot the removed item so capture can carry it as old_image.
+    var old_snapshot = cloneItem(self.allocator, removed.value) catch return storage.Error.OutOfMemory;
+    defer old_snapshot.deinit(self.allocator);
+
     self.allocator.free(removed.key);
     removed.value.deinit(self.allocator);
     self.allocator.destroy(removed.value);
+
+    captureWrite(self, slot, .remove, key_item, &old_snapshot, null);
 }
 
 fn applyUpdateLocked(
@@ -4078,6 +4157,15 @@ fn applyUpdateLocked(
     else
         cloneItem(allocator, key_item) catch return storage.Error.OutOfMemory;
 
+    // Snapshot the pre-image for capture.
+    var had_existing = false;
+    var old_snapshot: storage.Item = undefined;
+    if (existing_ptr) |ep| {
+        had_existing = true;
+        old_snapshot = cloneItem(self.allocator, ep) catch return storage.Error.OutOfMemory;
+    }
+    defer if (had_existing) old_snapshot.deinit(self.allocator);
+
     if (!apply_fn(apply_ctx, &working)) return storage.Error.TransactionCanceled;
 
     const owned = cloneItem(self.allocator, &working) catch return storage.Error.OutOfMemory;
@@ -4093,6 +4181,315 @@ fn applyUpdateLocked(
         self.allocator.destroy(old.value);
     }
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
+
+    captureWrite(self, slot, if (had_existing) .modify else .insert, key_item, if (had_existing) &old_snapshot else null, owned_ptr);
+}
+
+// ---------------------------------------------------------------------------
+// DynamoDB Streams sub-service (v0.2.2)
+
+/// Compute the ARN for a stream-enabled slot. Caller owns the returned
+/// slice via the supplied allocator.
+fn streamArn(allocator: Allocator, region: []const u8, table_name: []const u8, label: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "arn:aws:dynamodb:{s}:000000000000:table/{s}/stream/{s}", .{ region, table_name, label });
+}
+
+/// Extract a `(table_name, label)` pair from a stream ARN. Returns
+/// `InvalidStreamArn` on any malformed input.
+fn parseStreamArn(arn: []const u8) storage.Error!struct { table: []const u8, label: []const u8 } {
+    const prefix = "arn:aws:dynamodb:";
+    if (!std.mem.startsWith(u8, arn, prefix)) return storage.Error.InvalidStreamArn;
+    // skip "<region>:<account>:" → land at "table/..."
+    var i = prefix.len;
+    var colons: u8 = 0;
+    while (i < arn.len and colons < 2) : (i += 1) {
+        if (arn[i] == ':') colons += 1;
+    }
+    if (colons != 2) return storage.Error.InvalidStreamArn;
+    // arn[i..] should be `table/<name>/stream/<label>`
+    const tail = arn[i..];
+    const table_kw = "table/";
+    if (!std.mem.startsWith(u8, tail, table_kw)) return storage.Error.InvalidStreamArn;
+    const after_table = tail[table_kw.len..];
+    const slash_idx = std.mem.indexOfScalar(u8, after_table, '/') orelse return storage.Error.InvalidStreamArn;
+    const table_name = after_table[0..slash_idx];
+    const after_name = after_table[slash_idx + 1 ..];
+    const stream_kw = "stream/";
+    if (!std.mem.startsWith(u8, after_name, stream_kw)) return storage.Error.InvalidStreamArn;
+    const label = after_name[stream_kw.len..];
+    if (table_name.len == 0 or label.len == 0) return storage.Error.InvalidStreamArn;
+    return .{ .table = table_name, .label = label };
+}
+
+pub fn ddbListStreams(self: *Fs, allocator: Allocator, in: storage.ListStreamsInput) storage.Error!storage.ListStreamsOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    var summaries: std.ArrayList(storage.StreamSummary) = .empty;
+    errdefer {
+        for (summaries.items) |s| {
+            allocator.free(s.arn);
+            allocator.free(s.table_name);
+            allocator.free(s.label);
+        }
+        summaries.deinit(allocator);
+    }
+
+    var it = self.dynamo_tables.iterator();
+    while (it.next()) |entry| {
+        const slot = entry.value_ptr.*;
+        if (in.table_name) |filter| if (!std.mem.eql(u8, slot.name, filter)) continue;
+        const spec = slot.stream_spec orelse continue;
+        if (!spec.enabled) continue;
+        const enable_unix = slot.stream_enabled_unix orelse continue;
+
+        var label_buf: [32]u8 = undefined;
+        const label_slice = wire_tables.formatStreamLabel(enable_unix, &label_buf) catch
+            return storage.Error.OutOfMemory;
+        const label = try allocator.dupe(u8, label_slice);
+        errdefer allocator.free(label);
+        const arn = try streamArn(allocator, in.region, slot.name, label);
+        errdefer allocator.free(arn);
+        const table_name = try allocator.dupe(u8, slot.name);
+        errdefer allocator.free(table_name);
+
+        try summaries.append(allocator, .{ .arn = arn, .table_name = table_name, .label = label });
+    }
+
+    // Sort by ARN for stable pagination.
+    std.mem.sort(storage.StreamSummary, summaries.items, {}, struct {
+        fn lt(_: void, a: storage.StreamSummary, b: storage.StreamSummary) bool {
+            return std.mem.lessThan(u8, a.arn, b.arn);
+        }
+    }.lt);
+
+    var start: usize = 0;
+    if (in.exclusive_start_stream_arn) |cursor| {
+        for (summaries.items, 0..) |s, idx| {
+            if (std.mem.eql(u8, s.arn, cursor)) {
+                start = idx + 1;
+                break;
+            }
+        }
+    }
+    const end = @min(start + in.limit, summaries.items.len);
+
+    // Slice into the page; free the items outside the page.
+    const owned_slice = summaries.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory;
+    // Free trailing items.
+    if (end < owned_slice.len) {
+        for (owned_slice[end..]) |s| {
+            allocator.free(s.arn);
+            allocator.free(s.table_name);
+            allocator.free(s.label);
+        }
+    }
+    // Free leading items (before the cursor).
+    for (owned_slice[0..start]) |s| {
+        allocator.free(s.arn);
+        allocator.free(s.table_name);
+        allocator.free(s.label);
+    }
+    // Build the page as a fresh slice referencing the kept items.
+    const page = allocator.alloc(storage.StreamSummary, end - start) catch return storage.Error.OutOfMemory;
+    for (owned_slice[start..end], 0..) |s, i| page[i] = s;
+    const next_arn: ?[]const u8 = if (end < owned_slice.len)
+        // Last item in the page IS the LastEvaluatedStreamArn cursor.
+        try allocator.dupe(u8, page[page.len - 1].arn)
+    else
+        null;
+    allocator.free(owned_slice);
+    return .{ .streams = page, .last_evaluated_stream_arn = next_arn };
+}
+
+pub fn ddbDescribeStream(self: *Fs, allocator: Allocator, in: storage.DescribeStreamInput) storage.Error!storage.DescribeStreamOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const parts = try parseStreamArn(in.arn);
+    const slot = self.dynamo_tables.get(parts.table) orelse return storage.Error.StreamNotFound;
+    const spec = slot.stream_spec orelse return storage.Error.StreamNotFound;
+    const enable_unix = slot.stream_enabled_unix orelse return storage.Error.StreamNotFound;
+
+    var label_buf: [32]u8 = undefined;
+    const current_label = wire_tables.formatStreamLabel(enable_unix, &label_buf) catch
+        return storage.Error.OutOfMemory;
+    if (!std.mem.eql(u8, current_label, parts.label)) return storage.Error.StreamNotFound;
+
+    const stream = slot.stream orelse return storage.Error.StreamNotFound;
+
+    // Build shard description. We always have exactly one open shard.
+    var shards: []storage.ShardDescription = try allocator.alloc(storage.ShardDescription, 1);
+    errdefer allocator.free(shards);
+    const start_seq = if (stream.records.items.len == 0)
+        try formatSeq(allocator, 0)
+    else
+        try formatSeq(allocator, stream.records.items[0].seq);
+    shards[0] = .{
+        .shard_id = try allocator.dupe(u8, stream.shard_id),
+        .starting_sequence_number = start_seq,
+        .ending_sequence_number = null, // open shard
+    };
+
+    // Clone the key schema.
+    const ks_out = try allocator.alloc(storage.dynamo_state.KeyAttribute, slot.key_schema.len);
+    for (slot.key_schema, 0..) |k, i| ks_out[i] = .{
+        .name = try allocator.dupe(u8, k.name),
+        .key_type = k.key_type,
+    };
+
+    return .{
+        .arn = try allocator.dupe(u8, in.arn),
+        .label = try allocator.dupe(u8, parts.label),
+        .status = if (spec.enabled) .enabled else .disabled,
+        .view_type = spec.view_type,
+        .creation_request_unix = enable_unix,
+        .table_name = try allocator.dupe(u8, slot.name),
+        .key_schema = ks_out,
+        .shards = shards,
+        .last_evaluated_shard_id = null,
+    };
+}
+
+/// Sequence numbers render as 21-digit zero-padded decimals to match
+/// AWS's observed format.
+fn formatSeq(allocator: Allocator, seq: u64) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{d:0>21}", .{seq});
+}
+
+pub fn ddbGetShardIterator(self: *Fs, allocator: Allocator, in: storage.GetShardIteratorInput) storage.Error![]const u8 {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const parts = try parseStreamArn(in.arn);
+    const slot = self.dynamo_tables.get(parts.table) orelse return storage.Error.StreamNotFound;
+    const stream = slot.stream orelse return storage.Error.StreamNotFound;
+    if (!std.mem.eql(u8, stream.shard_id, in.shard_id)) return storage.Error.ShardNotFound;
+
+    const seq_or_zero: u64 = if (in.sequence_number) |s|
+        std.fmt.parseInt(u64, s, 10) catch return storage.Error.InvalidShardIterator
+    else
+        0;
+
+    const pos: storage.dynamo_streams.Stream.Position = switch (in.iterator_type) {
+        .trim_horizon => .trim_horizon,
+        .latest => .{ .after_seq = stream.latestSeq() },
+        .at_sequence_number => .{ .at_seq = seq_or_zero },
+        .after_sequence_number => .{ .after_seq = seq_or_zero },
+    };
+
+    return try encodeIterator(allocator, in.arn, in.shard_id, pos);
+}
+
+pub fn ddbGetRecords(self: *Fs, allocator: Allocator, in: storage.GetRecordsInput) storage.Error!storage.GetRecordsOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const decoded = decodeIterator(allocator, in.shard_iterator) catch return storage.Error.InvalidShardIterator;
+    defer {
+        allocator.free(decoded.arn);
+        allocator.free(decoded.shard_id);
+    }
+    const parts = try parseStreamArn(decoded.arn);
+    const slot = self.dynamo_tables.get(parts.table) orelse return storage.Error.StreamNotFound;
+    const stream = slot.stream orelse return storage.Error.StreamNotFound;
+    if (!std.mem.eql(u8, stream.shard_id, decoded.shard_id)) return storage.Error.ShardNotFound;
+
+    var read_result = stream.read(allocator, decoded.position, in.limit) catch return storage.Error.OutOfMemory;
+    defer read_result.deinit(allocator);
+
+    var out_records: []storage.StreamRecordOut = try allocator.alloc(storage.StreamRecordOut, read_result.records.len);
+    var produced: usize = 0;
+    errdefer {
+        for (out_records[0..produced]) |*r| {
+            allocator.free(r.seq);
+            r.keys.deinit(allocator);
+            if (r.new_image) |*ni| ni.deinit(allocator);
+            if (r.old_image) |*oi| oi.deinit(allocator);
+        }
+        allocator.free(out_records);
+    }
+    for (read_result.records, 0..) |src, i| {
+        out_records[i] = .{
+            .seq = try formatSeq(allocator, src.seq),
+            .kind = src.kind,
+            .keys = try storage.dynamo_state.cloneItem(allocator, &src.keys),
+            .new_image = if (src.new_image) |ni| try storage.dynamo_state.cloneItem(allocator, &ni) else null,
+            .old_image = if (src.old_image) |oi| try storage.dynamo_state.cloneItem(allocator, &oi) else null,
+            .created_unix = src.created_unix,
+        };
+        produced = i + 1;
+    }
+
+    // Open shard → always a non-null next iterator.
+    const next_iter = encodeIterator(allocator, decoded.arn, decoded.shard_id, read_result.next_position) catch
+        return storage.Error.OutOfMemory;
+
+    return .{ .records = out_records, .next_shard_iterator = next_iter };
+}
+
+const IteratorBlob = struct {
+    arn: []const u8,
+    shard_id: []const u8,
+    position: storage.dynamo_streams.Stream.Position,
+};
+
+/// Encode + decode the opaque shard-iterator token as base64-url over a
+/// pipe-delimited string: `arn|shard|kind|seq`. `kind` ∈ {T,A,L,N}
+/// (T=trim_horizon, A=at_seq, N=after_seq; L=after-seq(0) is folded into N).
+fn encodeIterator(allocator: Allocator, arn: []const u8, shard_id: []const u8, pos: storage.dynamo_streams.Stream.Position) ![]const u8 {
+    var raw_buf: std.ArrayList(u8) = .empty;
+    defer raw_buf.deinit(allocator);
+    try raw_buf.appendSlice(allocator, arn);
+    try raw_buf.append(allocator, '|');
+    try raw_buf.appendSlice(allocator, shard_id);
+    try raw_buf.append(allocator, '|');
+    switch (pos) {
+        .trim_horizon => try raw_buf.appendSlice(allocator, "T|0"),
+        .at_seq => |s| {
+            const tail = try std.fmt.allocPrint(allocator, "A|{d}", .{s});
+            defer allocator.free(tail);
+            try raw_buf.appendSlice(allocator, tail);
+        },
+        .after_seq => |s| {
+            const tail = try std.fmt.allocPrint(allocator, "N|{d}", .{s});
+            defer allocator.free(tail);
+            try raw_buf.appendSlice(allocator, tail);
+        },
+    }
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const enc_len = enc.calcSize(raw_buf.items.len);
+    const out = try allocator.alloc(u8, enc_len);
+    _ = enc.encode(out, raw_buf.items);
+    return out;
+}
+
+fn decodeIterator(allocator: Allocator, token: []const u8) !IteratorBlob {
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const max_len = dec.calcSizeForSlice(token) catch return error.InvalidShardIterator;
+    const buf = try allocator.alloc(u8, max_len);
+    defer allocator.free(buf);
+    dec.decode(buf, token) catch return error.InvalidShardIterator;
+
+    var it = std.mem.splitScalar(u8, buf, '|');
+    const arn = it.next() orelse return error.InvalidShardIterator;
+    const shard = it.next() orelse return error.InvalidShardIterator;
+    const kind = it.next() orelse return error.InvalidShardIterator;
+    const seq_s = it.next() orelse return error.InvalidShardIterator;
+    if (kind.len != 1) return error.InvalidShardIterator;
+
+    const arn_owned = try allocator.dupe(u8, arn);
+    errdefer allocator.free(arn_owned);
+    const shard_owned = try allocator.dupe(u8, shard);
+    errdefer allocator.free(shard_owned);
+
+    const pos: storage.dynamo_streams.Stream.Position = switch (kind[0]) {
+        'T' => .trim_horizon,
+        'A' => .{ .at_seq = std.fmt.parseInt(u64, seq_s, 10) catch return error.InvalidShardIterator },
+        'N' => .{ .after_seq = std.fmt.parseInt(u64, seq_s, 10) catch return error.InvalidShardIterator },
+        else => return error.InvalidShardIterator,
+    };
+    return .{ .arn = arn_owned, .shard_id = shard_owned, .position = pos };
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const attribute_value = @import("../wire/dynamodb/attribute_value.zig");
+const dynamo_streams = @import("dynamo_streams.zig");
 pub const AttributeValue = attribute_value.AttributeValue;
+pub const Stream = dynamo_streams.Stream;
 
 pub const KeyType = enum {
     hash,
@@ -92,6 +94,39 @@ pub const BillingMode = enum {
     }
 };
 
+/// DynamoDB Streams view-type, controls what each StreamRecord carries.
+pub const StreamViewType = enum {
+    new_image,
+    old_image,
+    new_and_old_images,
+    keys_only,
+
+    pub fn toAws(self: StreamViewType) []const u8 {
+        return switch (self) {
+            .new_image => "NEW_IMAGE",
+            .old_image => "OLD_IMAGE",
+            .new_and_old_images => "NEW_AND_OLD_IMAGES",
+            .keys_only => "KEYS_ONLY",
+        };
+    }
+
+    pub fn fromAws(s: []const u8) ?StreamViewType {
+        if (std.mem.eql(u8, s, "NEW_IMAGE")) return .new_image;
+        if (std.mem.eql(u8, s, "OLD_IMAGE")) return .old_image;
+        if (std.mem.eql(u8, s, "NEW_AND_OLD_IMAGES")) return .new_and_old_images;
+        if (std.mem.eql(u8, s, "KEYS_ONLY")) return .keys_only;
+        return null;
+    }
+};
+
+/// StreamSpecification on a table. AWS allows `StreamEnabled=false` with
+/// or without a view-type; when `enabled=true` the view-type is required
+/// (default `NEW_AND_OLD_IMAGES`).
+pub const StreamSpecification = struct {
+    enabled: bool,
+    view_type: StreamViewType,
+};
+
 /// One entry in a `KeySchema` list. AWS keys are exactly 1 HASH or
 /// (1 HASH + 1 RANGE); the validator enforces that on Put.
 pub const KeyAttribute = struct {
@@ -152,6 +187,66 @@ pub const Item = struct {
     }
 };
 
+/// Deep-clone an `Item` into the given allocator. Companion to
+/// `Item.deinit` — every allocation here must have a matching free
+/// there.
+pub fn cloneItem(allocator: Allocator, src: *const Item) !Item {
+    const names = try allocator.alloc([]const u8, src.names.len);
+    var names_done: usize = 0;
+    errdefer {
+        for (names[0..names_done]) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    for (src.names, 0..) |n, i| {
+        names[i] = try allocator.dupe(u8, n);
+        names_done = i + 1;
+    }
+
+    const values = try allocator.alloc(AttributeValue, src.values.len);
+    var values_done: usize = 0;
+    errdefer {
+        for (values[0..values_done]) |*v| {
+            var copy = v.*;
+            attribute_value.deinit(allocator, &copy);
+        }
+        allocator.free(values);
+    }
+    for (src.values, 0..) |v, i| {
+        values[i] = try attribute_value.cloneValue(allocator, v);
+        values_done = i + 1;
+    }
+    return .{ .names = names, .values = values };
+}
+
+/// Project an Item down to only its key attributes (as defined by the
+/// table's KeySchema). The returned Item owns its slices via the given
+/// allocator; freeing is via `Item.deinit`.
+pub fn projectKeys(allocator: Allocator, slot: *const TableSlot, src: *const Item) !Item {
+    const names = try allocator.alloc([]const u8, slot.key_schema.len);
+    var names_done: usize = 0;
+    errdefer {
+        for (names[0..names_done]) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    const values = try allocator.alloc(AttributeValue, slot.key_schema.len);
+    var values_done: usize = 0;
+    errdefer {
+        for (values[0..values_done]) |*v| {
+            var copy = v.*;
+            attribute_value.deinit(allocator, &copy);
+        }
+        allocator.free(values);
+    }
+    for (slot.key_schema, 0..) |k, i| {
+        const src_v = src.attributeValue(k.name) orelse return error.MissingKey;
+        names[i] = try allocator.dupe(u8, k.name);
+        names_done = i + 1;
+        values[i] = try attribute_value.cloneValue(allocator, src_v.*);
+        values_done = i + 1;
+    }
+    return .{ .names = names, .values = values };
+}
+
 /// One DynamoDB table's persisted state. Strings + slices live in the
 /// `Fs.allocator` long-lived arena and are freed via `deinit`.
 pub const TableSlot = struct {
@@ -162,6 +257,17 @@ pub const TableSlot = struct {
     global_secondary_indexes: []const GsiDef = &.{},
     local_secondary_indexes: []const LsiDef = &.{},
     tags: []const Tag = &.{},
+    /// Streams config + the wall-clock time the spec was last set.
+    /// `stream_enabled_unix` is null when streams were never enabled;
+    /// non-null even after a disable so the latest label/ARN can still
+    /// be derived. DescribeTable only emits LatestStreamLabel / ARN
+    /// when `stream_spec != null and stream_spec.enabled`.
+    stream_spec: ?StreamSpecification = null,
+    stream_enabled_unix: ?i64 = null,
+    /// In-memory streams ring buffer. Allocated when streams are first
+    /// enabled; freed when disabled or the table is deleted. Records
+    /// are lost on restart (Phase 2 design — see dynamo_streams.zig).
+    stream: ?*Stream = null,
     created_unix: i64,
     /// In-memory item store, keyed on a stable composite "<pk>|<sk?>"
     /// string. Populated by ddbPutItem on every write and rebuilt on
@@ -183,6 +289,10 @@ pub const TableSlot = struct {
             allocator.free(t.value);
         }
         allocator.free(self.tags);
+        if (self.stream) |stream| {
+            stream.deinit();
+            allocator.destroy(stream);
+        }
         var it = self.items.iterator();
         while (it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
@@ -334,6 +444,15 @@ test "KeyType.fromAws / toAws round-trip" {
     try testing.expectEqual(KeyType.hash, KeyType.fromAws("HASH").?);
     try testing.expectEqual(KeyType.range, KeyType.fromAws("RANGE").?);
     try testing.expectEqual(@as(?KeyType, null), KeyType.fromAws("hash")); // case-sensitive
+}
+
+test "StreamViewType.fromAws / toAws round-trip" {
+    try testing.expectEqual(StreamViewType.new_image, StreamViewType.fromAws("NEW_IMAGE").?);
+    try testing.expectEqual(StreamViewType.old_image, StreamViewType.fromAws("OLD_IMAGE").?);
+    try testing.expectEqual(StreamViewType.new_and_old_images, StreamViewType.fromAws("NEW_AND_OLD_IMAGES").?);
+    try testing.expectEqual(StreamViewType.keys_only, StreamViewType.fromAws("KEYS_ONLY").?);
+    try testing.expectEqual(@as(?StreamViewType, null), StreamViewType.fromAws("OTHER"));
+    try testing.expectEqualStrings("NEW_AND_OLD_IMAGES", StreamViewType.new_and_old_images.toAws());
 }
 
 test "ProjectionType.fromAws" {

@@ -15,6 +15,7 @@ pub const ParseError = error{
     InvalidScalarType, // attribute type not S/N/B
     InvalidBillingMode,
     InvalidProjectionType,
+    InvalidStreamViewType,
     KeyReferencesUndeclaredAttribute,
     InvalidKeySchema, // wrong number of keys, missing HASH, etc.
     OutOfMemory,
@@ -31,6 +32,7 @@ pub const CreateTableRequest = struct {
     global_secondary_indexes: []const dynamo_state.GsiDef,
     local_secondary_indexes: []const dynamo_state.LsiDef,
     tags: []const dynamo_state.Tag,
+    stream_spec: ?dynamo_state.StreamSpecification = null,
 };
 
 /// Parse a CreateTable request body. All slices are allocated via the
@@ -92,6 +94,11 @@ pub fn parseCreateTable(allocator: Allocator, body: []const u8) ParseError!Creat
 
     const tags = if (root.get("Tags")) |t| try parseTags(allocator, t) else try allocator.alloc(dynamo_state.Tag, 0);
 
+    const stream_spec = if (root.get("StreamSpecification")) |sv|
+        try parseStreamSpecification(sv)
+    else
+        null;
+
     return .{
         .name = name,
         .key_schema = key_schema,
@@ -100,7 +107,29 @@ pub fn parseCreateTable(allocator: Allocator, body: []const u8) ParseError!Creat
         .global_secondary_indexes = gsis,
         .local_secondary_indexes = lsis,
         .tags = tags,
+        .stream_spec = stream_spec,
     };
+}
+
+/// Parse a `StreamSpecification` object. `StreamEnabled` is required.
+/// `StreamViewType` is required when enabled and defaults to
+/// `NEW_AND_OLD_IMAGES` when AWS would accept its absence; we require
+/// it explicitly to surface bad input early.
+fn parseStreamSpecification(v: std.json.Value) ParseError!dynamo_state.StreamSpecification {
+    if (v != .object) return ParseError.Malformed;
+    const enabled_v = v.object.get("StreamEnabled") orelse return ParseError.Malformed;
+    if (enabled_v != .bool) return ParseError.Malformed;
+    const enabled = enabled_v.bool;
+
+    if (!enabled) {
+        // Disabled: view-type doesn't matter; canonicalise to a placeholder.
+        return .{ .enabled = false, .view_type = .new_and_old_images };
+    }
+    const view_v = v.object.get("StreamViewType") orelse return ParseError.Malformed;
+    if (view_v != .string) return ParseError.Malformed;
+    const view_type = dynamo_state.StreamViewType.fromAws(view_v.string) orelse
+        return ParseError.InvalidStreamViewType;
+    return .{ .enabled = true, .view_type = view_type };
 }
 
 fn parseKeySchema(allocator: Allocator, v: std.json.Value) ParseError![]const dynamo_state.KeyAttribute {
@@ -215,6 +244,7 @@ fn parseTags(allocator: Allocator, v: std.json.Value) ParseError![]const dynamo_
 pub const UpdateTableRequest = struct {
     name: []const u8,
     billing_mode: ?dynamo_state.BillingMode = null,
+    stream_spec: ?dynamo_state.StreamSpecification = null,
 };
 
 pub fn parseUpdateTable(allocator: Allocator, body: []const u8) ParseError!UpdateTableRequest {
@@ -233,7 +263,13 @@ pub fn parseUpdateTable(allocator: Allocator, body: []const u8) ParseError!Updat
         if (bv != .string) return ParseError.InvalidBillingMode;
         billing_mode = dynamo_state.BillingMode.fromAws(bv.string) orelse return ParseError.InvalidBillingMode;
     }
-    return .{ .name = name, .billing_mode = billing_mode };
+
+    const stream_spec = if (root.get("StreamSpecification")) |sv|
+        try parseStreamSpecification(sv)
+    else
+        null;
+
+    return .{ .name = name, .billing_mode = billing_mode, .stream_spec = stream_spec };
 }
 
 // ---------------------------------------------------------------------------
@@ -297,11 +333,13 @@ pub fn renderListTables(
 
 /// Render a `{ "TableDescription": {...} }` body — used by CreateTable,
 /// DeleteTable, UpdateTable. Mirrors most of DescribeTable but wrapped
-/// in `TableDescription` instead of `Table`.
+/// in `TableDescription` instead of `Table`. `region` populates the
+/// stream ARN when streams are enabled.
 pub fn renderTableDescription(
     allocator: Allocator,
     slot: *const storage.TableSlot,
     wrapper_key: []const u8, // "Table" or "TableDescription"
+    region: []const u8,
 ) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -363,9 +401,51 @@ pub fn renderTableDescription(
         try s.endArray();
     }
 
+    if (slot.stream_spec) |spec| {
+        try s.objectField("StreamSpecification");
+        try s.beginObject();
+        try s.objectField("StreamEnabled");
+        try s.write(spec.enabled);
+        if (spec.enabled) {
+            try s.objectField("StreamViewType");
+            try s.write(spec.view_type.toAws());
+        }
+        try s.endObject();
+
+        if (spec.enabled) {
+            if (slot.stream_enabled_unix) |enabled_unix| {
+                var label_buf: [32]u8 = undefined;
+                const label = try formatStreamLabel(enabled_unix, &label_buf);
+                try s.objectField("LatestStreamLabel");
+                try s.write(label);
+
+                try s.objectField("LatestStreamArn");
+                try s.print("\"arn:aws:dynamodb:{s}:000000000000:table/{s}/stream/{s}\"", .{ region, slot.name, label });
+            }
+        }
+    }
+
     try s.endObject(); // wrapper inner
     try s.endObject(); // root
     return aw.toOwnedSlice();
+}
+
+/// Format a unix-second timestamp as the AWS Streams "latest label"
+/// shape: `YYYY-MM-DDTHH:MM:SS.sss` (no timezone suffix; AWS uses the
+/// same format observed against the real service).
+pub fn formatStreamLabel(unix_s: i64, buf: []u8) ![]u8 {
+    const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = @intCast(unix_s) };
+    const day_secs = epoch_secs.getDaySeconds();
+    const year_day = epoch_secs.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_secs.getHoursIntoDay(),
+        day_secs.getMinutesIntoHour(),
+        day_secs.getSecondsIntoMinute(),
+    });
 }
 
 fn writeKeyAttr(s: *std.json.Stringify, k: dynamo_state.KeyAttribute) !void {
@@ -495,6 +575,76 @@ test "parseListTables: Limit + ExclusiveStartTableName" {
     );
     try testing.expectEqual(@as(u32, 10), req.limit);
     try testing.expectEqualStrings("prev", req.exclusive_start_table_name.?);
+}
+
+test "parseCreateTable: StreamSpecification enabled + view-type" {
+    const body =
+        \\{"TableName":"tbl","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+        \\"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+        \\"StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const req = try parseCreateTable(arena.allocator(), body);
+    try testing.expect(req.stream_spec != null);
+    try testing.expect(req.stream_spec.?.enabled);
+    try testing.expectEqual(dynamo_state.StreamViewType.new_and_old_images, req.stream_spec.?.view_type);
+}
+
+test "parseCreateTable: StreamSpecification disabled needs no view-type" {
+    const body =
+        \\{"TableName":"tbl","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+        \\"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+        \\"StreamSpecification":{"StreamEnabled":false}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const req = try parseCreateTable(arena.allocator(), body);
+    try testing.expect(req.stream_spec != null);
+    try testing.expect(!req.stream_spec.?.enabled);
+}
+
+test "parseCreateTable: enabled-without-view-type → Malformed" {
+    const body =
+        \\{"TableName":"tbl","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+        \\"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+        \\"StreamSpecification":{"StreamEnabled":true}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(ParseError.Malformed, parseCreateTable(arena.allocator(), body));
+}
+
+test "parseCreateTable: invalid view-type → InvalidStreamViewType" {
+    const body =
+        \\{"TableName":"tbl","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+        \\"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+        \\"StreamSpecification":{"StreamEnabled":true,"StreamViewType":"BOGUS"}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(ParseError.InvalidStreamViewType, parseCreateTable(arena.allocator(), body));
+}
+
+test "parseUpdateTable: StreamSpecification toggle off" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const req = try parseUpdateTable(arena.allocator(),
+        \\{"TableName":"tbl","StreamSpecification":{"StreamEnabled":false}}
+    );
+    try testing.expect(req.stream_spec != null);
+    try testing.expect(!req.stream_spec.?.enabled);
+}
+
+test "formatStreamLabel: well-known epoch" {
+    var buf: [32]u8 = undefined;
+    // 2024-01-15T00:00:00 UTC → 1705276800
+    const got = try formatStreamLabel(1705276800, &buf);
+    try testing.expectEqualStrings("2024-01-15T00:00:00.000", got);
+
+    // Add a non-midnight check too.
+    const got2 = try formatStreamLabel(1705276800 + 12 * 3600 + 34 * 60 + 56, &buf);
+    try testing.expectEqualStrings("2024-01-15T12:34:56.000", got2);
 }
 
 test "renderListTables: empty + populated + with-cursor shapes" {

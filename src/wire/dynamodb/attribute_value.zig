@@ -260,6 +260,42 @@ pub fn renderToOwnedSlice(allocator: Allocator, v: AttributeValue) ![]u8 {
 // ---------------------------------------------------------------------------
 // Deinit (deep-free)
 
+/// Deep-clone an `AttributeValue` into the given allocator. Mirrors
+/// `deinit` — every allocator.dupe / alloc here must have a matching
+/// free in deinit. Used by the storage backend (deep-copying request
+/// items into long-lived state) and the streams subsystem (deep-
+/// copying images into the stream's arena).
+pub fn cloneValue(allocator: Allocator, v: AttributeValue) std.mem.Allocator.Error!AttributeValue {
+    return switch (v) {
+        .s => |s| .{ .s = try allocator.dupe(u8, s) },
+        .n => |s| .{ .n = try allocator.dupe(u8, s) },
+        .b => |bytes| .{ .b = try allocator.dupe(u8, bytes) },
+        .bool => |b| .{ .bool = b },
+        .null => .null,
+        .list => |items| blk: {
+            const out = try allocator.alloc(AttributeValue, items.len);
+            for (items, 0..) |child, i| out[i] = try cloneValue(allocator, child);
+            break :blk .{ .list = out };
+        },
+        .map => |m| blk: {
+            const names = try allocator.alloc([]const u8, m.names.len);
+            for (m.names, 0..) |n, i| names[i] = try allocator.dupe(u8, n);
+            const values = try allocator.alloc(AttributeValue, m.values.len);
+            for (m.values, 0..) |child, i| values[i] = try cloneValue(allocator, child);
+            break :blk .{ .map = .{ .names = names, .values = values } };
+        },
+        .ss => |elems| .{ .ss = try dupSlices(allocator, elems) },
+        .ns => |elems| .{ .ns = try dupSlices(allocator, elems) },
+        .bs => |elems| .{ .bs = try dupSlices(allocator, elems) },
+    };
+}
+
+fn dupSlices(allocator: Allocator, src: []const []const u8) ![]const []const u8 {
+    const out = try allocator.alloc([]const u8, src.len);
+    for (src, 0..) |s, i| out[i] = try allocator.dupe(u8, s);
+    return out;
+}
+
 pub fn deinit(allocator: Allocator, v: *AttributeValue) void {
     switch (v.*) {
         .s => |s| allocator.free(s),

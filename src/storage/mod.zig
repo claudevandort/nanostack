@@ -38,6 +38,11 @@ pub const Error = error{
     TableNotFound,
     ConditionalCheckFailed,
     TransactionCanceled,
+    // DynamoDB Streams (v0.2.2).
+    StreamNotFound,
+    ShardNotFound,
+    InvalidStreamArn,
+    InvalidShardIterator,
     Io,
     OutOfMemory,
 };
@@ -1245,8 +1250,10 @@ pub const Backend = struct {
 // readable. `Fs` implements both — one struct, two backend views.
 
 pub const dynamo_state = @import("dynamo_state.zig");
+pub const dynamo_streams = @import("dynamo_streams.zig");
 pub const TableSlot = dynamo_state.TableSlot;
 pub const Item = dynamo_state.Item;
+pub const Stream = dynamo_streams.Stream;
 
 /// Inputs for CreateTable. All slices are borrowed from the request
 /// arena; the backend is responsible for copying anything it persists.
@@ -1258,13 +1265,16 @@ pub const CreateTableInput = struct {
     global_secondary_indexes: []const dynamo_state.GsiDef = &.{},
     local_secondary_indexes: []const dynamo_state.LsiDef = &.{},
     tags: []const dynamo_state.Tag = &.{},
+    stream_spec: ?dynamo_state.StreamSpecification = null,
 };
 
-/// Inputs for UpdateTable. Phase 2 supports BillingMode metadata changes
-/// only; other fields are accepted-and-ignored (documented divergence).
+/// Inputs for UpdateTable. Supports BillingMode and StreamSpecification
+/// mutations; other fields are accepted-and-ignored (documented
+/// divergence).
 pub const UpdateTableInput = struct {
     name: []const u8,
     billing_mode: ?dynamo_state.BillingMode = null,
+    stream_spec: ?dynamo_state.StreamSpecification = null,
 };
 
 /// A pre-evaluated condition predicate. Storage holds the mutex and
@@ -1417,6 +1427,104 @@ pub const TxCancellationReason = struct {
     message: ?[]const u8 = null,
 };
 
+// ---------------------------------------------------------------------------
+// DynamoDB Streams (v0.2.2)
+
+pub const StreamStatus = enum {
+    enabled,
+    enabling,
+    disabling,
+    disabled,
+
+    pub fn toAws(self: StreamStatus) []const u8 {
+        return switch (self) {
+            .enabled => "ENABLED",
+            .enabling => "ENABLING",
+            .disabling => "DISABLING",
+            .disabled => "DISABLED",
+        };
+    }
+};
+
+pub const StreamSummary = struct {
+    /// Owned by the caller's allocator.
+    arn: []const u8,
+    /// Owned by the caller's allocator.
+    table_name: []const u8,
+    /// Owned by the caller's allocator. The RFC3339 label.
+    label: []const u8,
+};
+
+pub const ListStreamsInput = struct {
+    table_name: ?[]const u8 = null,
+    limit: u32 = 100,
+    exclusive_start_stream_arn: ?[]const u8 = null,
+    region: []const u8 = "us-east-1",
+};
+
+pub const ListStreamsOutput = struct {
+    streams: []StreamSummary,
+    last_evaluated_stream_arn: ?[]const u8 = null,
+};
+
+pub const ShardDescription = struct {
+    /// Owned by the caller's allocator.
+    shard_id: []const u8,
+    /// Owned by the caller's allocator. Always non-empty.
+    starting_sequence_number: []const u8,
+    /// Owned by the caller's allocator. Null for an open shard.
+    ending_sequence_number: ?[]const u8 = null,
+};
+
+pub const DescribeStreamInput = struct {
+    arn: []const u8,
+    limit: u32 = 100,
+    exclusive_start_shard_id: ?[]const u8 = null,
+    region: []const u8 = "us-east-1",
+};
+
+pub const DescribeStreamOutput = struct {
+    /// Owned by the caller's allocator.
+    arn: []const u8,
+    label: []const u8,
+    status: StreamStatus,
+    view_type: dynamo_state.StreamViewType,
+    creation_request_unix: i64,
+    table_name: []const u8,
+    key_schema: []dynamo_state.KeyAttribute,
+    shards: []ShardDescription,
+    last_evaluated_shard_id: ?[]const u8 = null,
+};
+
+pub const GetShardIteratorInput = struct {
+    pub const Type = enum { trim_horizon, latest, at_sequence_number, after_sequence_number };
+
+    arn: []const u8,
+    shard_id: []const u8,
+    iterator_type: Type,
+    sequence_number: ?[]const u8 = null,
+};
+
+pub const GetRecordsInput = struct {
+    /// Opaque to the backend; it'll decode the position embedded inside.
+    shard_iterator: []const u8,
+    limit: u32 = 1000,
+};
+
+pub const StreamRecordOut = struct {
+    seq: []const u8,
+    kind: dynamo_streams.RecordKind,
+    keys: Item,
+    new_image: ?Item,
+    old_image: ?Item,
+    created_unix: i64,
+};
+
+pub const GetRecordsOutput = struct {
+    records: []StreamRecordOut,
+    next_shard_iterator: ?[]const u8,
+};
+
 
 pub const DynamoBackend = struct {
     ctx: *anyopaque,
@@ -1436,6 +1544,11 @@ pub const DynamoBackend = struct {
         query: *const fn (ctx: *anyopaque, allocator: Allocator, in: QueryInput) Error!QueryResult,
         transactGetItems: *const fn (ctx: *anyopaque, allocator: Allocator, ops: []const TxGetItem) Error!TxGetResult,
         transactWriteItems: *const fn (ctx: *anyopaque, allocator: Allocator, ops: []const TxWriteOp, reasons_out: *[]?[]const u8) Error!void,
+        // v0.2.2 Streams sub-service.
+        listStreams: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListStreamsInput) Error!ListStreamsOutput,
+        describeStream: *const fn (ctx: *anyopaque, allocator: Allocator, in: DescribeStreamInput) Error!DescribeStreamOutput,
+        getShardIterator: *const fn (ctx: *anyopaque, allocator: Allocator, in: GetShardIteratorInput) Error![]const u8,
+        getRecords: *const fn (ctx: *anyopaque, allocator: Allocator, in: GetRecordsInput) Error!GetRecordsOutput,
     };
 
     pub fn listTables(self: DynamoBackend, allocator: Allocator) Error![]const []const u8 {
@@ -1478,6 +1591,18 @@ pub const DynamoBackend = struct {
         reasons_out: *[]?[]const u8,
     ) Error!void {
         return self.vtable.transactWriteItems(self.ctx, allocator, ops, reasons_out);
+    }
+    pub fn listStreams(self: DynamoBackend, allocator: Allocator, in: ListStreamsInput) Error!ListStreamsOutput {
+        return self.vtable.listStreams(self.ctx, allocator, in);
+    }
+    pub fn describeStream(self: DynamoBackend, allocator: Allocator, in: DescribeStreamInput) Error!DescribeStreamOutput {
+        return self.vtable.describeStream(self.ctx, allocator, in);
+    }
+    pub fn getShardIterator(self: DynamoBackend, allocator: Allocator, in: GetShardIteratorInput) Error![]const u8 {
+        return self.vtable.getShardIterator(self.ctx, allocator, in);
+    }
+    pub fn getRecords(self: DynamoBackend, allocator: Allocator, in: GetRecordsInput) Error!GetRecordsOutput {
+        return self.vtable.getRecords(self.ctx, allocator, in);
     }
 };
 

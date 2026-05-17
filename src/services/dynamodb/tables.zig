@@ -26,13 +26,14 @@ pub fn createTable(ctx: Context) Result {
         .global_secondary_indexes = req.global_secondary_indexes,
         .local_secondary_indexes = req.local_secondary_indexes,
         .tags = req.tags,
+        .stream_spec = req.stream_spec,
     }) catch |err| return .{ .err = mapStorageErr(err) };
 
     // CreateTable's response shape carries the same fields as DescribeTable
     // but wrapped in `TableDescription` instead of `Table`.
     const slot = ctx.backend.describeTable(req.name) catch |err|
         return .{ .err = mapStorageErr(err) };
-    const body = tables_wire.renderTableDescription(ctx.allocator, slot, "TableDescription") catch
+    const body = tables_wire.renderTableDescription(ctx.allocator, slot, "TableDescription", ctx.region) catch
         return .{ .err = .{ .code = .internal_server_error } };
     return .{ .ok = .{ .body = body } };
 }
@@ -42,7 +43,7 @@ pub fn describeTable(ctx: Context) Result {
         return .{ .err = mapParseErr(err) };
     const slot = ctx.backend.describeTable(req) catch |err|
         return .{ .err = mapStorageErr(err) };
-    const body = tables_wire.renderTableDescription(ctx.allocator, slot, "Table") catch
+    const body = tables_wire.renderTableDescription(ctx.allocator, slot, "Table", ctx.region) catch
         return .{ .err = .{ .code = .internal_server_error } };
     return .{ .ok = .{ .body = body } };
 }
@@ -53,7 +54,7 @@ pub fn deleteTable(ctx: Context) Result {
     // Snapshot the slot BEFORE delete so we can render the response.
     const slot = ctx.backend.describeTable(req) catch |err|
         return .{ .err = mapStorageErr(err) };
-    const body = tables_wire.renderTableDescription(ctx.allocator, slot, "TableDescription") catch
+    const body = tables_wire.renderTableDescription(ctx.allocator, slot, "TableDescription", ctx.region) catch
         return .{ .err = .{ .code = .internal_server_error } };
     ctx.backend.deleteTable(req) catch |err| return .{ .err = mapStorageErr(err) };
     return .{ .ok = .{ .body = body } };
@@ -65,8 +66,9 @@ pub fn updateTable(ctx: Context) Result {
     const slot = ctx.backend.updateTable(.{
         .name = req.name,
         .billing_mode = req.billing_mode,
+        .stream_spec = req.stream_spec,
     }) catch |err| return .{ .err = mapStorageErr(err) };
-    const body = tables_wire.renderTableDescription(ctx.allocator, slot, "TableDescription") catch
+    const body = tables_wire.renderTableDescription(ctx.allocator, slot, "TableDescription", ctx.region) catch
         return .{ .err = .{ .code = .internal_server_error } };
     return .{ .ok = .{ .body = body } };
 }
@@ -133,6 +135,7 @@ fn parseErrorMessage(e: tables_wire.ParseError) []const u8 {
         tables_wire.ParseError.InvalidScalarType => "AttributeType must be S, N, or B.",
         tables_wire.ParseError.InvalidBillingMode => "BillingMode must be PROVISIONED or PAY_PER_REQUEST.",
         tables_wire.ParseError.InvalidProjectionType => "ProjectionType must be ALL, KEYS_ONLY, or INCLUDE.",
+        tables_wire.ParseError.InvalidStreamViewType => "StreamViewType must be one of NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES, KEYS_ONLY.",
         tables_wire.ParseError.KeyReferencesUndeclaredAttribute => "Every key-schema attribute must appear in AttributeDefinitions.",
         tables_wire.ParseError.InvalidKeySchema => "KeySchema must have exactly one HASH key and at most one RANGE key.",
         tables_wire.ParseError.OutOfMemory => "Out of memory.",

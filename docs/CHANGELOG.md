@@ -16,6 +16,45 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-05-17
+
+**Patch release: DynamoDB Streams.**
+
+Per the [versioning scheme](#versioning-scheme), patches mark "significant pinned cuts of work". v0.2.0 explicitly deferred Streams alongside PartiQL / PITR / Global Tables / DAX / Imports/Exports; this release closes the biggest of those holes — change-data-capture is the canonical surface DDB users reach for, and it's the prerequisite for the future Lambda-trigger work on the post-v1 roadmap.
+
+### Added — DynamoDBStreams sub-service (4 ops)
+
+New target prefix `DynamoDBStreams_20120810.*` on the same port as the core DDB service. Opt-in via the same `--services s3,dynamodb` flag — the sub-service is part of DDB.
+
+- **`ListStreams`** — `TableName` filter, `Limit` + `ExclusiveStartStreamArn` cursor, lex-ascending ARNs. Only stream-enabled tables appear.
+- **`DescribeStream`** — returns the single open shard per stream with `StreamStatus`, `StreamViewType`, `CreationRequestDateTime`, `KeySchema`. Mismatched stream label in the ARN → `ResourceNotFoundException` (matches AWS's "label changes on re-enable" behaviour).
+- **`GetShardIterator`** — all four iterator types (`TRIM_HORIZON`, `LATEST`, `AT_SEQUENCE_NUMBER`, `AFTER_SEQUENCE_NUMBER`). Returns an opaque base64-url token; clients must treat as opaque.
+- **`GetRecords`** — `Limit` 1–1000 (default 1000), `INSERT`/`MODIFY`/`REMOVE` classification with per-view-type image filtering. Always returns `NextShardIterator` (single open shard never closes in our model). Records render with the standard `eventID`/`eventName`/`awsRegion`/`eventSource`/`dynamodb` shape, so consumers that key off those fields work out of the box.
+
+### Added — table-side surface
+
+- **`StreamSpecification` on `CreateTable` and `UpdateTable`** — all four view types (`NEW_IMAGE`, `OLD_IMAGE`, `NEW_AND_OLD_IMAGES`, `KEYS_ONLY`). `DescribeTable` echoes the spec plus `LatestStreamLabel` and `LatestStreamArn` when enabled. The spec persists across nanostack restart; records do not (matches LocalStack, keeps cold start sub-second).
+- **Capture chokepoint = the storage backend.** Six write sites instrumented: `ddbPutItem`, `ddbDeleteItem`, `ddbUpdateItem`, and the three `apply*Locked` helpers used by `TransactWriteItems`. `BatchWriteItem` inherits capture for free since it routes through the public Put/Delete handlers.
+- **Bounded ring buffer (1000 records per stream) + best-effort 24h age trim.** Approximates AWS's 24h retention; write-heavy streams may evict records younger than 24h once the bound is hit.
+
+### Changed
+
+- **`EnableKinesisStreamingDestination` / `DisableKinesisStreamingDestination`** — explicit `ValidationException` with message "Kinesis service is not enabled on this nanostack instance." (these live on the core DDB service, not the Streams sub-service). Previously fell through to the generic unknown-target message.
+
+### Tests
+- Zig unit tests: 472 → 489 (+17 — 11 ring-buffer + iterator tests, 5 wire parse-path tests, 1 view-type helper).
+- Python conformance: 308 → 337 (+29 streams tests covering schema persistence, all four sub-service ops, view-type filtering, capture across all five write paths).
+- JS conformance: 65 → 70 (+5 streams tests on `@aws-sdk/client-dynamodb-streams`).
+- AWS CLI conformance: 19 → 22 (+3 streams tests on `aws dynamodbstreams`).
+
+### Documented divergences (intentional)
+- **Single open shard per stream** — no shard splitting / closed-shard lineage. Cleanly extensible later if anyone files an issue.
+- **24h retention is approximate** — bound + age trim, not time-strict.
+- **Records do not persist across restart** — matches LocalStack; the local-dev philosophy is "fresh server, fresh stream".
+
+### Strategic note
+This trims the DDB deferred list to PartiQL / PITR / Global Tables / DAX / Imports/Exports / TTL — five remaining patches' worth of work. The next minor (v0.3.0) is still SQS per PRD §15.
+
 ## [0.2.1] — 2026-05-17
 
 **Patch release: DynamoDB polish — closes four post-ship gaps.**
