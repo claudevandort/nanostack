@@ -390,6 +390,97 @@ def test_fifo_send_batch_dedupes_within_batch(sqs, fifo_queue):
     assert successful["a"]["MessageId"] == successful["b"]["MessageId"]
 
 
+# ---------- Phase D — per-group ordering on ReceiveMessage ----------
+
+
+def test_fifo_head_of_line_blocking_within_group(sqs, fifo_queue):
+    """Send 3 messages to one group, ReceiveMessage returns only the
+    head until it is deleted."""
+    _, url = fifo_queue
+    for body in ["a", "b", "c"]:
+        sqs.send_message(QueueUrl=url, MessageBody=body, MessageGroupId="g1")
+    recv = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)
+    assert len(recv["Messages"]) == 1
+    assert recv["Messages"][0]["Body"] == "a"
+
+
+def test_fifo_next_message_available_after_delete(sqs, fifo_queue):
+    _, url = fifo_queue
+    for body in ["a", "b", "c"]:
+        sqs.send_message(QueueUrl=url, MessageBody=body, MessageGroupId="g1")
+    recv1 = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)
+    sqs.delete_message(
+        QueueUrl=url, ReceiptHandle=recv1["Messages"][0]["ReceiptHandle"]
+    )
+    recv2 = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)
+    assert recv2["Messages"][0]["Body"] == "b"
+
+
+def test_fifo_multiple_groups_each_returns_head(sqs, fifo_queue):
+    """Two messages per group across 3 groups → ReceiveMessage returns
+    3 messages (one per group head)."""
+    _, url = fifo_queue
+    for body, gid in [("a1", "g1"), ("b1", "g2"), ("a2", "g1"), ("c1", "g3"), ("b2", "g2")]:
+        sqs.send_message(QueueUrl=url, MessageBody=body, MessageGroupId=gid)
+    recv = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)
+    bodies = sorted(m["Body"] for m in recv["Messages"])
+    assert bodies == ["a1", "b1", "c1"]
+
+
+def test_fifo_visibility_timeout_locks_group(sqs):
+    """An in-flight message keeps its group locked even though no
+    DeleteMessage has happened — the group only unlocks when the
+    visibility timeout expires or the message is deleted."""
+    name = _fifo_name()
+    url = sqs.create_queue(
+        QueueName=name,
+        Attributes={
+            "FifoQueue": "true",
+            "ContentBasedDeduplication": "true",
+            "VisibilityTimeout": "30",
+        },
+    )["QueueUrl"]
+    try:
+        sqs.send_message(QueueUrl=url, MessageBody="a", MessageGroupId="g1")
+        sqs.send_message(QueueUrl=url, MessageBody="b", MessageGroupId="g1")
+        recv1 = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)
+        assert len(recv1["Messages"]) == 1
+        # Immediate second receive returns nothing (group is locked).
+        recv2 = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)
+        assert "Messages" not in recv2 or len(recv2.get("Messages", [])) == 0
+    finally:
+        sqs.delete_queue(QueueUrl=url)
+
+
+def test_fifo_change_visibility_zero_releases_head(sqs, fifo_queue):
+    _, url = fifo_queue
+    sqs.send_message(QueueUrl=url, MessageBody="a", MessageGroupId="g1")
+    sqs.send_message(QueueUrl=url, MessageBody="b", MessageGroupId="g1")
+    recv1 = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)
+    sqs.change_message_visibility(
+        QueueUrl=url,
+        ReceiptHandle=recv1["Messages"][0]["ReceiptHandle"],
+        VisibilityTimeout=0,
+    )
+    recv2 = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)
+    # Re-released head is delivered again; still single-occupancy.
+    assert len(recv2["Messages"]) == 1
+    assert recv2["Messages"][0]["Body"] == "a"
+
+
+def test_fifo_max_messages_caps_at_distinct_group_heads(sqs, fifo_queue):
+    """MaxNumberOfMessages=10 across 4 groups returns up to 4 messages
+    (one per group head), not more."""
+    _, url = fifo_queue
+    for i, gid in enumerate(["g1", "g2", "g3", "g4"]):
+        sqs.send_message(QueueUrl=url, MessageBody=f"m-{gid}", MessageGroupId=gid)
+        sqs.send_message(QueueUrl=url, MessageBody=f"m-{gid}-2", MessageGroupId=gid)
+    recv = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)
+    assert len(recv["Messages"]) == 4
+    bodies = sorted(m["Body"] for m in recv["Messages"])
+    assert bodies == ["m-g1", "m-g2", "m-g3", "m-g4"]
+
+
 def _pick_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))

@@ -6007,12 +6007,41 @@ pub fn sqsReceiveMessage(self: *Fs, allocator: Allocator, in: storage.ReceiveMes
         out.deinit(allocator);
     }
 
+    // FIFO queues use a "claimed groups" set so that a group with a
+    // currently-in-flight message blocks delivery of later messages in
+    // the same group. The set lives only for this scan.
+    var claimed_groups = std.StringHashMapUnmanaged(void){};
+    defer claimed_groups.deinit(self.allocator);
+
     // Iterate via index because we may need to remove (DLQ route) mid-pass.
     var i: usize = 0;
     while (i < slot.messages.items.len) {
         if (out.items.len >= max) break;
         const m = slot.messages.items[i];
-        if (m.visible_unix > now) {
+
+        // FIFO group-lock semantics: a group is "claimed" by the first
+        // visible-or-in-flight message we see. Subsequent messages in
+        // the same group are skipped.
+        if (slot.attrs.is_fifo) {
+            const gid = m.message_group_id orelse {
+                // Shouldn't happen on a FIFO queue, but skip defensively.
+                i += 1;
+                continue;
+            };
+            if (claimed_groups.contains(gid)) {
+                i += 1;
+                continue;
+            }
+            if (m.visible_unix > now) {
+                // This group's head is in-flight — claim and skip.
+                claimed_groups.put(self.allocator, gid, {}) catch return storage.Error.OutOfMemory;
+                i += 1;
+                continue;
+            }
+            // m is visible and its group has no head-of-line block.
+            // Claim the group before delivering.
+            claimed_groups.put(self.allocator, gid, {}) catch return storage.Error.OutOfMemory;
+        } else if (m.visible_unix > now) {
             i += 1;
             continue;
         }
