@@ -162,9 +162,22 @@ SQS is the third AWS service nanostack covers, opt-in via `--services sqs` (or `
 | UntagQueue | supported | v0.3.0 |
 | ListQueueTags | supported | v0.3.0 |
 
+### Operations not yet supported
+
+These AWS SQS operations are part of the full surface but currently unrouted — a client call returns the generic "unknown target" error. Tracked here so users know whether to expect them in a future patch or treat them as out-of-scope.
+
+| Operation | Status | Planned |
+|---|---|---|
+| AddPermission | unrouted | v0.3.x patch alongside Queue Policy evaluation (today the Policy attribute is accept-store-roundtrip only — see divergences below) |
+| RemovePermission | unrouted | same as AddPermission |
+| ListDeadLetterSourceQueues | unrouted | v0.3.x patch (cheap; walks queues whose RedrivePolicy targets a given DLQ ARN) |
+| StartMessageMoveTask | unrouted | v0.3.x patch (DLQ redrive API — replays messages from a DLQ back to the configured source) |
+| CancelMessageMoveTask | unrouted | same as StartMessageMoveTask |
+| ListMessageMoveTasks | unrouted | same as StartMessageMoveTask |
+
 Documented divergences (intentional):
 - **JSON wire only.** boto3 v1.34+, JS SDK v3, and CLI v2 all use the JSON wire by default. The legacy query-string / XML form is **out of scope** — users on older SDKs should upgrade.
-- **FIFO queues deferred.** MessageGroupId / MessageDeduplicationId / ContentBasedDeduplication / per-group ordering land in a future v0.3.x patch. CreateQueue on a `.fifo` name name-validates but no FIFO semantics are applied.
+- **FIFO queues deferred to v0.3.1.** MessageGroupId / MessageDeduplicationId / ContentBasedDeduplication / per-group ordering land in the next patch. CreateQueue on a `.fifo` name name-validates but no FIFO semantics are applied yet.
 - **Long polling = in-handler sleep loop.** ReceiveMessage with `WaitTimeSeconds > 0` blocks the handler thread, polling the queue every 100ms until a message arrives or the deadline expires. AWS-real uses a server-side event loop; we don't. Wastes one handler thread per long-poll; acceptable for local dev.
 - **No connection-cancellation detection on long polling.** A client that drops mid-poll keeps the handler sleeping until the deadline. AWS-real would notice and return immediately.
 - **No rate limits.** AWS enforces per-account caps on queues + sends/sec. We accept everything.
