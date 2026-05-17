@@ -724,13 +724,35 @@ restored_objects: std.StringHashMapUnmanaged(void),
 /// at `<base>/dynamodb/tables/<name>/schema.json`. Lock via `mutex` for
 /// any mutation.
 dynamo_tables: std.StringHashMapUnmanaged(*storage.TableSlot),
+/// TTL sweeper state (v0.2.3). The thread runs `ttlSweepLoop` until
+/// `sweeper_stop` is set; on each tick it scans every TTL-enabled
+/// table and evicts expired items.
+ttl_sweep_interval_secs: u32,
+sweeper_thread: ?std.Thread,
+sweeper_stop: std.atomic.Value(bool),
 
 pub const InitError = error{
     OutOfMemory,
     Io,
+    ThreadSpawn,
 };
 
+pub const Options = struct {
+    /// Default 5s for local-dev responsiveness. AWS uses hours.
+    ttl_sweep_interval_seconds: u32 = 5,
+    /// Spawn the TTL sweeper thread? Default true in production; tests
+    /// use the 3-arg `init` shim which disables the sweeper because the
+    /// Zig test runner doesn't tolerate dangling threads at teardown.
+    spawn_ttl_sweeper: bool = true,
+};
+
+/// Test-friendly init: no background sweeper. Use `initWithOptions` in
+/// production / `main.zig`.
 pub fn init(allocator: Allocator, io: Io, base_dir: []const u8) InitError!*Fs {
+    return initWithOptions(allocator, io, base_dir, .{ .spawn_ttl_sweeper = false });
+}
+
+pub fn initWithOptions(allocator: Allocator, io: Io, base_dir: []const u8, opts: Options) InitError!*Fs {
     const self = try allocator.create(Fs);
     errdefer allocator.destroy(self);
 
@@ -745,16 +767,27 @@ pub fn init(allocator: Allocator, io: Io, base_dir: []const u8) InitError!*Fs {
         .buckets = .empty,
         .restored_objects = .empty,
         .dynamo_tables = .empty,
+        .ttl_sweep_interval_secs = opts.ttl_sweep_interval_seconds,
+        .sweeper_thread = null,
+        .sweeper_stop = .init(false),
     };
 
     ensureS3Dir(self) catch return InitError.Io;
     loadRegistry(self) catch return InitError.Io;
     ensureDynamoDir(self) catch return InitError.Io;
     loadDynamoTables(self) catch return InitError.Io;
+
+    if (opts.spawn_ttl_sweeper) {
+        self.sweeper_thread = std.Thread.spawn(.{}, ttlSweepLoop, .{self}) catch return InitError.ThreadSpawn;
+    }
     return self;
 }
 
 pub fn deinit(self: *Fs) void {
+    if (self.sweeper_thread) |t| {
+        self.sweeper_stop.store(true, .release);
+        t.join();
+    }
     for (self.buckets.items) |*b| b.deinit(self.allocator);
     self.buckets.deinit(self.allocator);
     {
@@ -802,6 +835,8 @@ const dynamo_vtable: storage.DynamoBackend.VTable = .{
     .describeStream = vtDdbDescribeStream,
     .getShardIterator = vtDdbGetShardIterator,
     .getRecords = vtDdbGetRecords,
+    .updateTimeToLive = vtDdbUpdateTimeToLive,
+    .describeTimeToLive = vtDdbDescribeTimeToLive,
 };
 
 fn vtDdbListTables(ctx: *anyopaque, allocator: Allocator) storage.Error![]const []const u8 {
@@ -851,6 +886,12 @@ fn vtDdbGetShardIterator(ctx: *anyopaque, allocator: Allocator, in: storage.GetS
 }
 fn vtDdbGetRecords(ctx: *anyopaque, allocator: Allocator, in: storage.GetRecordsInput) storage.Error!storage.GetRecordsOutput {
     return ddbGetRecords(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtDdbUpdateTimeToLive(ctx: *anyopaque, in: storage.UpdateTimeToLiveInput) storage.Error!storage.dynamo_state.TimeToLiveSpec {
+    return ddbUpdateTimeToLive(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtDdbDescribeTimeToLive(ctx: *anyopaque, name: []const u8) storage.Error!?storage.dynamo_state.TimeToLiveSpec {
+    return ddbDescribeTimeToLive(@ptrCast(@alignCast(ctx)), name);
 }
 
 // ---------------------------------------------------------------------------
@@ -3182,6 +3223,12 @@ const SchemaDoc = struct {
     stream_enabled: ?bool = null,
     stream_view_type: ?[]const u8 = null,
     stream_enabled_unix: ?i64 = null,
+    /// TTL config (v0.2.3). `ttl_status` ∈ {"ENABLED", "DISABLED"};
+    /// we never persist the transient ENABLING / DISABLING states
+    /// because we snap directly to the terminal state. Null when never
+    /// configured.
+    ttl_status: ?[]const u8 = null,
+    ttl_attribute_name: ?[]const u8 = null,
 };
 const KeyAttrDoc = struct { name: []const u8, key_type: []const u8 };
 const AttributeDefDoc = struct { name: []const u8, type: []const u8 };
@@ -3255,6 +3302,8 @@ fn slotToDoc(allocator: Allocator, slot: *const storage.TableSlot) !SchemaDoc {
         .stream_enabled = if (slot.stream_spec) |sp| sp.enabled else null,
         .stream_view_type = if (slot.stream_spec) |sp| sp.view_type.toAws() else null,
         .stream_enabled_unix = slot.stream_enabled_unix,
+        .ttl_status = if (slot.ttl_spec) |sp| sp.status.toAws() else null,
+        .ttl_attribute_name = if (slot.ttl_spec) |sp| sp.attribute_name else null,
     };
 }
 
@@ -3452,6 +3501,19 @@ fn docToSlot(allocator: Allocator, doc: SchemaDoc) !storage.TableSlot {
             .new_and_old_images,
     } else null;
 
+    const ttl_spec: ?ddb.dynamo_state.TimeToLiveSpec = blk: {
+        const status_str = doc.ttl_status orelse break :blk null;
+        const status: ddb.dynamo_state.TimeToLiveStatus = if (std.mem.eql(u8, status_str, "ENABLED"))
+            .enabled
+        else
+            .disabled;
+        const attr_src = doc.ttl_attribute_name orelse "";
+        break :blk .{
+            .status = status,
+            .attribute_name = try allocator.dupe(u8, attr_src),
+        };
+    };
+
     return .{
         .name = name,
         .key_schema = ks,
@@ -3462,6 +3524,7 @@ fn docToSlot(allocator: Allocator, doc: SchemaDoc) !storage.TableSlot {
         .tags = tags,
         .stream_spec = stream_spec,
         .stream_enabled_unix = doc.stream_enabled_unix,
+        .ttl_spec = ttl_spec,
         .created_unix = doc.created_unix,
     };
 }
@@ -3782,7 +3845,7 @@ pub fn ddbPutItem(self: *Fs, allocator: Allocator, in: storage.PutItemInput) sto
 
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
 
-    captureWrite(self, slot, if (had_existing) .modify else .insert, in.item, if (result.old_item) |*oi| oi else null, owned_ptr);
+    captureWrite(self, slot, if (had_existing) .modify else .insert, in.item, if (result.old_item) |*oi| oi else null, owned_ptr, .user);
     return result;
 }
 
@@ -3799,11 +3862,12 @@ fn captureWrite(
     key_src: *const storage.Item,
     old_item: ?*const storage.Item,
     new_item: ?*const storage.Item,
+    identity: storage.dynamo_streams.UserIdentity,
 ) void {
     const stream = slot.stream orelse return;
     var keys = storage.dynamo_state.projectKeys(self.allocator, slot, key_src) catch return;
     defer keys.deinit(self.allocator);
-    _ = stream.capture(kind, &keys, new_item, old_item, nowUnixSeconds(self.io)) catch {};
+    _ = stream.capture(kind, &keys, new_item, old_item, nowUnixSeconds(self.io), identity) catch {};
 }
 
 pub fn ddbGetItem(self: *Fs, allocator: Allocator, in: storage.GetItemInput) storage.Error!storage.GetItemResult {
@@ -3849,7 +3913,7 @@ pub fn ddbDeleteItem(self: *Fs, allocator: Allocator, in: storage.DeleteItemInpu
     removed.value.deinit(self.allocator);
     self.allocator.destroy(removed.value);
 
-    captureWrite(self, slot, .remove, in.key, &old, null);
+    captureWrite(self, slot, .remove, in.key, &old, null, .user);
     return .{ .old_item = old };
 }
 
@@ -3910,7 +3974,7 @@ pub fn ddbUpdateItem(self: *Fs, allocator: Allocator, in: storage.UpdateItemInpu
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
 
     const kind: storage.dynamo_streams.RecordKind = if (existing_ptr == null) .insert else .modify;
-    captureWrite(self, slot, kind, in.key, if (result.old_item) |*oi| oi else null, owned_ptr);
+    captureWrite(self, slot, kind, in.key, if (result.old_item) |*oi| oi else null, owned_ptr, .user);
     return result;
 }
 
@@ -4076,7 +4140,7 @@ pub fn ddbTransactWrite(
         const slot = self.dynamo_tables.get(op.table) orelse return storage.Error.Io;
         switch (op.kind) {
             .put => try applyPutLocked(self, slot, op.item_or_key),
-            .delete => try applyDeleteLocked(self, slot, op.item_or_key),
+            .delete => try applyDeleteLocked(self, slot, op.item_or_key, .user),
             .update => try applyUpdateLocked(self, allocator, slot, op.item_or_key, op.apply_fn.?, op.apply_ctx.?),
             .condition_check => {}, // validated, nothing to apply
         }
@@ -4111,10 +4175,15 @@ fn applyPutLocked(self: *Fs, slot: *storage.TableSlot, item: *const storage.Item
 
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
 
-    captureWrite(self, slot, if (had_existing) .modify else .insert, item, if (had_existing) &old_snapshot else null, owned_ptr);
+    captureWrite(self, slot, if (had_existing) .modify else .insert, item, if (had_existing) &old_snapshot else null, owned_ptr, .user);
 }
 
-fn applyDeleteLocked(self: *Fs, slot: *storage.TableSlot, key_item: *const storage.Item) storage.Error!void {
+fn applyDeleteLocked(
+    self: *Fs,
+    slot: *storage.TableSlot,
+    key_item: *const storage.Item,
+    identity: storage.dynamo_streams.UserIdentity,
+) storage.Error!void {
     const key_str = storage.dynamo_state.buildKeyFromAttrs(self.allocator, slot, key_item) catch
         return storage.Error.OutOfMemory;
     defer self.allocator.free(key_str);
@@ -4136,7 +4205,7 @@ fn applyDeleteLocked(self: *Fs, slot: *storage.TableSlot, key_item: *const stora
     removed.value.deinit(self.allocator);
     self.allocator.destroy(removed.value);
 
-    captureWrite(self, slot, .remove, key_item, &old_snapshot, null);
+    captureWrite(self, slot, .remove, key_item, &old_snapshot, null, identity);
 }
 
 fn applyUpdateLocked(
@@ -4182,7 +4251,7 @@ fn applyUpdateLocked(
     }
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
 
-    captureWrite(self, slot, if (had_existing) .modify else .insert, key_item, if (had_existing) &old_snapshot else null, owned_ptr);
+    captureWrite(self, slot, if (had_existing) .modify else .insert, key_item, if (had_existing) &old_snapshot else null, owned_ptr, .user);
 }
 
 // ---------------------------------------------------------------------------
@@ -4417,6 +4486,7 @@ pub fn ddbGetRecords(self: *Fs, allocator: Allocator, in: storage.GetRecordsInpu
             .new_image = if (src.new_image) |ni| try storage.dynamo_state.cloneItem(allocator, &ni) else null,
             .old_image = if (src.old_image) |oi| try storage.dynamo_state.cloneItem(allocator, &oi) else null,
             .created_unix = src.created_unix,
+            .identity = src.identity,
         };
         produced = i + 1;
     }
@@ -4490,6 +4560,120 @@ fn decodeIterator(allocator: Allocator, token: []const u8) !IteratorBlob {
         else => return error.InvalidShardIterator,
     };
     return .{ .arn = arn_owned, .shard_id = shard_owned, .position = pos };
+}
+
+// ---------------------------------------------------------------------------
+// DynamoDB TTL (v0.2.3)
+
+pub fn ddbUpdateTimeToLive(self: *Fs, in: storage.UpdateTimeToLiveInput) storage.Error!storage.dynamo_state.TimeToLiveSpec {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.dynamo_tables.get(in.name) orelse return storage.Error.TableNotFound;
+
+    // Free the old attribute_name if any. AWS allows changing the
+    // attribute name on a re-enable; we accept any spec the user
+    // sends and overwrite. Simpler than modelling the transient
+    // DISABLING→ENABLING handoff AWS uses.
+    if (slot.ttl_spec) |existing| self.allocator.free(existing.attribute_name);
+    const attr_owned = self.allocator.dupe(u8, in.attribute_name) catch return storage.Error.OutOfMemory;
+    const new_spec: storage.dynamo_state.TimeToLiveSpec = .{
+        .status = if (in.enabled) .enabled else .disabled,
+        .attribute_name = attr_owned,
+    };
+    slot.ttl_spec = new_spec;
+
+    writeSchemaJson(self, slot) catch {
+        self.allocator.free(attr_owned);
+        slot.ttl_spec = null;
+        return storage.Error.Io;
+    };
+    return new_spec;
+}
+
+pub fn ddbDescribeTimeToLive(self: *Fs, name: []const u8) storage.Error!?storage.dynamo_state.TimeToLiveSpec {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const slot = self.dynamo_tables.get(name) orelse return storage.Error.TableNotFound;
+    return slot.ttl_spec;
+}
+
+/// Sweeper main loop. Spawned from `init`; runs until `sweeper_stop`
+/// is set by `deinit`. Sleeps in small chunks so shutdown observes the
+/// stop flag promptly even when the interval is set high.
+fn ttlSweepLoop(self: *Fs) void {
+    const tick_ms: u32 = 250;
+    while (true) {
+        const interval_ms: u32 = self.ttl_sweep_interval_secs * 1000;
+        var slept: u32 = 0;
+        while (slept < interval_ms) {
+            if (self.sweeper_stop.load(.acquire)) return;
+            const chunk: u32 = @min(tick_ms, interval_ms - slept);
+            // Use Linux nanosleep directly. std.posix.poll(&[], ms) is
+            // tempting but panics with EFAULT on an empty slice in Zig
+            // 0.16 (the slice's .ptr is non-null but invalid).
+            const req: std.os.linux.timespec = .{
+                .sec = @intCast(@divTrunc(chunk, 1000)),
+                .nsec = @intCast(@as(i64, @mod(chunk, 1000)) * std.time.ns_per_ms),
+            };
+            _ = std.os.linux.nanosleep(&req, null);
+            slept += chunk;
+        }
+        if (self.sweeper_stop.load(.acquire)) return;
+        ttlSweepOnce(self);
+    }
+}
+
+/// One pass: lock the table mutex, iterate every TTL-enabled table,
+/// collect expired item keys (TTL attribute is a Number ≤ now()), and
+/// evict each via the existing transaction-write delete path.
+/// Wrong-type or missing TTL attributes are ignored per AWS semantics.
+pub fn ttlSweepOnce(self: *Fs) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const now = nowUnixSeconds(self.io);
+    var it = self.dynamo_tables.iterator();
+    while (it.next()) |entry| {
+        const slot = entry.value_ptr.*;
+        const spec = slot.ttl_spec orelse continue;
+        if (spec.status != .enabled) continue;
+        sweepTableLocked(self, slot, spec.attribute_name, now);
+    }
+}
+
+fn sweepTableLocked(self: *Fs, slot: *storage.TableSlot, attr_name: []const u8, now_unix: i64) void {
+    // Snapshot the expired keys first; we can't mutate the map while
+    // iterating it (Zig hash-map iterator is invalidated on modify).
+    var victims: std.ArrayList(storage.Item) = .empty;
+    defer {
+        for (victims.items) |*v| v.deinit(self.allocator);
+        victims.deinit(self.allocator);
+    }
+
+    var it = slot.items.iterator();
+    while (it.next()) |entry| {
+        const item = entry.value_ptr.*;
+        const av = item.attributeValue(attr_name) orelse continue;
+        const n_str = switch (av.*) {
+            .n => |n| n,
+            else => continue, // wrong type → ignored per AWS
+        };
+        const ttl_val = std.fmt.parseFloat(f64, n_str) catch continue;
+        if (ttl_val > @as(f64, @floatFromInt(now_unix))) continue;
+
+        // Project keys for the delete call.
+        const key_only = storage.dynamo_state.projectKeys(self.allocator, slot, item) catch continue;
+        victims.append(self.allocator, key_only) catch {
+            var k = key_only;
+            k.deinit(self.allocator);
+            continue;
+        };
+    }
+
+    for (victims.items) |*key_only| {
+        applyDeleteLocked(self, slot, key_only, .ttl_sweeper) catch {};
+    }
 }
 
 // ---------------------------------------------------------------------------

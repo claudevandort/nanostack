@@ -16,6 +16,46 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-05-17
+
+**Patch release: DynamoDB TTL background sweeper.**
+
+Per the [versioning scheme](#versioning-scheme), patches mark "significant pinned cuts of work". v0.2.2 deferred TTL alongside PartiQL / PITR / Imports/Exports; this release closes TTL because ephemeral-data tables (session storage, OTP codes, idempotency keys, request dedup) are a common DDB use case that simply doesn't work in local emulation without it.
+
+This release also introduces **the first background thread in nanostack**. The threading model + shutdown semantics (`std.Thread.spawn` from `Fs.init`, stop-flag via `std.atomic.Value(bool)`, join in `Fs.deinit`) become the precedent for future sweepers.
+
+### Added — TTL surface (2 ops)
+
+- **`UpdateTimeToLive`** — `{TableName, TimeToLiveSpecification: {Enabled, AttributeName}}`. Returns `{TimeToLiveSpecification: {Enabled, AttributeName}}` (different wrapper from Describe — matches the AWS shape exactly). Status snaps directly to terminal; we don't model the ENABLING / DISABLING transients.
+- **`DescribeTimeToLive`** — `{TableName}` → `{TimeToLiveDescription: {TimeToLiveStatus, AttributeName?}}`. Returns `DISABLED` for never-configured tables (no AttributeName). Spec persists across nanostack restart.
+
+### Added — background sweeper
+
+- **`--ttl-sweep-interval-seconds N`** (range 1..=3600, default 5). Real AWS evicts "best-effort within 48h"; 5s makes local-dev tests responsive without polling too aggressively.
+- **One background thread per `Fs` instance**, spawned in `Fs.initWithOptions` and joined in `Fs.deinit`. Shutdown signalled via a `std.atomic.Value(bool)` polled in 250ms chunks. Test-friendly `Fs.init` shim disables the sweeper (Zig test runner doesn't tolerate dangling threads).
+- **Sweep semantics**: iterates every TTL-enabled table, collects items where the TTL attribute is a `Number` (`.n`) ≤ `now()`, and evicts each via the existing `applyDeleteLocked` (so capture + on-disk delete come for free). Items where the attribute is missing or non-Number are ignored, matching AWS.
+
+### Added — Stream-record userIdentity for TTL-driven REMOVE
+
+- Sweeper-evicted items appear in the stream with `userIdentity: {Type: "Service", PrincipalId: "dynamodb.amazonaws.com"}`. User-driven `DeleteItem` REMOVE records have no `userIdentity` field — matches AWS exactly, so consumer code that filters on this distinction works.
+- Internally: new `UserIdentity` enum (`.user`, `.ttl_sweeper`) threaded through `captureWrite` → `Stream.capture` → `StreamRecord`. The 6 existing capture sites pass `.user`; the sweeper passes `.ttl_sweeper` via a new identity parameter on `applyDeleteLocked`.
+
+### Tests
+
+- Zig unit tests: 489 → 497 (+8 — TTL spec, parse + render, status enum, CLI flag).
+- Python conformance: 337 → 351 (+14 — schema persistence + 7 surface tests + 6 sweeper tests + 1 userIdentity contrast test).
+- JS conformance: 70 → 74 (+4 surface tests; eviction is verified in Python).
+- AWS CLI conformance: 22 → 25 (+3 surface tests).
+
+### Documented divergences (intentional)
+
+- **Sweep interval defaults to 5s**, not the AWS "up to 48h". Tunable.
+- **Status transitions snap immediately**, no ENABLING / DISABLING transients.
+
+### Strategic note
+
+After v0.2.3 the DDB deferred list trims to PartiQL, PITR, and Imports/Exports — all candidates for future v0.2.x patches if demand surfaces. Global Tables and DAX stay out of scope indefinitely (multi-region and separate-protocol respectively). The next minor (v0.3.0) is still SQS per PRD §15.
+
 ## [0.2.2] — 2026-05-17
 
 **Patch release: DynamoDB Streams.**

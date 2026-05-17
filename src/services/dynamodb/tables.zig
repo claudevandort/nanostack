@@ -73,6 +73,29 @@ pub fn updateTable(ctx: Context) Result {
     return .{ .ok = .{ .body = body } };
 }
 
+pub fn updateTimeToLive(ctx: Context) Result {
+    const req = tables_wire.parseUpdateTimeToLive(ctx.allocator, ctx.request.body) catch |err|
+        return .{ .err = mapParseErr(err) };
+    const spec = ctx.backend.updateTimeToLive(.{
+        .name = req.name,
+        .enabled = req.enabled,
+        .attribute_name = req.attribute_name,
+    }) catch |err| return .{ .err = mapStorageErr(err) };
+    const body = tables_wire.renderUpdateTimeToLive(ctx.allocator, spec) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
+}
+
+pub fn describeTimeToLive(ctx: Context) Result {
+    const req = tables_wire.parseDescribeTimeToLive(ctx.allocator, ctx.request.body) catch |err|
+        return .{ .err = mapParseErr(err) };
+    const spec = ctx.backend.describeTimeToLive(req.name) catch |err|
+        return .{ .err = mapStorageErr(err) };
+    const body = tables_wire.renderTimeToLiveDescription(ctx.allocator, spec) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
+}
+
 pub fn listTables(ctx: Context) Result {
     const req = tables_wire.parseListTables(ctx.allocator, ctx.request.body) catch |err|
         return .{ .err = mapParseErr(err) };

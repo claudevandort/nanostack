@@ -22,6 +22,10 @@ pub const Config = struct {
     no_auth: bool = false,
     /// SigV4 clock-skew tolerance (seconds). AWS default is 900 (15 min).
     skew_seconds: i64 = 900,
+    /// DynamoDB TTL background sweep interval (seconds). Real AWS evicts
+    /// expired items "best effort within 48h"; for local-dev tests we
+    /// default to 5s so callers don't need to wait. Range: 1..=3600.
+    ttl_sweep_interval_seconds: u32 = 5,
     /// `--version` flag: print version + exit before starting the server.
     print_version: bool = false,
 
@@ -59,6 +63,12 @@ pub fn parse(args: []const [:0]const u8) ParseError!Config {
             i += 1;
             if (i >= args.len) return ParseError.MissingValue;
             c.skew_seconds = std.fmt.parseInt(i64, args[i], 10) catch return ParseError.InvalidValue;
+        } else if (std.mem.eql(u8, arg, "--ttl-sweep-interval-seconds")) {
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            const n = std.fmt.parseInt(u32, args[i], 10) catch return ParseError.InvalidValue;
+            if (n < 1 or n > 3600) return ParseError.InvalidValue;
+            c.ttl_sweep_interval_seconds = n;
         } else if (std.mem.eql(u8, arg, "--port")) {
             i += 1;
             if (i >= args.len) return ParseError.MissingValue;
@@ -119,6 +129,13 @@ test "overrides" {
     try testing.expectEqual(@as(u16, 9999), c.port);
     try testing.expectEqualStrings("0.0.0.0", c.bind);
     try testing.expectEqualStrings("eu-west-1", c.region);
+}
+
+test "--ttl-sweep-interval-seconds parses + range-checks" {
+    const c = try parse(&.{ "nanostack", "--ttl-sweep-interval-seconds", "30" });
+    try testing.expectEqual(@as(u32, 30), c.ttl_sweep_interval_seconds);
+    try testing.expectError(ParseError.InvalidValue, parse(&.{ "nanostack", "--ttl-sweep-interval-seconds", "0" }));
+    try testing.expectError(ParseError.InvalidValue, parse(&.{ "nanostack", "--ttl-sweep-interval-seconds", "3601" }));
 }
 
 test "no-auth + skew flags" {
