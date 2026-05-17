@@ -118,6 +118,18 @@ fn handleCore(ctx: Context) Result {
     if (std.mem.eql(u8, target, "UntagResource")) return misc_handler.untagResource(ctx);
     if (std.mem.eql(u8, target, "ListTagsOfResource")) return misc_handler.listTagsOfResource(ctx);
 
+    // Kinesis-streaming-destination ops are on the core DDB service
+    // (not the Streams sub-service). We explicitly reject them so they
+    // don't fall through to "Unsupported operation" — Kinesis isn't
+    // emulated and we want consumers to see the precise reason.
+    if (std.mem.eql(u8, target, "EnableKinesisStreamingDestination") or
+        std.mem.eql(u8, target, "DisableKinesisStreamingDestination"))
+    {
+        const owned = ctx.allocator.dupe(u8, "Kinesis service is not enabled on this nanostack instance.") catch
+            return .{ .err = .{ .code = .internal_server_error } };
+        return .{ .err = .{ .code = .validation_exception, .message = owned } };
+    }
+
     // Anything else gets 400 ValidationException with a message that
     // names the unsupported target. AWS-correct: unknown targets return
     // ValidationException, not 404.
@@ -135,14 +147,6 @@ fn handleStreams(ctx: Context) Result {
     if (std.mem.eql(u8, target, "DescribeStream")) return streams_handler.describeStream(ctx);
     if (std.mem.eql(u8, target, "GetShardIterator")) return streams_handler.getShardIterator(ctx);
     if (std.mem.eql(u8, target, "GetRecords")) return streams_handler.getRecords(ctx);
-
-    if (std.mem.eql(u8, target, "EnableKinesisStreamingDestination") or
-        std.mem.eql(u8, target, "DisableKinesisStreamingDestination"))
-    {
-        const owned = ctx.allocator.dupe(u8, "Kinesis service is not enabled on this nanostack instance.") catch
-            return .{ .err = .{ .code = .internal_server_error } };
-        return .{ .err = .{ .code = .validation_exception, .message = owned } };
-    }
     return unsupportedTarget(ctx, target);
 }
 
