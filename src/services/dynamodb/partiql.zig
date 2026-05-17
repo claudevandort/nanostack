@@ -60,17 +60,281 @@ pub fn executeStatement(ctx: Context) Result {
 }
 
 pub fn executeTransaction(ctx: Context) Result {
-    _ = ctx;
-    return unsupported("ExecuteTransaction lands in Phase 3 of v0.2.4.");
+    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.request.body, .{}) catch
+        return .{ .err = .{ .code = .validation_exception, .message = "Could not parse the request body as JSON." } };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .err = .{ .code = .validation_exception } };
+
+    const ts_v = parsed.value.object.get("TransactStatements") orelse
+        return .{ .err = .{ .code = .validation_exception, .message = "TransactStatements is required." } };
+    if (ts_v != .array) return .{ .err = .{ .code = .validation_exception } };
+    const items = ts_v.array.items;
+    if (items.len == 0 or items.len > 100) {
+        return .{ .err = .{ .code = .validation_exception, .message = "TransactStatements size must be in 1..=100." } };
+    }
+
+    // Parse + dispatch each statement into a TxWriteOp + applier ctx.
+    var ops: std.ArrayList(storage.TxWriteOp) = .empty;
+    defer ops.deinit(ctx.allocator);
+    var update_ctxs: std.ArrayList(*UpdateApplierCtx) = .empty;
+    defer update_ctxs.deinit(ctx.allocator);
+
+    for (items) |entry| {
+        if (entry != .object) return .{ .err = .{ .code = .validation_exception } };
+        const stmt_v = entry.object.get("Statement") orelse
+            return .{ .err = .{ .code = .validation_exception, .message = "TransactStatements[].Statement is required." } };
+        if (stmt_v != .string) return .{ .err = .{ .code = .validation_exception } };
+
+        const params = parseParameters(ctx.allocator, entry.object.get("Parameters")) catch
+            return .{ .err = .{ .code = .validation_exception, .message = "Invalid TransactStatements[].Parameters." } };
+        const ast_doc = partiql_parser.parse(ctx.allocator, stmt_v.string) catch |err|
+            return .{ .err = mapParseErr(err) };
+        if (ast_doc.placeholder_count != @as(u32, @intCast(params.len))) {
+            return .{ .err = .{ .code = .validation_exception, .message = "Parameters count mismatch." } };
+        }
+
+        const op = buildTxOp(ctx, ast_doc.statement, params, &update_ctxs) catch |err| return switch (err) {
+            error.UnresolvableOperand => .{ .err = .{ .code = .validation_exception, .message = "Unbound parameter." } },
+            error.SelectInTransaction => .{ .err = .{ .code = .validation_exception, .message = "SELECT is not allowed in ExecuteTransaction." } },
+            else => .{ .err = .{ .code = .internal_server_error } },
+        };
+        ops.append(ctx.allocator, op) catch return .{ .err = .{ .code = .internal_server_error } };
+    }
+
+    var reasons: []?[]const u8 = &.{};
+    ctx.backend.transactWriteItems(ctx.allocator, ops.items, &reasons) catch |err| switch (err) {
+        storage.Error.TransactionCanceled => return renderCancellation(ctx.allocator, reasons),
+        else => return .{ .err = mapStorageErr(err) },
+    };
+
+    // Success: empty Responses array of the right size.
+    var aw: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    s.beginObject() catch return .{ .err = .{ .code = .internal_server_error } };
+    s.objectField("Responses") catch return .{ .err = .{ .code = .internal_server_error } };
+    s.beginArray() catch return .{ .err = .{ .code = .internal_server_error } };
+    for (ops.items) |_| {
+        s.beginObject() catch return .{ .err = .{ .code = .internal_server_error } };
+        s.endObject() catch return .{ .err = .{ .code = .internal_server_error } };
+    }
+    s.endArray() catch return .{ .err = .{ .code = .internal_server_error } };
+    s.endObject() catch return .{ .err = .{ .code = .internal_server_error } };
+    const body = aw.toOwnedSlice() catch return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
+}
+
+fn renderCancellation(allocator: Allocator, reasons: []?[]const u8) Result {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    s.beginObject() catch return .{ .err = .{ .code = .internal_server_error } };
+    s.objectField("CancellationReasons") catch return .{ .err = .{ .code = .internal_server_error } };
+    s.beginArray() catch return .{ .err = .{ .code = .internal_server_error } };
+    for (reasons) |r| {
+        s.beginObject() catch return .{ .err = .{ .code = .internal_server_error } };
+        s.objectField("Code") catch return .{ .err = .{ .code = .internal_server_error } };
+        s.write(r orelse "None") catch return .{ .err = .{ .code = .internal_server_error } };
+        s.endObject() catch return .{ .err = .{ .code = .internal_server_error } };
+    }
+    s.endArray() catch return .{ .err = .{ .code = .internal_server_error } };
+    s.endObject() catch return .{ .err = .{ .code = .internal_server_error } };
+    const body = aw.toOwnedSlice() catch return .{ .err = .{ .code = .internal_server_error } };
+    // AWS surfaces transaction cancellation as TransactionCanceledException.
+    return .{ .err = .{ .code = .transaction_canceled_exception, .message = body } };
+}
+
+/// Build a `TxWriteOp` from a parsed PartiQL statement. Allocates
+/// auxiliary closures (applier ctxs) inside the per-request arena.
+fn buildTxOp(
+    ctx: Context,
+    stmt: partiql_ast.Statement,
+    params: []const AttributeValue,
+    update_ctxs: *std.ArrayList(*UpdateApplierCtx),
+) !storage.TxWriteOp {
+    return switch (stmt) {
+        .select => error.SelectInTransaction,
+        .insert => |ins| blk: {
+            const n = ins.fields.len;
+            const names = try ctx.allocator.alloc([]const u8, n);
+            const values = try ctx.allocator.alloc(AttributeValue, n);
+            for (ins.fields, 0..) |f, i| {
+                names[i] = f.name;
+                values[i] = resolveOperand(f.value, params) orelse return error.UnresolvableOperand;
+            }
+            const item_ptr = try ctx.allocator.create(storage.Item);
+            item_ptr.* = .{ .names = names, .values = values };
+            break :blk .{ .kind = .put, .table = ins.table_name, .item_or_key = item_ptr };
+        },
+        .update => |upd| blk: {
+            const key_owned = try ctx.allocator.create(storage.Item);
+            key_owned.* = try buildKeyItem(ctx.allocator, upd.where_clause, params);
+            const ac = try ctx.allocator.create(UpdateApplierCtx);
+            ac.* = .{ .assignments = upd.assignments, .params = params, .allocator = ctx.allocator };
+            try update_ctxs.append(ctx.allocator, ac);
+            break :blk .{
+                .kind = .update,
+                .table = upd.table_name,
+                .item_or_key = key_owned,
+                .apply_fn = updateApplyFn,
+                .apply_ctx = @ptrCast(ac),
+            };
+        },
+        .delete => |del| blk: {
+            const key_owned = try ctx.allocator.create(storage.Item);
+            key_owned.* = try buildKeyItem(ctx.allocator, del.where_clause, params);
+            break :blk .{ .kind = .delete, .table = del.table_name, .item_or_key = key_owned };
+        },
+    };
 }
 
 pub fn batchExecuteStatement(ctx: Context) Result {
-    _ = ctx;
-    return unsupported("BatchExecuteStatement lands in Phase 3 of v0.2.4.");
+    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.request.body, .{}) catch
+        return .{ .err = .{ .code = .validation_exception, .message = "Could not parse the request body as JSON." } };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .err = .{ .code = .validation_exception } };
+
+    const ss_v = parsed.value.object.get("Statements") orelse
+        return .{ .err = .{ .code = .validation_exception, .message = "Statements is required." } };
+    if (ss_v != .array) return .{ .err = .{ .code = .validation_exception } };
+    const items = ss_v.array.items;
+    if (items.len == 0 or items.len > 25) {
+        return .{ .err = .{ .code = .validation_exception, .message = "Statements size must be in 1..=25." } };
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    s.beginObject() catch return .{ .err = .{ .code = .internal_server_error } };
+    s.objectField("Responses") catch return .{ .err = .{ .code = .internal_server_error } };
+    s.beginArray() catch return .{ .err = .{ .code = .internal_server_error } };
+
+    for (items) |entry| {
+        s.beginObject() catch return .{ .err = .{ .code = .internal_server_error } };
+
+        if (entry != .object) {
+            writeBatchError(&s, .{ .code = .validation_exception, .message = "Statements[] entry must be an object." }) catch {};
+            s.endObject() catch return .{ .err = .{ .code = .internal_server_error } };
+            continue;
+        }
+        const stmt_v = entry.object.get("Statement") orelse {
+            writeBatchError(&s, .{ .code = .validation_exception, .message = "Statements[].Statement is required." }) catch {};
+            s.endObject() catch return .{ .err = .{ .code = .internal_server_error } };
+            continue;
+        };
+        if (stmt_v != .string) {
+            writeBatchError(&s, .{ .code = .validation_exception, .message = "Statements[].Statement must be a string." }) catch {};
+            s.endObject() catch return .{ .err = .{ .code = .internal_server_error } };
+            continue;
+        }
+
+        const params = parseParameters(ctx.allocator, entry.object.get("Parameters")) catch {
+            writeBatchError(&s, .{ .code = .validation_exception, .message = "Invalid Parameters." }) catch {};
+            s.endObject() catch return .{ .err = .{ .code = .internal_server_error } };
+            continue;
+        };
+        const ast_doc = partiql_parser.parse(ctx.allocator, stmt_v.string) catch |err| {
+            writeBatchError(&s, mapParseErr(err)) catch {};
+            s.endObject() catch return .{ .err = .{ .code = .internal_server_error } };
+            continue;
+        };
+        if (ast_doc.placeholder_count != @as(u32, @intCast(params.len))) {
+            writeBatchError(&s, .{ .code = .validation_exception, .message = "Parameters count mismatch." }) catch {};
+            s.endObject() catch return .{ .err = .{ .code = .internal_server_error } };
+            continue;
+        }
+
+        runBatchStatement(&s, ctx, ast_doc.statement, params) catch |err| {
+            writeBatchError(&s, .{ .code = mapErrCode(err), .message = null }) catch {};
+        };
+        s.endObject() catch return .{ .err = .{ .code = .internal_server_error } };
+    }
+
+    s.endArray() catch return .{ .err = .{ .code = .internal_server_error } };
+    s.endObject() catch return .{ .err = .{ .code = .internal_server_error } };
+    const body = aw.toOwnedSlice() catch return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
 }
 
-fn unsupported(msg: []const u8) Result {
-    return .{ .err = .{ .code = .validation_exception, .message = msg } };
+fn mapErrCode(e: anyerror) errors.Code {
+    return switch (e) {
+        storage.Error.TableNotFound => .resource_not_found_exception,
+        storage.Error.ConditionalCheckFailed => .conditional_check_failed_exception,
+        else => .internal_server_error,
+    };
+}
+
+fn writeBatchError(s: *std.json.Stringify, eb: ErrorBody) !void {
+    try s.objectField("Error");
+    try s.beginObject();
+    try s.objectField("Code");
+    try s.write(@tagName(eb.code));
+    if (eb.message) |m| {
+        try s.objectField("Message");
+        try s.write(m);
+    }
+    try s.endObject();
+}
+
+fn runBatchStatement(
+    s: *std.json.Stringify,
+    ctx: Context,
+    stmt: partiql_ast.Statement,
+    params: []const AttributeValue,
+) !void {
+    switch (stmt) {
+        .select => |sel| {
+            // Run as a query and embed Items.
+            const slot = try ctx.backend.describeTable(sel.table_name);
+            var holder: KeyPredicateHolder = .{ .cond = sel.where_clause, .slot = slot, .params = params };
+            const key_pred: storage.ItemPredicate = .{
+                .ctx = @ptrCast(&holder),
+                .match_fn = KeyPredicateHolder.match,
+            };
+            const result = try ctx.backend.query(ctx.allocator, .{
+                .table = sel.table_name,
+                .key_predicate = key_pred,
+                .filter_predicate = null,
+                .forward = true,
+                .limit = 0,
+                .exclusive_start_key = null,
+            });
+            try s.objectField("Item");
+            // BatchExecuteStatement returns a single Item per statement
+            // (matches AWS — SELECT in batch is for point lookups).
+            if (result.items.len > 0) {
+                try items_wire.renderItem(s, ctx.allocator, &result.items[0]);
+            } else {
+                try s.beginObject();
+                try s.endObject();
+            }
+        },
+        .insert => |ins| {
+            const n = ins.fields.len;
+            const names = try ctx.allocator.alloc([]const u8, n);
+            const values = try ctx.allocator.alloc(AttributeValue, n);
+            for (ins.fields, 0..) |f, i| {
+                names[i] = f.name;
+                values[i] = resolveOperand(f.value, params) orelse return error.UnresolvableOperand;
+            }
+            const item: storage.Item = .{ .names = names, .values = values };
+            _ = try ctx.backend.putItem(ctx.allocator, .{ .table = ins.table_name, .item = &item });
+        },
+        .update => |upd| {
+            const key = try buildKeyItem(ctx.allocator, upd.where_clause, params);
+            var ac: UpdateApplierCtx = .{ .assignments = upd.assignments, .params = params, .allocator = ctx.allocator };
+            _ = try ctx.backend.updateItem(ctx.allocator, .{
+                .table = upd.table_name,
+                .key = &key,
+                .apply_fn = updateApplyFn,
+                .apply_ctx = @ptrCast(&ac),
+            });
+        },
+        .delete => |del| {
+            const key = try buildKeyItem(ctx.allocator, del.where_clause, params);
+            _ = try ctx.backend.deleteItem(ctx.allocator, .{ .table = del.table_name, .key = &key });
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
