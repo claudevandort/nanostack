@@ -21,6 +21,7 @@ const tx_handler = @import("transactions.zig");
 const misc_handler = @import("misc.zig");
 const streams_handler = @import("streams.zig");
 const partiql_handler = @import("partiql.zig");
+const backups_handler = @import("backups.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -128,6 +129,16 @@ fn handleCore(ctx: Context) Result {
     if (std.mem.eql(u8, target, "ExecuteTransaction")) return partiql_handler.executeTransaction(ctx);
     if (std.mem.eql(u8, target, "BatchExecuteStatement")) return partiql_handler.batchExecuteStatement(ctx);
 
+    // Backups + PITR (v0.2.5).
+    if (std.mem.eql(u8, target, "CreateBackup")) return backups_handler.createBackup(ctx);
+    if (std.mem.eql(u8, target, "ListBackups")) return backups_handler.listBackups(ctx);
+    if (std.mem.eql(u8, target, "DescribeBackup")) return backups_handler.describeBackup(ctx);
+    if (std.mem.eql(u8, target, "DeleteBackup")) return backups_handler.deleteBackup(ctx);
+    if (std.mem.eql(u8, target, "RestoreTableFromBackup")) return backups_handler.restoreTableFromBackup(ctx);
+    if (std.mem.eql(u8, target, "UpdateContinuousBackups")) return backups_handler.updateContinuousBackups(ctx);
+    if (std.mem.eql(u8, target, "DescribeContinuousBackups")) return backups_handler.describeContinuousBackups(ctx);
+    if (std.mem.eql(u8, target, "RestoreTableToPointInTime")) return backups_handler.restoreTableToPointInTime(ctx);
+
     // Kinesis-streaming-destination ops are on the core DDB service
     // (not the Streams sub-service). We explicitly reject them so they
     // don't fall through to "Unsupported operation" — Kinesis isn't
@@ -198,12 +209,44 @@ const StubBackend = struct {
             .getRecords = stubGetRecords,
             .updateTimeToLive = stubUpdateTimeToLive,
             .describeTimeToLive = stubDescribeTimeToLive,
+            .createBackup = stubCreateBackup,
+            .listBackups = stubListBackups,
+            .describeBackup = stubDescribeBackup,
+            .deleteBackup = stubDeleteBackup,
+            .restoreTableFromBackup = stubRestoreFromBackup,
+            .updateContinuousBackups = stubUpdateContinuousBackups,
+            .describeContinuousBackups = stubDescribeContinuousBackups,
+            .restoreTableToPointInTime = stubRestoreToPit,
         } };
+    }
+    fn stubUpdateContinuousBackups(_: *anyopaque, _: storage.UpdateContinuousBackupsInput) storage.Error!storage.ContinuousBackupsDescription {
+        unreachable;
+    }
+    fn stubDescribeContinuousBackups(_: *anyopaque, _: []const u8) storage.Error!storage.ContinuousBackupsDescription {
+        unreachable;
+    }
+    fn stubRestoreToPit(_: *anyopaque, _: Allocator, _: storage.RestoreTableToPointInTimeInput) storage.Error!*const storage.TableSlot {
+        unreachable;
     }
     fn stubUpdateTimeToLive(_: *anyopaque, _: storage.UpdateTimeToLiveInput) storage.Error!storage.dynamo_state.TimeToLiveSpec {
         unreachable;
     }
     fn stubDescribeTimeToLive(_: *anyopaque, _: []const u8) storage.Error!?storage.dynamo_state.TimeToLiveSpec {
+        unreachable;
+    }
+    fn stubCreateBackup(_: *anyopaque, _: Allocator, _: storage.CreateBackupInput) storage.Error!storage.BackupSummary {
+        unreachable;
+    }
+    fn stubListBackups(_: *anyopaque, _: Allocator, _: storage.ListBackupsInput) storage.Error!storage.ListBackupsOutput {
+        unreachable;
+    }
+    fn stubDescribeBackup(_: *anyopaque, _: Allocator, _: []const u8) storage.Error!storage.BackupDescription {
+        unreachable;
+    }
+    fn stubDeleteBackup(_: *anyopaque, _: Allocator, _: []const u8) storage.Error!storage.BackupDescription {
+        unreachable;
+    }
+    fn stubRestoreFromBackup(_: *anyopaque, _: Allocator, _: storage.RestoreTableFromBackupInput) storage.Error!*const storage.TableSlot {
         unreachable;
     }
     fn stubListStreams(_: *anyopaque, _: Allocator, _: storage.ListStreamsInput) storage.Error!storage.ListStreamsOutput {

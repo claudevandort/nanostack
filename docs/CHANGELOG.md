@@ -16,6 +16,54 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.2.5] — 2026-05-17
+
+**Patch release: DynamoDB Backups + PITR.**
+
+v0.2.5 lands the last truly-useful DDB deferred feature. Real apps test their restore workflows in local dev (backup → corrupt some data → restore-and-verify), and that flow now works end-to-end against nanostack.
+
+After v0.2.5 the deferred list trims to Imports/Exports — DDB is feature-complete for almost every local-dev workflow. The next minor (v0.3.0) is still SQS per PRD §15.
+
+### Added — Backups (5 ops)
+
+- **`CreateBackup`** — real on-disk snapshot of the table's full schema + every item at time T. Stored at `<data_dir>/profiles/<profile>/dynamodb/backups/<backup_id>/`, independent of the source table. Backups outlive `DeleteTable` (matching AWS).
+- **`ListBackups`** — `TableName` filter, `Limit` + `ExclusiveStartBackupArn` cursor, lex-ascending ARNs.
+- **`DescribeBackup`** — returns the full `BackupDescription` with snapshotted KeySchema + ItemCount + SourceTableDetails.
+- **`DeleteBackup`** — `deleteTree` on the backup dir; returns the description with `BackupStatus=DELETED`.
+- **`RestoreTableFromBackup`** — creates the target table from the snapshotted schema and replays every snapshotted item. Rejects on target-name conflict with `ResourceInUseException`.
+
+### Added — PITR (3 ops)
+
+- **`UpdateContinuousBackups`** — toggles PITR enabled/disabled. Status snaps directly (no ENABLING/DISABLING transients). Persisted on the table slot's `continuous_backup` field; survives nanostack restart.
+- **`DescribeContinuousBackups`** — returns `ContinuousBackupsStatus = ENABLED` (account-level) + `PointInTimeRecoveryDescription` with the configured PITR status + `EarliestRestorableDateTime` = `max(table_created, now - 35d)` + `LatestRestorableDateTime` = `now`.
+- **`RestoreTableToPointInTime`** — accepts `RestoreDateTime` / `UseLatestRestorableTime` but **ignores them** and snapshots the current source state. Documented divergence; LocalStack and Moto do the same. Real time-travel would require a write-ahead log we don't keep.
+
+### Internals
+
+- **Backup disk layout**: `<base>/dynamodb/backups/<backup_id>/{manifest.json, schema.json, items/<sha>.json}`. Backup IDs are `<14-digit unix-ms>-<8-hex>` (matches AWS's opaque shape). Backup ARN format `arn:aws:dynamodb:<region>:000000000000:table/<source>/backup/<id>`.
+- **Reused schema persistence**: backups invoke `slotToDoc` directly to serialize the schema, matching the live `tables/<name>/schema.json` format. Items use the existing AttributeValue renderer.
+- **`createTableLocked` extracted** from `ddbCreateTable` so callers that already hold the mutex (restore path) don't re-lock.
+- **TableSlot grows `continuous_backup`** following the same persistence template as `stream_spec` (v0.2.2) and `ttl_spec` (v0.2.3): new SchemaDoc fields, `slotToDoc` + `docToSlot` threaded through.
+
+### Tests
+
+- Zig unit tests: 514 → 520 (+6 — wire parser tests for the new ops).
+- Python conformance: 383 → 405 (+22 — full Phase-1 + Phase-2 coverage including restart-survival and the backup-then-corrupt-then-restore pattern).
+- JS conformance: 80 → 86 (+6 — round-trips through `@aws-sdk/client-dynamodb`).
+- AWS CLI conformance: 29 → 33 (+4).
+
+### Documented divergences (intentional)
+
+- **PITR target time ignored** on `RestoreTableToPointInTime`. Snapshots current state.
+- **`EarliestRestorableDateTime` is synthetic** when PITR is disabled (boto3 reads it unconditionally).
+- **No backup encryption** (no KMS modelling).
+- **`BackupSizeBytes` is an estimate** = sum of item-file sizes after JSON serialization.
+- **No restore-in-progress state.** AWS shows `CREATING` for several minutes; nanostack snaps to `ACTIVE`.
+
+### Strategic note
+
+After v0.2.5 the DDB deferred list trims to Imports/Exports only — and Imports/Exports involves S3 cross-service data shuffling and an async job model that fits a future patch better than this release. The next minor (v0.3.0) brings SQS as service #3.
+
 ## [0.2.4] — 2026-05-17
 
 **Patch release: DynamoDB PartiQL.**

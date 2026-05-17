@@ -158,6 +158,32 @@ pub const TimeToLiveSpec = struct {
     attribute_name: []const u8,
 };
 
+/// PITR (point-in-time recovery) status. AWS shows ENABLED / DISABLED
+/// only; we snap to terminal state (no ENABLING/DISABLING transients).
+pub const PitrStatus = enum {
+    enabled,
+    disabled,
+
+    pub fn toAws(self: PitrStatus) []const u8 {
+        return switch (self) {
+            .enabled => "ENABLED",
+            .disabled => "DISABLED",
+        };
+    }
+};
+
+/// Continuous backups (PITR) config. Default = disabled.
+pub const ContinuousBackupSpec = struct {
+    /// Whether PITR is enabled. Continuous-backups-as-a-feature is
+    /// always reported as ENABLED to clients (matches AWS — the
+    /// feature is on at the account level); only the PITR sub-status
+    /// reflects this field.
+    pitr_status: PitrStatus = .disabled,
+    /// Wall-clock unix seconds when PITR was last enabled. null when
+    /// never enabled. Used to compute `EarliestRestorableDateTime`.
+    enabled_unix: ?i64 = null,
+};
+
 /// One entry in a `KeySchema` list. AWS keys are exactly 1 HASH or
 /// (1 HASH + 1 RANGE); the validator enforces that on Put.
 pub const KeyAttribute = struct {
@@ -302,6 +328,8 @@ pub const TableSlot = struct {
     /// TTL config (v0.2.3). Null when never configured. The background
     /// sweeper in fs.zig consults this on each tick.
     ttl_spec: ?TimeToLiveSpec = null,
+    /// PITR config (v0.2.5). Defaults to "disabled".
+    continuous_backup: ContinuousBackupSpec = .{},
     created_unix: i64,
     /// In-memory item store, keyed on a stable composite "<pk>|<sk?>"
     /// string. Populated by ddbPutItem on every write and rebuilt on

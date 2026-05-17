@@ -34,6 +34,12 @@ pub const Code = enum {
     provisioned_throughput_exceeded_exception,
     /// Account-level limit hit (e.g. table count).
     limit_exceeded_exception,
+    /// Backup ARN doesn't match any known backup (v0.2.5).
+    backup_not_found_exception,
+    /// Continuous backups (PITR) state precondition failed — e.g.
+    /// RestoreTableToPointInTime called against a table that never had
+    /// PITR enabled (v0.2.5).
+    continuous_backups_unavailable_exception,
     /// Op recognised by the dispatcher but not yet implemented.
     not_implemented,
     /// Generic 500.
@@ -48,6 +54,8 @@ pub const Code = enum {
             .transaction_canceled_exception => "TransactionCanceledException",
             .provisioned_throughput_exceeded_exception => "ProvisionedThroughputExceededException",
             .limit_exceeded_exception => "LimitExceededException",
+            .backup_not_found_exception => "BackupNotFoundException",
+            .continuous_backups_unavailable_exception => "ContinuousBackupsUnavailableException",
             .not_implemented => "InternalServerError", // AWS doesn't expose "NotImplemented" on DDB
             .internal_server_error => "InternalServerError",
         };
@@ -62,6 +70,8 @@ pub const Code = enum {
             .transaction_canceled_exception => "Transaction cancelled, please refer to cancellation reasons for specific reasons",
             .provisioned_throughput_exceeded_exception => "The level of configured provisioned throughput for the table was exceeded.",
             .limit_exceeded_exception => "An account-level limit was exceeded.",
+            .backup_not_found_exception => "Backup not found.",
+            .continuous_backups_unavailable_exception => "Continuous backups are not enabled on this table.",
             .not_implemented => "This operation is not implemented in nanostack.",
             .internal_server_error => "An error occurred on the server side.",
         };

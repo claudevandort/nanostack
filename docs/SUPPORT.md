@@ -99,6 +99,14 @@ DynamoDB is the second AWS service nanostack covers, opt-in via `--services s3,d
 | **ExecuteStatement** | supported (SELECT / INSERT / UPDATE / DELETE; positional `?` parameters; RETURNING ALL_OLD/ALL_NEW/MODIFIED_OLD/MODIFIED_NEW on UPDATE/DELETE; quoted + unquoted identifiers; index access via `"table"."index"`) | v0.2.4 |
 | **ExecuteTransaction** | supported (up to 100 statements; atomic all-or-nothing; SELECT rejected per AWS; cancellation surfaces TransactionCanceledException with CancellationReasons) | v0.2.4 |
 | **BatchExecuteStatement** | supported (up to 25 statements; per-statement Responses array; SELECT/INSERT/UPDATE/DELETE all allowed; per-statement errors don't abort the batch) | v0.2.4 |
+| **CreateBackup** | supported (real on-disk snapshot of schema + items at time T; backups outlive their source table, matching AWS) | v0.2.5 |
+| **ListBackups** | supported (TableName filter; Limit + ExclusiveStartBackupArn cursor; lex-ascending) | v0.2.5 |
+| **DescribeBackup** | supported (returns BackupDescription with snapshotted KeySchema + ItemCount + SourceTableDetails) | v0.2.5 |
+| **DeleteBackup** | supported (returns BackupDescription with BackupStatus=DELETED; idempotent on missing → BackupNotFoundException) | v0.2.5 |
+| **RestoreTableFromBackup** | supported (creates new table from snapshotted schema; replays every snapshotted item; rejects on target-name conflict with ResourceInUseException) | v0.2.5 |
+| **UpdateContinuousBackups** | supported (ENABLED / DISABLED; spec persists across restart; no transient ENABLING/DISABLING) | v0.2.5 |
+| **DescribeContinuousBackups** | supported (returns PITR status + EarliestRestorableDateTime = max(table_created, now-35d), LatestRestorableDateTime = now) | v0.2.5 |
+| **RestoreTableToPointInTime** | supported (accepts RestoreDateTime / UseLatestRestorableTime but ignores them — always snapshots current source state; LocalStack-compatible divergence) | v0.2.5 |
 
 ### DynamoDBStreams sub-service (v0.2.2)
 
@@ -115,7 +123,7 @@ Target prefix `DynamoDBStreams_20120810.*`. Opt-in via the same `--services s3,d
 
 Documented divergences (intentional):
 - **Bucket-policy-style `Condition` blocks are skipped** in IAM policies (same caveat as S3 M14). Not applicable to DynamoDB resource policies since we don't model IAM at all.
-- **Backups/PITR, Imports/Exports** — out of scope for v0.2.x. Returned as `ValidationException` (unknown target) for now. Candidates for future v0.2.x patches if there's demand.
+- **Imports/Exports** — out of scope for v0.2.x. Returned as `ValidationException` (unknown target) for now. Candidate for a future patch if there's demand.
 - **Global Tables, DAX** — out of scope indefinitely. Global Tables is meaningless on a single-region emulator; DAX is a separate cache service with its own binary protocol, wrong shape for an emulator.
 - **Parallel scan (`TotalSegments > 1`)** will return `ValidationException`.
 - **GSI auto-fetch-from-base-table** for non-projected attrs is a client-SDK behavior; nanostack returns only the projected attrs.
@@ -125,6 +133,10 @@ Documented divergences (intentional):
 - **TTL: status transitions snap immediately.** AWS shows ENABLING / DISABLING transients for ~1h after each call; we move straight to ENABLED / DISABLED. Tests asserting on transient states won't match.
 - **PartiQL grammar**: Phase 1 covers what AWS supports — SELECT / INSERT / UPDATE / DELETE with WHERE constrained to PK eq + optional SK predicate (eq / lt / le / gt / ge / BETWEEN / begins_with). FilterExpression-style scan filters (OR / NOT / IN / AND-of-non-key-attrs) and richer SET (list_append, if_not_exists) land in future patches. Quoted identifiers are case-sensitive; unquoted identifiers case-fold to lowercase, matching AWS.
 - **PartiQL `LIMIT` in statement**: rejected — AWS doesn't support it either. Use the request-level `Limit` parameter instead.
+- **PITR target time is ignored.** `RestoreTableToPointInTime` accepts `RestoreDateTime` / `UseLatestRestorableTime` but always snapshots the current source state. Documented divergence — same as LocalStack. Real time-travel would require a write-ahead log we don't keep.
+- **`EarliestRestorableDateTime` is synthetic** = `max(table_created, now - 35d)` even when PITR is disabled. boto3 reads the field unconditionally so we return a plausible value.
+- **Backup snapshots aren't encrypted.** AWS uses KMS; we don't model KMS at all.
+- **`BackupSizeBytes` is an estimate** = sum of item-file sizes after JSON serialization.
 
 ## S3
 

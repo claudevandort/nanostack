@@ -43,6 +43,9 @@ pub const Error = error{
     ShardNotFound,
     InvalidStreamArn,
     InvalidShardIterator,
+    // DynamoDB Backups (v0.2.5).
+    BackupNotFound,
+    InvalidBackupArn,
     Io,
     OutOfMemory,
 };
@@ -1287,6 +1290,112 @@ pub const UpdateTimeToLiveInput = struct {
     attribute_name: []const u8,
 };
 
+// ---------------------------------------------------------------------------
+// Backups (v0.2.5)
+
+pub const BackupStatus = enum {
+    creating,
+    available,
+    deleted,
+
+    pub fn toAws(self: BackupStatus) []const u8 {
+        return switch (self) {
+            .creating => "CREATING",
+            .available => "AVAILABLE",
+            .deleted => "DELETED",
+        };
+    }
+};
+
+pub const BackupType = enum {
+    user,
+    system,
+    aws_backup,
+
+    pub fn toAws(self: BackupType) []const u8 {
+        return switch (self) {
+            .user => "USER",
+            .system => "SYSTEM",
+            .aws_backup => "AWS_BACKUP",
+        };
+    }
+};
+
+pub const CreateBackupInput = struct {
+    table_name: []const u8,
+    backup_name: []const u8,
+    region: []const u8 = "us-east-1",
+};
+
+/// One row in ListBackups. Strings owned by the caller's allocator.
+pub const BackupSummary = struct {
+    arn: []const u8,
+    backup_id: []const u8,
+    name: []const u8,
+    table_name: []const u8,
+    creation_unix: i64,
+    status: BackupStatus,
+    backup_type: BackupType,
+    size_bytes: u64,
+};
+
+pub const ListBackupsInput = struct {
+    table_name: ?[]const u8 = null,
+    limit: u32 = 100,
+    exclusive_start_backup_arn: ?[]const u8 = null,
+    region: []const u8 = "us-east-1",
+};
+
+pub const ListBackupsOutput = struct {
+    backups: []BackupSummary,
+    last_evaluated_backup_arn: ?[]const u8 = null,
+};
+
+/// Verbose description returned by DescribeBackup. Includes the
+/// snapshotted schema + item-level summary.
+pub const BackupDescription = struct {
+    summary: BackupSummary,
+    /// Snapshotted schema fields (the same shape as a CreateTable
+    /// input plus the original creation timestamp). All slices are
+    /// owned by the caller's allocator.
+    table_name: []const u8,
+    key_schema: []const dynamo_state.KeyAttribute,
+    attribute_definitions: []const dynamo_state.AttributeDef,
+    billing_mode: dynamo_state.BillingMode,
+    table_created_unix: i64,
+    item_count: u64,
+};
+
+pub const RestoreTableFromBackupInput = struct {
+    backup_arn: []const u8,
+    target_table_name: []const u8,
+};
+
+pub const UpdateContinuousBackupsInput = struct {
+    table_name: []const u8,
+    pitr_enabled: bool,
+};
+
+pub const ContinuousBackupsDescription = struct {
+    /// AWS reports continuous backups as ENABLED at the account level;
+    /// only the PITR sub-status reflects the per-table toggle.
+    continuous_backups_status: enum { enabled, disabled },
+    pitr_status: dynamo_state.PitrStatus,
+    /// Wall-clock unix seconds. Synthetic if PITR is disabled (we still
+    /// return a value to match AWS-real wire shape).
+    earliest_restorable_unix: i64,
+    latest_restorable_unix: i64,
+};
+
+pub const RestoreTableToPointInTimeInput = struct {
+    source_table_name: []const u8,
+    target_table_name: []const u8,
+    /// Accepted but ignored; we always snapshot the current state.
+    /// Documented divergence — LocalStack does the same.
+    restore_date_time: ?i64 = null,
+    use_latest_restorable_time: bool = false,
+};
+
 /// A pre-evaluated condition predicate. Storage holds the mutex and
 /// calls `evaluate` against the existing item. Returns true if the
 /// condition passes; false → the storage op fails with
@@ -1565,6 +1674,16 @@ pub const DynamoBackend = struct {
         // v0.2.3 TTL.
         updateTimeToLive: *const fn (ctx: *anyopaque, in: UpdateTimeToLiveInput) Error!dynamo_state.TimeToLiveSpec,
         describeTimeToLive: *const fn (ctx: *anyopaque, name: []const u8) Error!?dynamo_state.TimeToLiveSpec,
+        // v0.2.5 Backups.
+        createBackup: *const fn (ctx: *anyopaque, allocator: Allocator, in: CreateBackupInput) Error!BackupSummary,
+        listBackups: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListBackupsInput) Error!ListBackupsOutput,
+        describeBackup: *const fn (ctx: *anyopaque, allocator: Allocator, backup_arn: []const u8) Error!BackupDescription,
+        deleteBackup: *const fn (ctx: *anyopaque, allocator: Allocator, backup_arn: []const u8) Error!BackupDescription,
+        restoreTableFromBackup: *const fn (ctx: *anyopaque, allocator: Allocator, in: RestoreTableFromBackupInput) Error!*const TableSlot,
+        // v0.2.5 PITR.
+        updateContinuousBackups: *const fn (ctx: *anyopaque, in: UpdateContinuousBackupsInput) Error!ContinuousBackupsDescription,
+        describeContinuousBackups: *const fn (ctx: *anyopaque, table_name: []const u8) Error!ContinuousBackupsDescription,
+        restoreTableToPointInTime: *const fn (ctx: *anyopaque, allocator: Allocator, in: RestoreTableToPointInTimeInput) Error!*const TableSlot,
     };
 
     pub fn listTables(self: DynamoBackend, allocator: Allocator) Error![]const []const u8 {
@@ -1625,6 +1744,30 @@ pub const DynamoBackend = struct {
     }
     pub fn describeTimeToLive(self: DynamoBackend, name: []const u8) Error!?dynamo_state.TimeToLiveSpec {
         return self.vtable.describeTimeToLive(self.ctx, name);
+    }
+    pub fn createBackup(self: DynamoBackend, allocator: Allocator, in: CreateBackupInput) Error!BackupSummary {
+        return self.vtable.createBackup(self.ctx, allocator, in);
+    }
+    pub fn listBackups(self: DynamoBackend, allocator: Allocator, in: ListBackupsInput) Error!ListBackupsOutput {
+        return self.vtable.listBackups(self.ctx, allocator, in);
+    }
+    pub fn describeBackup(self: DynamoBackend, allocator: Allocator, backup_arn: []const u8) Error!BackupDescription {
+        return self.vtable.describeBackup(self.ctx, allocator, backup_arn);
+    }
+    pub fn deleteBackup(self: DynamoBackend, allocator: Allocator, backup_arn: []const u8) Error!BackupDescription {
+        return self.vtable.deleteBackup(self.ctx, allocator, backup_arn);
+    }
+    pub fn restoreTableFromBackup(self: DynamoBackend, allocator: Allocator, in: RestoreTableFromBackupInput) Error!*const TableSlot {
+        return self.vtable.restoreTableFromBackup(self.ctx, allocator, in);
+    }
+    pub fn updateContinuousBackups(self: DynamoBackend, in: UpdateContinuousBackupsInput) Error!ContinuousBackupsDescription {
+        return self.vtable.updateContinuousBackups(self.ctx, in);
+    }
+    pub fn describeContinuousBackups(self: DynamoBackend, table_name: []const u8) Error!ContinuousBackupsDescription {
+        return self.vtable.describeContinuousBackups(self.ctx, table_name);
+    }
+    pub fn restoreTableToPointInTime(self: DynamoBackend, allocator: Allocator, in: RestoreTableToPointInTimeInput) Error!*const TableSlot {
+        return self.vtable.restoreTableToPointInTime(self.ctx, allocator, in);
     }
 };
 
