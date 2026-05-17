@@ -46,6 +46,16 @@ pub const Error = error{
     // DynamoDB Backups (v0.2.5).
     BackupNotFound,
     InvalidBackupArn,
+    // SQS (v0.3.0).
+    QueueNotFound,
+    QueueAlreadyExists,
+    InvalidQueueName,
+    InvalidReceiptHandle,
+    MessageNotFound,
+    InvalidMessageBody,
+    QueueDeletedRecently,
+    InvalidAttributeValue,
+    TooManyEntries,
     Io,
     OutOfMemory,
 };
@@ -1768,6 +1778,91 @@ pub const DynamoBackend = struct {
     }
     pub fn restoreTableToPointInTime(self: DynamoBackend, allocator: Allocator, in: RestoreTableToPointInTimeInput) Error!*const TableSlot {
         return self.vtable.restoreTableToPointInTime(self.ctx, allocator, in);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// SQS (v0.3.0)
+
+pub const sqs_state = @import("sqs_state.zig");
+pub const SqsQueueSlot = sqs_state.SqsQueueSlot;
+pub const Message = sqs_state.Message;
+pub const QueueAttributes = sqs_state.QueueAttributes;
+
+pub const CreateQueueInput = struct {
+    name: []const u8,
+    attrs: QueueAttributes = .{},
+    tags: []const Tag = &.{},
+};
+
+pub const QueueUrlInput = struct {
+    name: []const u8,
+};
+
+pub const ListQueuesInput = struct {
+    name_prefix: ?[]const u8 = null,
+    max_results: u32 = 1000,
+    next_token: ?[]const u8 = null,
+};
+
+pub const ListQueuesOutput = struct {
+    /// Each entry is a queue name (the caller renders to a full URL).
+    /// Owned by the caller's allocator.
+    queue_names: []const []const u8,
+    next_token: ?[]const u8 = null,
+};
+
+pub const SetQueueAttributesInput = struct {
+    name: []const u8,
+    /// Partial attribute set — caller supplies only the fields to mutate.
+    attrs: PartialAttributes,
+};
+
+pub const PartialAttributes = struct {
+    visibility_timeout: ?u32 = null,
+    delay_seconds: ?u32 = null,
+    receive_message_wait_time_seconds: ?u32 = null,
+    message_retention_period: ?u32 = null,
+    maximum_message_size: ?u32 = null,
+    /// `null` = leave as-is. To clear, pass empty string.
+    redrive_policy: ?[]const u8 = null,
+    policy: ?[]const u8 = null,
+};
+
+pub const SqsBackend = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        createQueue: *const fn (ctx: *anyopaque, in: CreateQueueInput) Error!*const SqsQueueSlot,
+        deleteQueue: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
+        listQueues: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListQueuesInput) Error!ListQueuesOutput,
+        getQueueUrl: *const fn (ctx: *anyopaque, name: []const u8) Error!*const SqsQueueSlot,
+        getQueueAttributes: *const fn (ctx: *anyopaque, name: []const u8) Error!QueueAttributes,
+        setQueueAttributes: *const fn (ctx: *anyopaque, in: SetQueueAttributesInput) Error!void,
+        purgeQueue: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
+    };
+
+    pub fn createQueue(self: SqsBackend, in: CreateQueueInput) Error!*const SqsQueueSlot {
+        return self.vtable.createQueue(self.ctx, in);
+    }
+    pub fn deleteQueue(self: SqsBackend, name: []const u8) Error!void {
+        return self.vtable.deleteQueue(self.ctx, name);
+    }
+    pub fn listQueues(self: SqsBackend, allocator: Allocator, in: ListQueuesInput) Error!ListQueuesOutput {
+        return self.vtable.listQueues(self.ctx, allocator, in);
+    }
+    pub fn getQueueUrl(self: SqsBackend, name: []const u8) Error!*const SqsQueueSlot {
+        return self.vtable.getQueueUrl(self.ctx, name);
+    }
+    pub fn getQueueAttributes(self: SqsBackend, name: []const u8) Error!QueueAttributes {
+        return self.vtable.getQueueAttributes(self.ctx, name);
+    }
+    pub fn setQueueAttributes(self: SqsBackend, in: SetQueueAttributesInput) Error!void {
+        return self.vtable.setQueueAttributes(self.ctx, in);
+    }
+    pub fn purgeQueue(self: SqsBackend, name: []const u8) Error!void {
+        return self.vtable.purgeQueue(self.ctx, name);
     }
 };
 

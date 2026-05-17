@@ -17,6 +17,8 @@ const fs_backend = @import("storage/fs.zig");
 const s3 = @import("services/s3/mod.zig");
 const dynamodb = @import("services/dynamodb/mod.zig");
 const ddb_errors = @import("wire/dynamodb/errors.zig");
+const sqs = @import("services/sqs/mod.zig");
+const sqs_errors = @import("wire/sqs/errors.zig");
 
 pub const App = struct {
     config: *const cli.Config,
@@ -24,6 +26,8 @@ pub const App = struct {
     backend: storage.Backend,
     /// DynamoDB backend, present when `--services` includes `dynamodb`.
     dynamo_backend: ?storage.DynamoBackend = null,
+    /// SQS backend, present when `--services` includes `sqs`.
+    sqs_backend: ?storage.SqsBackend = null,
 
     /// `handle` takeover circumvents httpz's pattern router so our service
     /// layer sees every request. AWS APIs are not a fit for path-pattern
@@ -65,7 +69,18 @@ pub const App = struct {
         // SDK we've seen. The SigV4 service-name validation (below) then
         // catches mismatched-credential-scope attacks.
         const target_header = req.header("x-amz-target") orelse req.header("X-Amz-Target");
-        const is_ddb = target_header != null;
+        const is_sqs = if (target_header) |t| std.mem.startsWith(u8, t, sqs.target_prefix) else false;
+        const is_ddb = target_header != null and !is_sqs;
+
+        if (is_sqs) {
+            if (!self.config.hasService("sqs")) {
+                return respondSqsError(res, request_id, host_id, .{
+                    .code = .invalid_parameter_value,
+                    .message = "SQS is not enabled. Restart nanostack with --services s3,sqs (or similar).",
+                });
+            }
+            return handleSqs(self, req, res, arena, request_id, host_id, target_header.?);
+        }
 
         if (is_ddb) {
             if (!self.config.hasService("dynamodb")) {
@@ -295,6 +310,120 @@ fn respondDdbError(
     res.body = body;
 }
 
+fn handleSqs(
+    self: *App,
+    req: *httpz.Request,
+    res: *httpz.Response,
+    arena: Allocator,
+    request_id: []const u8,
+    host_id: []const u8,
+    target_header: []const u8,
+) void {
+    // SigV4 with service="sqs". Same flow as DDB: `--no-auth` bypasses.
+    if (!self.config.no_auth) {
+        const verify_headers = collectHeaders(arena, req) catch {
+            return respondSqsError(res, request_id, host_id, .{ .code = .internal_server_error });
+        };
+        _ = sigv4.verify(arena, .{
+            .method = if (req.method == .OTHER) req.method_string else @tagName(req.method),
+            .path = req.url.path,
+            .query = req.url.query,
+            .headers = verify_headers,
+            .body = req.body() orelse "",
+        }, .{
+            .access_key = self.config.access_key,
+            .secret_key = self.config.secret_key,
+        }, .{
+            .region = self.config.region,
+            .service = "sqs",
+            .now_unix = fs_backend.nowUnixSeconds(self.io),
+            .skew_tolerance_seconds = self.config.skew_seconds,
+        }) catch {
+            return respondSqsError(res, request_id, host_id, .{
+                .code = .invalid_parameter_value,
+                .message = "The security token included in the request is invalid.",
+            });
+        };
+    }
+
+    if (!std.mem.startsWith(u8, target_header, sqs.target_prefix)) {
+        return respondSqsError(res, request_id, host_id, .{
+            .code = .invalid_parameter_value,
+            .message = "Only AmazonSQS targets are supported.",
+        });
+    }
+    const target = target_header[sqs.target_prefix.len..];
+
+    const all_headers = collectHeaders(arena, req) catch {
+        return respondSqsError(res, request_id, host_id, .{ .code = .internal_server_error });
+    };
+    const svc_headers = arena.alloc(storage.Header, all_headers.len) catch {
+        return respondSqsError(res, request_id, host_id, .{ .code = .internal_server_error });
+    };
+    for (all_headers, 0..) |h, i| svc_headers[i] = .{ .name = h.name, .value = h.value };
+
+    // Build a base URL from the `host` header (so clients reach the
+    // queue via the same authority they used to call CreateQueue).
+    const host_header = req.header("host") orelse "127.0.0.1";
+    var base_url_buf: [256]u8 = undefined;
+    const base_url = std.fmt.bufPrint(&base_url_buf, "http://{s}", .{host_header}) catch
+        return respondSqsError(res, request_id, host_id, .{ .code = .internal_server_error });
+
+    const result = sqs.handle(.{
+        .backend = self.sqs_backend orelse unreachable,
+        .allocator = arena,
+        .region = self.config.region,
+        .account_id = self.config.account_id,
+        .base_url = base_url,
+        .request = .{
+            .headers = svc_headers,
+            .body = req.body() orelse "",
+            .target = target,
+        },
+    });
+
+    switch (result) {
+        .ok => |out| respondSqsOk(res, request_id, host_id, out),
+        .err => |e| respondSqsError(res, request_id, host_id, e),
+    }
+}
+
+fn respondSqsOk(
+    res: *httpz.Response,
+    request_id: []const u8,
+    host_id: []const u8,
+    out: sqs.Output,
+) void {
+    res.status = out.status;
+    res.header("x-amz-request-id", request_id);
+    res.header("x-amzn-RequestId", request_id);
+    res.header("x-amz-id-2", host_id);
+    for (out.extra_headers) |h| res.header(h.name, h.value);
+    res.header("Content-Type", "application/x-amz-json-1.0");
+    res.content_type = null;
+    res.body = out.body;
+}
+
+fn respondSqsError(
+    res: *httpz.Response,
+    request_id: []const u8,
+    host_id: []const u8,
+    e: sqs.ErrorBody,
+) void {
+    const body = sqs_errors.render(res.arena, e.code, e.message) catch {
+        res.status = 500;
+        res.body = "";
+        return;
+    };
+    res.status = e.code.httpStatus();
+    res.header("x-amz-request-id", request_id);
+    res.header("x-amzn-RequestId", request_id);
+    res.header("x-amz-id-2", host_id);
+    res.header("Content-Type", "application/x-amz-json-1.0");
+    res.content_type = null;
+    res.body = body;
+}
+
 fn mapVerifyError(e: sigv4.VerifyError) errors.Code {
     return switch (e) {
         sigv4.VerifyError.InvalidAccessKeyId => .invalid_access_key_id,
@@ -415,6 +544,7 @@ pub fn run(
     init: std.process.Init,
     backend: storage.Backend,
     dynamo_backend: ?storage.DynamoBackend,
+    sqs_backend: ?storage.SqsBackend,
 ) !void {
     const address = try std.Io.net.IpAddress.parse(config.bind, config.port);
 
@@ -433,7 +563,7 @@ pub fn run(
         return;
     }
 
-    var app: App = .{ .config = config, .io = init.io, .backend = backend, .dynamo_backend = dynamo_backend };
+    var app: App = .{ .config = config, .io = init.io, .backend = backend, .dynamo_backend = dynamo_backend, .sqs_backend = sqs_backend };
     // Allow up to 64 MiB request bodies. AWS S3 caps single-PUT and
     // per-part uploads at 5 GiB, but httpz preallocates a per-worker pool
     // sized by `max_body_size` — anything close to AWS's ceiling OOMs the

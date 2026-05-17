@@ -41,7 +41,13 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
 
-    try server.run(arena, &config, init, fs.backend(), dynamo_backend);
+    // SQS backend (v0.3.0): opt-in via --services sqs.
+    const sqs_backend: ?storage.SqsBackend = if (config.hasService("sqs"))
+        fs.sqsBackend()
+    else
+        null;
+
+    try server.run(arena, &config, init, fs.backend(), dynamo_backend, sqs_backend);
 }
 
 fn resolveDataDir(
