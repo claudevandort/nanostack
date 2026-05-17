@@ -17,6 +17,7 @@ const items_handler = @import("items.zig");
 const query_handler = @import("query.zig");
 const scan_handler = @import("scan.zig");
 const batch_handler = @import("batch.zig");
+const tx_handler = @import("transactions.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -91,6 +92,10 @@ pub fn handle(ctx: Context) Result {
     if (std.mem.eql(u8, target, "BatchGetItem")) return batch_handler.batchGetItem(ctx);
     if (std.mem.eql(u8, target, "BatchWriteItem")) return batch_handler.batchWriteItem(ctx);
 
+    // Transactions (M15-tx, Phase 9).
+    if (std.mem.eql(u8, target, "TransactGetItems")) return tx_handler.transactGetItems(ctx);
+    if (std.mem.eql(u8, target, "TransactWriteItems")) return tx_handler.transactWriteItems(ctx);
+
     // Anything else gets 400 ValidationException with a message that
     // names the unsupported target. AWS-correct: unknown targets return
     // ValidationException, not 404.
@@ -123,9 +128,17 @@ const StubBackend = struct {
             .deleteItem = stubDeleteItem,
             .updateItem = stubUpdateItem,
             .query = stubQuery,
+            .transactGetItems = stubTxGet,
+            .transactWriteItems = stubTxWrite,
         } };
     }
     fn stubQuery(_: *anyopaque, _: Allocator, _: storage.QueryInput) storage.Error!storage.QueryResult {
+        unreachable;
+    }
+    fn stubTxGet(_: *anyopaque, _: Allocator, _: []const storage.TxGetItem) storage.Error!storage.TxGetResult {
+        unreachable;
+    }
+    fn stubTxWrite(_: *anyopaque, _: Allocator, _: []const storage.TxWriteOp, _: *[]?[]const u8) storage.Error!void {
         unreachable;
     }
 

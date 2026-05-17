@@ -796,6 +796,8 @@ const dynamo_vtable: storage.DynamoBackend.VTable = .{
     .deleteItem = vtDdbDeleteItem,
     .updateItem = vtDdbUpdateItem,
     .query = vtDdbQuery,
+    .transactGetItems = vtDdbTransactGet,
+    .transactWriteItems = vtDdbTransactWrite,
 };
 
 fn vtDdbListTables(ctx: *anyopaque, allocator: Allocator) storage.Error![]const []const u8 {
@@ -827,6 +829,12 @@ fn vtDdbUpdateItem(ctx: *anyopaque, allocator: Allocator, in: storage.UpdateItem
 }
 fn vtDdbQuery(ctx: *anyopaque, allocator: Allocator, in: storage.QueryInput) storage.Error!storage.QueryResult {
     return ddbQuery(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtDdbTransactGet(ctx: *anyopaque, allocator: Allocator, ops: []const storage.TxGetItem) storage.Error!storage.TxGetResult {
+    return ddbTransactGet(@ptrCast(@alignCast(ctx)), allocator, ops);
+}
+fn vtDdbTransactWrite(ctx: *anyopaque, allocator: Allocator, ops: []const storage.TxWriteOp, reasons_out: *[]?[]const u8) storage.Error!void {
+    return ddbTransactWrite(@ptrCast(@alignCast(ctx)), allocator, ops, reasons_out);
 }
 
 // ---------------------------------------------------------------------------
@@ -3850,6 +3858,155 @@ pub fn ddbQuery(self: *Fs, allocator: Allocator, in: storage.QueryInput) storage
         .scanned_count = scanned_count,
         .last_evaluated_key = cursor_out,
     };
+}
+
+/// TransactGetItems: read N items atomically under the mutex.
+pub fn ddbTransactGet(self: *Fs, allocator: Allocator, ops: []const storage.TxGetItem) storage.Error!storage.TxGetResult {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const out = allocator.alloc(?storage.Item, ops.len) catch return storage.Error.OutOfMemory;
+    for (ops, 0..) |op, i| {
+        const slot = self.dynamo_tables.get(op.table) orelse return storage.Error.TableNotFound;
+        const key_str = storage.dynamo_state.buildKeyFromAttrs(self.allocator, slot, op.key) catch
+            return storage.Error.OutOfMemory;
+        defer self.allocator.free(key_str);
+        if (slot.items.get(key_str)) |stored| {
+            out[i] = cloneItem(allocator, stored) catch return storage.Error.OutOfMemory;
+        } else {
+            out[i] = null;
+        }
+    }
+    return .{ .items = out };
+}
+
+/// TransactWriteItems: validate all conditions, then apply all writes.
+/// All-or-nothing atomicity (single mutex hold).
+pub fn ddbTransactWrite(
+    self: *Fs,
+    allocator: Allocator,
+    ops: []const storage.TxWriteOp,
+    reasons_out: *[]?[]const u8,
+) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    // Pass 1: validate every condition.
+    var any_failed = false;
+    const reasons = allocator.alloc(?[]const u8, ops.len) catch return storage.Error.OutOfMemory;
+    for (reasons) |*r| r.* = null;
+
+    for (ops, 0..) |op, i| {
+        const slot = self.dynamo_tables.get(op.table) orelse {
+            reasons[i] = "ResourceNotFound";
+            any_failed = true;
+            continue;
+        };
+        if (op.condition) |c| {
+            // For put: build key from item; otherwise op.item_or_key IS the key.
+            const key_item = op.item_or_key;
+            const key_str = storage.dynamo_state.buildKeyFromAttrs(self.allocator, slot, key_item) catch
+                return storage.Error.OutOfMemory;
+            defer self.allocator.free(key_str);
+            const existing_ptr: ?*const storage.Item = slot.items.get(key_str);
+            if (!c.evaluate(existing_ptr)) {
+                reasons[i] = "ConditionalCheckFailed";
+                any_failed = true;
+            }
+        }
+    }
+
+    if (any_failed) {
+        reasons_out.* = reasons;
+        return storage.Error.TransactionCanceled;
+    }
+
+    // Pass 2: apply all writes inline (mutex already held; do NOT call
+    // the public ddbPutItem/etc. — they relock and deadlock).
+    for (ops) |op| {
+        const slot = self.dynamo_tables.get(op.table) orelse return storage.Error.Io;
+        switch (op.kind) {
+            .put => try applyPutLocked(self, slot, op.item_or_key),
+            .delete => try applyDeleteLocked(self, slot, op.item_or_key),
+            .update => try applyUpdateLocked(self, allocator, slot, op.item_or_key, op.apply_fn.?, op.apply_ctx.?),
+            .condition_check => {}, // validated, nothing to apply
+        }
+    }
+    reasons_out.* = &.{};
+}
+
+fn applyPutLocked(self: *Fs, slot: *storage.TableSlot, item: *const storage.Item) storage.Error!void {
+    const key_str = storage.dynamo_state.buildItemKey(self.allocator, slot, item) catch
+        return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(key_str);
+
+    if (slot.items.fetchRemove(key_str)) |existing| {
+        self.allocator.free(existing.key);
+        existing.value.deinit(self.allocator);
+        self.allocator.destroy(existing.value);
+    }
+
+    const owned = cloneItem(self.allocator, item) catch return storage.Error.OutOfMemory;
+    const owned_ptr = self.allocator.create(storage.Item) catch return storage.Error.OutOfMemory;
+    owned_ptr.* = owned;
+
+    const key_hash = itemKeyHash(key_str);
+    writeItemJson(self, slot.name, &key_hash, owned_ptr) catch return storage.Error.Io;
+
+    slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
+}
+
+fn applyDeleteLocked(self: *Fs, slot: *storage.TableSlot, key_item: *const storage.Item) storage.Error!void {
+    const key_str = storage.dynamo_state.buildKeyFromAttrs(self.allocator, slot, key_item) catch
+        return storage.Error.OutOfMemory;
+    defer self.allocator.free(key_str);
+
+    const removed = slot.items.fetchRemove(key_str) orelse return;
+    const key_hash = itemKeyHash(key_str);
+    var path_buf: [4096]u8 = undefined;
+    const path = itemPath(self, slot.name, &key_hash, &path_buf) catch return storage.Error.Io;
+    Io.Dir.cwd().deleteFile(self.io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return storage.Error.Io,
+    };
+    self.allocator.free(removed.key);
+    removed.value.deinit(self.allocator);
+    self.allocator.destroy(removed.value);
+}
+
+fn applyUpdateLocked(
+    self: *Fs,
+    allocator: Allocator,
+    slot: *storage.TableSlot,
+    key_item: *const storage.Item,
+    apply_fn: *const fn (ctx: *anyopaque, item: *storage.Item) bool,
+    apply_ctx: *anyopaque,
+) storage.Error!void {
+    const key_str = storage.dynamo_state.buildKeyFromAttrs(self.allocator, slot, key_item) catch
+        return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(key_str);
+
+    const existing_ptr: ?*const storage.Item = slot.items.get(key_str);
+    var working: storage.Item = if (existing_ptr) |ep|
+        cloneItem(allocator, ep) catch return storage.Error.OutOfMemory
+    else
+        cloneItem(allocator, key_item) catch return storage.Error.OutOfMemory;
+
+    if (!apply_fn(apply_ctx, &working)) return storage.Error.TransactionCanceled;
+
+    const owned = cloneItem(self.allocator, &working) catch return storage.Error.OutOfMemory;
+    const owned_ptr = self.allocator.create(storage.Item) catch return storage.Error.OutOfMemory;
+    owned_ptr.* = owned;
+
+    const key_hash = itemKeyHash(key_str);
+    writeItemJson(self, slot.name, &key_hash, owned_ptr) catch return storage.Error.Io;
+
+    if (slot.items.fetchRemove(key_str)) |old| {
+        self.allocator.free(old.key);
+        old.value.deinit(self.allocator);
+        self.allocator.destroy(old.value);
+    }
+    slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
 }
 
 // ---------------------------------------------------------------------------
