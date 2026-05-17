@@ -16,6 +16,35 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-05-18
+
+**Patch release: SQS FIFO queues.**
+
+Closes the headline gap in the v0.3.0 SQS surface — FIFO queues now actually order messages, dedupe, and enforce head-of-line blocking. Standard queues are unchanged.
+
+### Added — FIFO support
+
+- **`FifoQueue` attribute** — derived from the `.fifo` name suffix, immutable post-creation. Mismatch between the name and the explicit `FifoQueue` attribute → `InvalidAttributeValue`.
+- **`ContentBasedDeduplication` attribute** — when `true`, SendMessage on a FIFO queue without `MessageDeduplicationId` uses `sha256(body)` as the implicit dedup id.
+- **`MessageGroupId` (SendMessage)** — required on FIFO sends, rejected on Standard. Carries the group-ordering scope.
+- **`MessageDeduplicationId` (SendMessage)** — explicit dedup id with a 5-minute window. Re-sends within the window silently return the original `MessageId` + `SequenceNumber`.
+- **`SequenceNumber` (SendMessage response)** — monotonic per-queue u128, rendered as zero-padded 20-digit decimal. Persisted on `attributes.json` so re-sends after restart can't collide.
+- **Per-group head-of-line blocking on ReceiveMessage** — only one in-flight message per `MessageGroupId` at a time. ReceiveMessage walks the in-memory list once per call, claiming groups as it goes; a group's later messages are hidden while its head is in-flight. `DeleteMessage` / `ChangeMessageVisibility(0)` re-elect the new head naturally.
+- **Per-message `DelaySeconds` rejected on FIFO** (matches AWS).
+- **`SendMessageBatch` per-entry FIFO support** — each successful entry returns its own `SequenceNumber`; in-batch dedup collapses to one delivered message.
+
+### Tests
+
+- Python: 448 → 474 (+26 FIFO).
+- JS: 94 → 98 (+4).
+- AWS CLI: 37 → 40 (+3).
+
+### Documented divergences (new in v0.3.1)
+
+- **FIFO high-throughput mode (`DeduplicationScope=messageGroup` + `FifoThroughputLimit=perMessageGroupId`)** is not modelled — attributes accepted but the per-group-throughput accounting isn't built.
+- **Dedup history is in-memory only** — survives within a process but not across restart.
+- **SequenceNumber width**: 20-digit zero-padded decimal (covers u64 with room to grow). AWS docs say up to 39 digits.
+
 ## [0.3.0] — 2026-05-17
 
 **Minor release: SQS joins S3 + DynamoDB.**
