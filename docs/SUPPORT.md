@@ -67,7 +67,7 @@ The "Milestone" column points at the release tag in which the capability landed.
 
 ## DynamoDB
 
-DynamoDB is the second AWS service nanostack covers, opt-in via `--services s3,dynamodb`. The v0.2.0 (M15) scope is 18 ops covering table CRUD, item CRUD with full expression-evaluation, Query (incl. queryable GSI/LSI), Scan, batch ops, and transactions. See the M15 plan for the full IN/OUT matrix and rationale.
+DynamoDB is the second AWS service nanostack covers, opt-in via `--services s3,dynamodb`. The v0.2.0 (M15) scope was 18 ops covering table CRUD, item CRUD with full expression-evaluation, Query (incl. queryable GSI/LSI), Scan, batch ops, and transactions. v0.2.2 adds the DynamoDBStreams sub-service (4 ops + StreamSpecification on Create/Update). See the M15 plan for the full IN/OUT matrix and rationale.
 
 | Operation | Status | Milestone |
 |---|---|---|
@@ -94,19 +94,28 @@ DynamoDB is the second AWS service nanostack covers, opt-in via `--services s3,d
 | TransactWriteItems | supported (Put / Update / Delete / ConditionCheck; up to 100 ops; all-or-nothing atomicity; per-op CancellationReasons on failure) | M15-tx |
 | DescribeLimits | supported (returns synthetic AWS-default account limits) | M15-polish |
 | TagResource / UntagResource / ListTagsOfResource | supported (metadata-only; not persisted across nanostack restart) | M15-polish |
-| GetItem / PutItem / DeleteItem | planned | M15-items |
-| UpdateItem (with UpdateExpression) | planned | M15-expressions |
-| Query (incl. GSI/LSI) | planned | M15-query / M15-gsi |
-| Scan | planned | M15-scan |
-| BatchGetItem / BatchWriteItem | planned | M15-batch |
-| TransactGetItems / TransactWriteItems | planned | M15-tx |
-| TagResource / UntagResource / ListTagsOfResource / DescribeLimits | planned | M15-polish |
+| **StreamSpecification on CreateTable / UpdateTable** | supported (all four view types — NEW_IMAGE / OLD_IMAGE / NEW_AND_OLD_IMAGES / KEYS_ONLY; spec persists across restart; LatestStreamLabel + LatestStreamArn echoed on DescribeTable) | v0.2.2 |
 
-Documented divergences (intentional, won't change in v0.2.0):
+### DynamoDBStreams sub-service (v0.2.2)
+
+Target prefix `DynamoDBStreams_20120810.*`. Opt-in via the same `--services s3,dynamodb` flag (the sub-service is part of DDB). Stream records live in an in-memory ring buffer per stream (bounded at 1000 records, with best-effort 24h age trim) and **do not persist across nanostack restart** — matches LocalStack's behaviour and keeps the local-dev cold start sub-second.
+
+| Operation | Status | Milestone |
+|---|---|---|
+| ListStreams | supported (TableName filter; Limit + ExclusiveStartStreamArn cursor; lex-ascending) | v0.2.2 |
+| DescribeStream | supported (single open shard per stream; StreamStatus, StreamViewType, KeySchema; mismatched stream label → ResourceNotFoundException) | v0.2.2 |
+| GetShardIterator | supported (TRIM_HORIZON / LATEST / AT_SEQUENCE_NUMBER / AFTER_SEQUENCE_NUMBER; opaque base64-url token encoding) | v0.2.2 |
+| GetRecords | supported (Limit 1–1000; INSERT/MODIFY/REMOVE classification; per-view-type image filtering; capture across PutItem / UpdateItem / DeleteItem / BatchWriteItem / TransactWriteItems) | v0.2.2 |
+| EnableKinesisStreamingDestination | rejected with `ValidationException` ("Kinesis service is not enabled on this nanostack instance.") — Kinesis isn't emulated. | v0.2.2 |
+| DisableKinesisStreamingDestination | rejected with `ValidationException` (same as above). | v0.2.2 |
+
+Documented divergences (intentional):
 - **Bucket-policy-style `Condition` blocks are skipped** in IAM policies (same caveat as S3 M14). Not applicable to DynamoDB resource policies since we don't model IAM at all.
-- **Streams, PartiQL, Backups/PITR, Global Tables, DAX, Imports/Exports** — out of v0.2.0 scope. Returned as `ValidationException` (unknown target) for now.
+- **PartiQL, Backups/PITR, Global Tables, DAX, Imports/Exports, TTL background sweeper** — out of scope. Returned as `ValidationException` (unknown target) for now. PartiQL / PITR / TTL are candidates for future v0.2.x patches.
 - **Parallel scan (`TotalSegments > 1`)** will return `ValidationException`.
 - **GSI auto-fetch-from-base-table** for non-projected attrs is a client-SDK behavior; nanostack returns only the projected attrs.
+- **Streams: single open shard per stream** (no shard splitting / closed-shard semantics). Sequence numbers are a monotonic per-stream counter rendered as 21-digit zero-padded decimals. Re-enabling a stream rotates the shard ID (matches AWS's "label changes on re-enable").
+- **Streams: 24h retention is approximate** — records older than 24h are dropped on next consult, but a write-heavy stream may evict records younger than 24h once the 1000-record bound is hit.
 
 ## S3
 
