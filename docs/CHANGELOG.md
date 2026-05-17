@@ -16,6 +16,73 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-17
+
+**Minor release: SQS joins S3 + DynamoDB.**
+
+Per the [versioning scheme](#versioning-scheme), minor releases mark "one AWS service fully implemented against the real-AWS surface." nanostack now covers three services on the same port: S3 (since v0.1.x), DynamoDB (since v0.2.x), and SQS. The architecture proven over four minor cuts of DDB generalises cleanly — three-way `X-Amz-Target` dispatch (`AmazonSQS.*` / `DynamoDB_20120810.*` / S3), parallel storage backend vtable on `Fs`, parallel JSON wire layer.
+
+Opt-in via `--services sqs` (or `--services s3,dynamodb,sqs` for all three). The default is still S3-only.
+
+### Added — SQS v1 surface (17 ops)
+
+**Queue management** (Phase 1, 7 ops):
+- `CreateQueue` — Attributes parsed for VisibilityTimeout / DelaySeconds / ReceiveMessageWaitTimeSeconds / MessageRetentionPeriod / MaximumMessageSize / RedrivePolicy / Policy. Duplicate-name calls are idempotent.
+- `DeleteQueue` — immediate; wipes disk + in-memory state.
+- `ListQueues` — QueueNamePrefix filter; MaxResults + NextToken cursor.
+- `GetQueueUrl`, `GetQueueAttributes`, `SetQueueAttributes`, `PurgeQueue`.
+
+**Messages** (Phase 2, 4 ops):
+- `SendMessage` — real MD5 of body, per-message DelaySeconds override, MessageAttributes round-trip verbatim.
+- `ReceiveMessage` — MaxNumberOfMessages 1..10, per-call VisibilityTimeout override. Visibility timeout enforced via on-read promotion of expired in-flight messages (no background sweeper needed).
+- `DeleteMessage` — receipt-handle decoded + validated; idempotent on already-deleted.
+- `ChangeMessageVisibility` — 0..43200 seconds; 0 immediately re-releases.
+
+**Batches** (Phase 3, 3 ops):
+- `SendMessageBatch`, `DeleteMessageBatch`, `ChangeMessageVisibilityBatch` — up to 10 entries each, per-entry Successful / Failed split, per-entry errors don't abort the batch.
+
+**Long polling** (Phase 3):
+- `ReceiveMessage` with `WaitTimeSeconds > 0` (1..20) blocks the handler. Polls the queue every 100ms until a message arrives or the deadline expires. Resolves the effective wait from the request or the queue's `ReceiveMessageWaitTimeSeconds` attribute. **First long-poll handler in nanostack** — sets the precedent for future Lambda invoke / DDB Streams subscriptions.
+
+**Dead-letter queues** (Phase 4):
+- `RedrivePolicy` attribute parsed at receive time. Once `receive_count >= maxReceiveCount`, the message moves atomically to the DLQ (write to DLQ's messages dir, delete from source). Body preserved. Missing DLQ silently disables routing.
+
+**Tags** (Phase 5, 3 ops):
+- `TagQueue` / `UntagQueue` / `ListQueueTags`. Max 50 tags per queue. Persisted to `tags.json` per queue. Survive restart.
+
+### Added — service plumbing
+
+- **`--account-id` CLI flag** (default `000000000000`) — embedded in queue URLs and ARNs. Future Lambda integration will share the same value across services.
+- **Three-way X-Amz-Target dispatch in `src/server.zig`**: `AmazonSQS.*` → SQS, other non-null target → DynamoDB, null → S3. SigV4 with `service="sqs"` for SQS requests.
+- **Storage layout**: `<data_dir>/profiles/<profile>/sqs/queues/<name>/{attributes.json, tags.json, messages/<id>.json}` — parallel to DDB's `dynamodb/tables/...`. Queues survive restart with their attributes, tags, and pending messages intact.
+
+### Internals
+
+- **Receipt handle encoding**: base64-url of `<queue_name>|<message_id>|<receive_count>`. Opaque to clients; we decode + validate the queue name + look up by message ID for `DeleteMessage` / `ChangeMessageVisibility`.
+- **Message ID format**: UUID-v4-shaped from the nanosecond clock. AWS-compatible string format (`xxxxxxxx-xxxx-4xxx-xxxx-xxxxxxxxxxxx`).
+- **Long-poll primitive**: `std.os.linux.nanosleep` per the v0.2.3 TTL sweeper precedent. No new background-thread infrastructure introduced.
+
+### Tests
+
+- Zig unit tests: 520 → 532 (+12 — queue-name validation, wire parser shapes for queues + messages + batches).
+- Python conformance: 405 → 448 (+43 — 15 queue CRUD + 14 messages + 6 batch & long-polling + 4 DLQ + 4 tag).
+- JS conformance: 86 → 94 (+8 — full SQS round-trip via `@aws-sdk/client-sqs`).
+- AWS CLI conformance: 33 → 37 (+4).
+
+### Documented divergences (intentional)
+
+- **JSON wire only**, not the legacy query-string/XML form. Modern SDKs default to JSON; users on older SDKs should upgrade.
+- **FIFO queues deferred.** Future v0.3.x patch.
+- **In-handler long-poll sleep** (not server-side event loop). Wastes one handler thread per active poll.
+- **No connection-cancellation detection** during long polls.
+- **No rate limits.** AWS enforces per-account caps.
+- **MessageRetentionPeriod is configured but not enforced.**
+- **No encryption at rest**, queue policies accepted-not-enforced.
+
+### Strategic note
+
+After v0.3.0 nanostack covers the three services that anchor the dominant local-dev workflow for serverless backends — S3 for blobs, DynamoDB for state, SQS for queues. The PRD §15 v1.4 target (Lambda + cross-service event wiring) becomes the next strategic move: S3 → Lambda, DDB Streams → Lambda, SQS → Lambda. After that, v1.0 — the "multi-service workflow-ready" milestone — is in reach.
+
 ## [0.2.5] — 2026-05-17
 
 **Patch release: DynamoDB Backups + PITR.**

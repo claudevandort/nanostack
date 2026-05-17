@@ -26,6 +26,10 @@ pub const Config = struct {
     /// expired items "best effort within 48h"; for local-dev tests we
     /// default to 5s so callers don't need to wait. Range: 1..=3600.
     ttl_sweep_interval_seconds: u32 = 5,
+    /// Account ID embedded in ARNs + SQS queue URLs. AWS accounts are
+    /// 12 digits; nanostack uses 000000000000 by default to match the
+    /// LocalStack-style placeholder.
+    account_id: []const u8 = "000000000000",
     /// `--version` flag: print version + exit before starting the server.
     print_version: bool = false,
 
@@ -105,6 +109,10 @@ pub fn parse(args: []const [:0]const u8) ParseError!Config {
             i += 1;
             if (i >= args.len) return ParseError.MissingValue;
             c.region = args[i];
+        } else if (std.mem.eql(u8, arg, "--account-id")) {
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            c.account_id = args[i];
         } else {
             return ParseError.UnknownFlag;
         }

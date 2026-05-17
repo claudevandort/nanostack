@@ -138,6 +138,41 @@ Documented divergences (intentional):
 - **Backup snapshots aren't encrypted.** AWS uses KMS; we don't model KMS at all.
 - **`BackupSizeBytes` is an estimate** = sum of item-file sizes after JSON serialization.
 
+## SQS
+
+SQS is the third AWS service nanostack covers, opt-in via `--services sqs` (or `--services s3,dynamodb,sqs` to enable all three). v0.3.0 ships 17 ops: queue CRUD, message send/receive/delete with visibility timeout enforcement, batch ops (send / delete / change-visibility), long-polling on ReceiveMessage, dead-letter queues, and tags. Standard queues only; FIFO is deferred.
+
+| Operation | Status | Milestone |
+|---|---|---|
+| CreateQueue | supported (Attributes parsed for VisibilityTimeout / DelaySeconds / ReceiveMessageWaitTimeSeconds / MessageRetentionPeriod / MaximumMessageSize / RedrivePolicy / Policy; duplicate-name calls are idempotent) | v0.3.0 |
+| DeleteQueue | supported (immediate; removes disk + in-memory state) | v0.3.0 |
+| ListQueues | supported (QueueNamePrefix filter; MaxResults + NextToken cursor; lex-ascending) | v0.3.0 |
+| GetQueueUrl | supported | v0.3.0 |
+| GetQueueAttributes | supported (All / per-attribute selection; QueueArn synthesised; CreatedTimestamp from cold-start time) | v0.3.0 |
+| SetQueueAttributes | supported (mutates VisibilityTimeout / DelaySeconds / ReceiveMessageWaitTimeSeconds / MessageRetentionPeriod / MaximumMessageSize / RedrivePolicy / Policy) | v0.3.0 |
+| PurgeQueue | supported (clears in-memory + on-disk messages) | v0.3.0 |
+| SendMessage | supported (real MD5 of body; per-message DelaySeconds override; MessageAttributes round-trip verbatim) | v0.3.0 |
+| ReceiveMessage | supported (MaxNumberOfMessages 1..10; per-call VisibilityTimeout override; WaitTimeSeconds 0..20 long polling; visibility-timeout enforced via on-read promotion of expired in-flight messages) | v0.3.0 |
+| DeleteMessage | supported (receipt-handle decoded + validated; idempotent on already-deleted, matches AWS) | v0.3.0 |
+| ChangeMessageVisibility | supported (0..43200 seconds; 0 immediately re-releases) | v0.3.0 |
+| SendMessageBatch | supported (up to 10 entries; per-entry Successful / Failed split) | v0.3.0 |
+| DeleteMessageBatch | supported (up to 10 entries; per-entry Successful / Failed split) | v0.3.0 |
+| ChangeMessageVisibilityBatch | supported (up to 10 entries; per-entry Successful / Failed split) | v0.3.0 |
+| TagQueue | supported (max 50 tags per queue; overwrites existing keys; persisted to tags.json) | v0.3.0 |
+| UntagQueue | supported | v0.3.0 |
+| ListQueueTags | supported | v0.3.0 |
+
+Documented divergences (intentional):
+- **JSON wire only.** boto3 v1.34+, JS SDK v3, and CLI v2 all use the JSON wire by default. The legacy query-string / XML form is **out of scope** — users on older SDKs should upgrade.
+- **FIFO queues deferred.** MessageGroupId / MessageDeduplicationId / ContentBasedDeduplication / per-group ordering land in a future v0.3.x patch. CreateQueue on a `.fifo` name name-validates but no FIFO semantics are applied.
+- **Long polling = in-handler sleep loop.** ReceiveMessage with `WaitTimeSeconds > 0` blocks the handler thread, polling the queue every 100ms until a message arrives or the deadline expires. AWS-real uses a server-side event loop; we don't. Wastes one handler thread per long-poll; acceptable for local dev.
+- **No connection-cancellation detection on long polling.** A client that drops mid-poll keeps the handler sleeping until the deadline. AWS-real would notice and return immediately.
+- **No rate limits.** AWS enforces per-account caps on queues + sends/sec. We accept everything.
+- **MessageRetentionPeriod is configured but not enforced.** Messages persist until deleted or DLQ-routed. A future patch may add a sweeper similar to v0.2.3 TTL.
+- **No encryption at rest** (no SSE-SQS, no SSE-KMS). Same divergence as DDB backups.
+- **Queue Policy attribute is accepted, not evaluated.** Round-trips verbatim through Set/GetQueueAttributes.
+- **In-flight messages tracked in-memory** with the visible_unix timestamp persisted per message. Crash-safe: on cold start, messages with visible_unix in the past are immediately visible again.
+
 ## S3
 
 ### v1 — must-have

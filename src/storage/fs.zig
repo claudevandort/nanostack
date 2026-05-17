@@ -724,6 +724,10 @@ restored_objects: std.StringHashMapUnmanaged(void),
 /// at `<base>/dynamodb/tables/<name>/schema.json`. Lock via `mutex` for
 /// any mutation.
 dynamo_tables: std.StringHashMapUnmanaged(*storage.TableSlot),
+/// SQS queues, in-memory (v0.3.0). Keys are the queue name (owned by
+/// the slot itself). Persistence layout:
+/// `<base>/sqs/queues/<name>/{attributes,tags}.json` + messages dir.
+sqs_queues: std.StringHashMapUnmanaged(*storage.SqsQueueSlot),
 /// TTL sweeper state (v0.2.3). The thread runs `ttlSweepLoop` until
 /// `sweeper_stop` is set; on each tick it scans every TTL-enabled
 /// table and evicts expired items.
@@ -767,6 +771,7 @@ pub fn initWithOptions(allocator: Allocator, io: Io, base_dir: []const u8, opts:
         .buckets = .empty,
         .restored_objects = .empty,
         .dynamo_tables = .empty,
+        .sqs_queues = .empty,
         .ttl_sweep_interval_secs = opts.ttl_sweep_interval_seconds,
         .sweeper_thread = null,
         .sweeper_stop = .init(false),
@@ -777,6 +782,8 @@ pub fn initWithOptions(allocator: Allocator, io: Io, base_dir: []const u8, opts:
     ensureDynamoDir(self) catch return InitError.Io;
     ensureBackupsDir(self) catch return InitError.Io;
     loadDynamoTables(self) catch return InitError.Io;
+    ensureSqsDir(self) catch return InitError.Io;
+    loadSqsQueues(self) catch return InitError.Io;
 
     if (opts.spawn_ttl_sweeper) {
         self.sweeper_thread = std.Thread.spawn(.{}, ttlSweepLoop, .{self}) catch return InitError.ThreadSpawn;
@@ -804,6 +811,14 @@ pub fn deinit(self: *Fs) void {
         }
         self.dynamo_tables.deinit(self.allocator);
     }
+    {
+        var it = self.sqs_queues.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinit(self.allocator);
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.sqs_queues.deinit(self.allocator);
+    }
     self.allocator.free(self.base_dir);
     self.allocator.destroy(self);
 }
@@ -817,6 +832,73 @@ pub fn backend(self: *Fs) storage.Backend {
 /// `s3/...`. Phase-1 stub returns an empty table list.
 pub fn dynamoBackend(self: *Fs) storage.DynamoBackend {
     return .{ .ctx = self, .vtable = &dynamo_vtable };
+}
+
+/// SQS-flavoured view of the same `Fs` (v0.3.0). Persistence path is
+/// `<data_dir>/profiles/<profile>/sqs/queues/...`, parallel to S3
+/// and DynamoDB.
+pub fn sqsBackend(self: *Fs) storage.SqsBackend {
+    return .{ .ctx = self, .vtable = &sqs_vtable };
+}
+
+const sqs_vtable: storage.SqsBackend.VTable = .{
+    .createQueue = vtSqsCreateQueue,
+    .deleteQueue = vtSqsDeleteQueue,
+    .listQueues = vtSqsListQueues,
+    .getQueueUrl = vtSqsGetQueueUrl,
+    .getQueueAttributes = vtSqsGetQueueAttributes,
+    .setQueueAttributes = vtSqsSetQueueAttributes,
+    .purgeQueue = vtSqsPurgeQueue,
+    .sendMessage = vtSqsSendMessage,
+    .receiveMessage = vtSqsReceiveMessage,
+    .deleteMessage = vtSqsDeleteMessage,
+    .changeMessageVisibility = vtSqsChangeMessageVisibility,
+    .tagQueue = vtSqsTagQueue,
+    .untagQueue = vtSqsUntagQueue,
+    .listQueueTags = vtSqsListQueueTags,
+};
+
+fn vtSqsCreateQueue(ctx: *anyopaque, in: storage.CreateQueueInput) storage.Error!*const storage.SqsQueueSlot {
+    return sqsCreateQueue(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtSqsDeleteQueue(ctx: *anyopaque, name: []const u8) storage.Error!void {
+    return sqsDeleteQueue(@ptrCast(@alignCast(ctx)), name);
+}
+fn vtSqsListQueues(ctx: *anyopaque, allocator: Allocator, in: storage.ListQueuesInput) storage.Error!storage.ListQueuesOutput {
+    return sqsListQueues(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtSqsGetQueueUrl(ctx: *anyopaque, name: []const u8) storage.Error!*const storage.SqsQueueSlot {
+    return sqsGetQueueUrl(@ptrCast(@alignCast(ctx)), name);
+}
+fn vtSqsGetQueueAttributes(ctx: *anyopaque, name: []const u8) storage.Error!storage.QueueAttributes {
+    return sqsGetQueueAttributes(@ptrCast(@alignCast(ctx)), name);
+}
+fn vtSqsSetQueueAttributes(ctx: *anyopaque, in: storage.SetQueueAttributesInput) storage.Error!void {
+    return sqsSetQueueAttributes(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtSqsPurgeQueue(ctx: *anyopaque, name: []const u8) storage.Error!void {
+    return sqsPurgeQueue(@ptrCast(@alignCast(ctx)), name);
+}
+fn vtSqsSendMessage(ctx: *anyopaque, allocator: Allocator, in: storage.SendMessageInput) storage.Error!storage.SendMessageOutput {
+    return sqsSendMessage(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtSqsReceiveMessage(ctx: *anyopaque, allocator: Allocator, in: storage.ReceiveMessageInput) storage.Error!storage.ReceiveMessageOutput {
+    return sqsReceiveMessage(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtSqsDeleteMessage(ctx: *anyopaque, in: storage.DeleteMessageInput) storage.Error!void {
+    return sqsDeleteMessage(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtSqsChangeMessageVisibility(ctx: *anyopaque, in: storage.ChangeMessageVisibilityInput) storage.Error!void {
+    return sqsChangeMessageVisibility(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtSqsTagQueue(ctx: *anyopaque, in: storage.TagQueueInput) storage.Error!void {
+    return sqsTagQueue(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtSqsUntagQueue(ctx: *anyopaque, in: storage.UntagQueueInput) storage.Error!void {
+    return sqsUntagQueue(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtSqsListQueueTags(ctx: *anyopaque, allocator: Allocator, queue_name: []const u8) storage.Error!storage.ListQueueTagsOutput {
+    return sqsListQueueTags(@ptrCast(@alignCast(ctx)), allocator, queue_name);
 }
 
 const dynamo_vtable: storage.DynamoBackend.VTable = .{
@@ -5315,6 +5397,722 @@ fn parseItemFromJson(allocator: Allocator, obj: std.json.ObjectMap) !storage.Ite
         values_done = i + 1;
     }
     return .{ .names = names, .values = values };
+}
+
+// ---------------------------------------------------------------------------
+// SQS (v0.3.0)
+//
+// Disk layout: <base>/sqs/queues/<name>/{attributes.json, tags.json,
+// messages/<id>.json}. The in-memory `sqs_queues` map holds a pointer
+// to each queue's slot; mutations go through `Fs.mutex` for parity
+// with the DDB layer.
+
+const sqs_state_mod = @import("sqs_state.zig");
+
+fn ensureSqsDir(self: *Fs) !void {
+    var buf: [4096]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/sqs/queues", .{self.base_dir});
+    try Io.Dir.cwd().createDirPath(self.io, path);
+}
+
+fn queueDirPath(self: *Fs, name: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/sqs/queues/{s}", .{ self.base_dir, name });
+}
+
+fn queueAttrsPath(self: *Fs, name: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/sqs/queues/{s}/attributes.json", .{ self.base_dir, name });
+}
+
+const AttributesDoc = struct {
+    visibility_timeout: u32,
+    delay_seconds: u32,
+    receive_message_wait_time_seconds: u32,
+    message_retention_period: u32,
+    maximum_message_size: u32,
+    created_unix: i64,
+    redrive_policy: ?[]const u8 = null,
+    policy: ?[]const u8 = null,
+};
+
+fn writeQueueAttrs(self: *Fs, slot: *const storage.SqsQueueSlot) !void {
+    var dir_buf: [4096]u8 = undefined;
+    const dir_path = try queueDirPath(self, slot.name, &dir_buf);
+    try Io.Dir.cwd().createDirPath(self.io, dir_path);
+
+    const doc: AttributesDoc = .{
+        .visibility_timeout = slot.attrs.visibility_timeout,
+        .delay_seconds = slot.attrs.delay_seconds,
+        .receive_message_wait_time_seconds = slot.attrs.receive_message_wait_time_seconds,
+        .message_retention_period = slot.attrs.message_retention_period,
+        .maximum_message_size = slot.attrs.maximum_message_size,
+        .created_unix = slot.created_unix,
+        .redrive_policy = slot.attrs.redrive_policy,
+        .policy = slot.attrs.policy,
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(doc, .{}, &aw.writer);
+    const body = try aw.toOwnedSlice();
+    defer self.allocator.free(body);
+
+    var path_buf: [4096]u8 = undefined;
+    const path = try queueAttrsPath(self, slot.name, &path_buf);
+    try writeAtomic(self.io, path, body);
+}
+
+fn loadSqsQueues(self: *Fs) !void {
+    var buf: [4096]u8 = undefined;
+    const queues_path = try std.fmt.bufPrint(&buf, "{s}/sqs/queues", .{self.base_dir});
+
+    var dir = Io.Dir.cwd().openDir(self.io, queues_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(self.io);
+
+    var it = dir.iterate();
+    while (try it.next(self.io)) |entry| {
+        if (entry.kind != .directory) continue;
+        loadSingleQueue(self, entry.name) catch |err| {
+            std.log.warn("sqs: skipping corrupted queue dir {s}: {s}", .{ entry.name, @errorName(err) });
+        };
+    }
+}
+
+fn loadSingleQueue(self: *Fs, name: []const u8) !void {
+    var path_buf: [4096]u8 = undefined;
+    const attrs_path = try queueAttrsPath(self, name, &path_buf);
+
+    const body = Io.Dir.cwd().readFileAlloc(self.io, attrs_path, self.allocator, .limited(64 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer self.allocator.free(body);
+
+    var parsed = std.json.parseFromSlice(AttributesDoc, self.allocator, body, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    const doc = parsed.value;
+
+    const slot_ptr = try self.allocator.create(storage.SqsQueueSlot);
+    errdefer self.allocator.destroy(slot_ptr);
+    slot_ptr.* = .{
+        .name = try self.allocator.dupe(u8, name),
+        .created_unix = doc.created_unix,
+        .attrs = .{
+            .visibility_timeout = doc.visibility_timeout,
+            .delay_seconds = doc.delay_seconds,
+            .receive_message_wait_time_seconds = doc.receive_message_wait_time_seconds,
+            .message_retention_period = doc.message_retention_period,
+            .maximum_message_size = doc.maximum_message_size,
+            .redrive_policy = if (doc.redrive_policy) |s| try self.allocator.dupe(u8, s) else null,
+            .policy = if (doc.policy) |s| try self.allocator.dupe(u8, s) else null,
+        },
+    };
+
+    loadQueueTags(self, slot_ptr);
+
+    try self.sqs_queues.put(self.allocator, slot_ptr.name, slot_ptr);
+}
+
+pub fn sqsCreateQueue(self: *Fs, in: storage.CreateQueueInput) storage.Error!*const storage.SqsQueueSlot {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    if (self.sqs_queues.get(in.name)) |existing| {
+        // AWS idempotency: CreateQueue with the same name + matching
+        // attrs returns the existing queue. If attrs differ, returns
+        // QueueNameExists. For local-dev we accept any duplicate-name
+        // call as idempotent — the SDKs treat it that way.
+        return existing;
+    }
+
+    const name_owned = self.allocator.dupe(u8, in.name) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(name_owned);
+
+    const slot_ptr = self.allocator.create(storage.SqsQueueSlot) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.destroy(slot_ptr);
+    slot_ptr.* = .{
+        .name = name_owned,
+        .created_unix = nowUnixSeconds(self.io),
+        .attrs = .{
+            .visibility_timeout = in.attrs.visibility_timeout,
+            .delay_seconds = in.attrs.delay_seconds,
+            .receive_message_wait_time_seconds = in.attrs.receive_message_wait_time_seconds,
+            .message_retention_period = in.attrs.message_retention_period,
+            .maximum_message_size = in.attrs.maximum_message_size,
+            .redrive_policy = if (in.attrs.redrive_policy) |s| (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory) else null,
+            .policy = if (in.attrs.policy) |s| (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory) else null,
+        },
+    };
+    writeQueueAttrs(self, slot_ptr) catch return storage.Error.Io;
+    self.sqs_queues.put(self.allocator, slot_ptr.name, slot_ptr) catch return storage.Error.OutOfMemory;
+    return slot_ptr;
+}
+
+pub fn sqsDeleteQueue(self: *Fs, name: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(name) orelse return storage.Error.QueueNotFound;
+    var dir_buf: [4096]u8 = undefined;
+    const dir_path = queueDirPath(self, name, &dir_buf) catch return storage.Error.Io;
+    Io.Dir.cwd().deleteTree(self.io, dir_path) catch return storage.Error.Io;
+    _ = self.sqs_queues.remove(name);
+    slot.deinit(self.allocator);
+    self.allocator.destroy(slot);
+}
+
+pub fn sqsGetQueueUrl(self: *Fs, name: []const u8) storage.Error!*const storage.SqsQueueSlot {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    return self.sqs_queues.get(name) orelse storage.Error.QueueNotFound;
+}
+
+pub fn sqsGetQueueAttributes(self: *Fs, name: []const u8) storage.Error!storage.QueueAttributes {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const slot = self.sqs_queues.get(name) orelse return storage.Error.QueueNotFound;
+    return slot.attrs;
+}
+
+pub fn sqsSetQueueAttributes(self: *Fs, in: storage.SetQueueAttributesInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(in.name) orelse return storage.Error.QueueNotFound;
+    if (in.attrs.visibility_timeout) |v| slot.attrs.visibility_timeout = v;
+    if (in.attrs.delay_seconds) |v| slot.attrs.delay_seconds = v;
+    if (in.attrs.receive_message_wait_time_seconds) |v| slot.attrs.receive_message_wait_time_seconds = v;
+    if (in.attrs.message_retention_period) |v| slot.attrs.message_retention_period = v;
+    if (in.attrs.maximum_message_size) |v| slot.attrs.maximum_message_size = v;
+    if (in.attrs.redrive_policy) |s| {
+        if (slot.attrs.redrive_policy) |old| self.allocator.free(old);
+        slot.attrs.redrive_policy = if (s.len > 0)
+            (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory)
+        else
+            null;
+    }
+    if (in.attrs.policy) |s| {
+        if (slot.attrs.policy) |old| self.allocator.free(old);
+        slot.attrs.policy = if (s.len > 0)
+            (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory)
+        else
+            null;
+    }
+    writeQueueAttrs(self, slot) catch return storage.Error.Io;
+}
+
+pub fn sqsListQueues(self: *Fs, allocator: Allocator, in: storage.ListQueuesInput) storage.Error!storage.ListQueuesOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+    var it = self.sqs_queues.iterator();
+    while (it.next()) |entry| {
+        if (in.name_prefix) |pfx| if (!std.mem.startsWith(u8, entry.key_ptr.*, pfx)) continue;
+        const owned = allocator.dupe(u8, entry.key_ptr.*) catch return storage.Error.OutOfMemory;
+        names.append(allocator, owned) catch return storage.Error.OutOfMemory;
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
+    // Pagination: MaxResults clamps to in.max_results; NextToken is the
+    // last name returned (clients pass it back as `NextToken`).
+    var start_idx: usize = 0;
+    if (in.next_token) |tok| {
+        for (names.items, 0..) |n, i| {
+            if (std.mem.eql(u8, n, tok)) {
+                start_idx = i + 1;
+                break;
+            }
+        }
+    }
+    const end_idx = @min(start_idx + in.max_results, names.items.len);
+    const owned = names.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory;
+    for (owned[0..start_idx]) |n| allocator.free(n);
+    for (owned[end_idx..]) |n| allocator.free(n);
+    const page = allocator.alloc([]const u8, end_idx - start_idx) catch return storage.Error.OutOfMemory;
+    for (owned[start_idx..end_idx], 0..) |n, i| page[i] = n;
+    const next: ?[]const u8 = if (end_idx < owned.len)
+        allocator.dupe(u8, page[page.len - 1]) catch return storage.Error.OutOfMemory
+    else
+        null;
+    allocator.free(owned);
+    return .{ .queue_names = page, .next_token = next };
+}
+
+pub fn sqsPurgeQueue(self: *Fs, name: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const slot = self.sqs_queues.get(name) orelse return storage.Error.QueueNotFound;
+
+    // Delete all in-memory messages.
+    for (slot.messages.items) |m| {
+        m.deinit(self.allocator);
+        self.allocator.destroy(m);
+    }
+    slot.messages.clearAndFree(self.allocator);
+
+    // Wipe the messages dir on disk.
+    var dir_buf: [4096]u8 = undefined;
+    const msgs_dir = std.fmt.bufPrint(&dir_buf, "{s}/sqs/queues/{s}/messages", .{ self.base_dir, name }) catch
+        return storage.Error.Io;
+    Io.Dir.cwd().deleteTree(self.io, msgs_dir) catch {};
+}
+
+// ---------------------------------------------------------------------------
+// SQS messages (v0.3.0 Phase 2)
+
+/// Generate a UUID-shaped MessageId from the nanosecond clock. Uniqueness
+/// at sub-nanosecond granularity isn't realistic in practice (single
+/// host) so this is "good enough for local dev".
+fn generateMessageId(allocator: Allocator, io: Io) ![]const u8 {
+    const ts = Io.Timestamp.now(io, .real);
+    const ns: u128 = @intCast(ts.nanoseconds);
+    const a: u32 = @truncate(ns >> 96);
+    const b: u16 = @truncate(ns >> 80);
+    const c: u16 = @truncate(ns >> 64);
+    const d: u16 = @truncate(ns >> 48);
+    const e: u48 = @truncate(ns);
+    return std.fmt.allocPrint(allocator, "{x:0>8}-{x:0>4}-4{x:0>3}-{x:0>4}-{x:0>12}", .{
+        a, b, @as(u16, c & 0xfff), d, e,
+    });
+}
+
+/// Compute hex-encoded lowercase MD5 of the given input. AWS clients
+/// verify this against the response.
+fn md5Hex(input: []const u8) [32]u8 {
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(input, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+/// Receipt handles are opaque to clients. We encode
+/// `<queue_name>|<message_id>|<receive_count>` then base64-url it.
+/// DeleteMessage / ChangeMessageVisibility decode + validate.
+fn buildReceiptHandle(
+    allocator: Allocator,
+    queue_name: []const u8,
+    message_id: []const u8,
+    receive_count: u32,
+) ![]const u8 {
+    var raw_buf: std.ArrayList(u8) = .empty;
+    defer raw_buf.deinit(allocator);
+    try raw_buf.appendSlice(allocator, queue_name);
+    try raw_buf.append(allocator, '|');
+    try raw_buf.appendSlice(allocator, message_id);
+    try raw_buf.append(allocator, '|');
+    const tail = try std.fmt.allocPrint(allocator, "{d}", .{receive_count});
+    defer allocator.free(tail);
+    try raw_buf.appendSlice(allocator, tail);
+
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const out_len = enc.calcSize(raw_buf.items.len);
+    const out = try allocator.alloc(u8, out_len);
+    _ = enc.encode(out, raw_buf.items);
+    return out;
+}
+
+const DecodedReceipt = struct {
+    queue_name: []const u8,
+    message_id: []const u8,
+    receive_count: u32,
+};
+
+fn decodeReceiptHandle(allocator: Allocator, handle: []const u8) !DecodedReceipt {
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const max_len = dec.calcSizeForSlice(handle) catch return error.InvalidReceiptHandle;
+    const buf = try allocator.alloc(u8, max_len);
+    dec.decode(buf, handle) catch return error.InvalidReceiptHandle;
+
+    var it = std.mem.splitScalar(u8, buf, '|');
+    const q = it.next() orelse return error.InvalidReceiptHandle;
+    const id = it.next() orelse return error.InvalidReceiptHandle;
+    const c = it.next() orelse return error.InvalidReceiptHandle;
+    const cnt = std.fmt.parseInt(u32, c, 10) catch return error.InvalidReceiptHandle;
+    return .{ .queue_name = q, .message_id = id, .receive_count = cnt };
+}
+
+fn messagePath(self: *Fs, queue_name: []const u8, message_id: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/sqs/queues/{s}/messages/{s}.json", .{ self.base_dir, queue_name, message_id });
+}
+
+const MessageDoc = struct {
+    id: []const u8,
+    body: []const u8,
+    sent_unix: i64,
+    visible_unix: i64,
+    receive_count: u32,
+    md5_of_body: []const u8,
+    raw_attributes_json: ?[]const u8 = null,
+};
+
+fn writeMessageJson(self: *Fs, queue_name: []const u8, m: *const storage.Message) !void {
+    var dir_buf: [4096]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "{s}/sqs/queues/{s}/messages", .{ self.base_dir, queue_name });
+    try Io.Dir.cwd().createDirPath(self.io, dir);
+
+    const doc: MessageDoc = .{
+        .id = m.id,
+        .body = m.body,
+        .sent_unix = m.sent_unix,
+        .visible_unix = m.visible_unix,
+        .receive_count = m.receive_count,
+        .md5_of_body = &m.md5_of_body,
+        .raw_attributes_json = m.raw_attributes_json,
+    };
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(doc, .{}, &aw.writer);
+    const body = try aw.toOwnedSlice();
+    defer self.allocator.free(body);
+
+    var path_buf: [4096]u8 = undefined;
+    const path = try messagePath(self, queue_name, m.id, &path_buf);
+    try writeAtomic(self.io, path, body);
+}
+
+pub fn sqsSendMessage(self: *Fs, allocator: Allocator, in: storage.SendMessageInput) storage.Error!storage.SendMessageOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(in.queue_name) orelse return storage.Error.QueueNotFound;
+    if (in.body.len > slot.attrs.maximum_message_size) return storage.Error.InvalidMessageBody;
+
+    const now = nowUnixSeconds(self.io);
+    const delay: u32 = in.delay_seconds orelse slot.attrs.delay_seconds;
+
+    const id_owned = generateMessageId(self.allocator, self.io) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(id_owned);
+    const body_owned = self.allocator.dupe(u8, in.body) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(body_owned);
+    const attrs_owned: ?[]const u8 = if (in.raw_attributes_json) |s|
+        (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory)
+    else
+        null;
+    errdefer if (attrs_owned) |s| self.allocator.free(s);
+
+    const md5 = md5Hex(in.body);
+    const msg_ptr = self.allocator.create(storage.Message) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.destroy(msg_ptr);
+    msg_ptr.* = .{
+        .id = id_owned,
+        .body = body_owned,
+        .sent_unix = now,
+        .visible_unix = now + @as(i64, @intCast(delay)),
+        .receive_count = 0,
+        .md5_of_body = md5,
+        .raw_attributes_json = attrs_owned,
+    };
+    writeMessageJson(self, slot.name, msg_ptr) catch return storage.Error.Io;
+    slot.messages.append(self.allocator, msg_ptr) catch return storage.Error.OutOfMemory;
+
+    return .{
+        .message_id = allocator.dupe(u8, id_owned) catch return storage.Error.OutOfMemory,
+        .md5_of_body = allocator.dupe(u8, &md5) catch return storage.Error.OutOfMemory,
+    };
+}
+
+pub fn sqsReceiveMessage(self: *Fs, allocator: Allocator, in: storage.ReceiveMessageInput) storage.Error!storage.ReceiveMessageOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(in.queue_name) orelse return storage.Error.QueueNotFound;
+
+    const now = nowUnixSeconds(self.io);
+    const vt: i64 = @intCast(in.visibility_timeout orelse slot.attrs.visibility_timeout);
+    const max: usize = @min(@as(usize, in.max_messages), 10);
+
+    // Parse RedrivePolicy once per call (lazy).
+    const redrive: ?Redrive = parseRedrivePolicy(slot.attrs.redrive_policy);
+
+    var out: std.ArrayList(storage.ReceivedMessage) = .empty;
+    errdefer {
+        for (out.items) |m| {
+            allocator.free(m.message_id);
+            allocator.free(m.receipt_handle);
+            allocator.free(m.body);
+            allocator.free(m.md5_of_body);
+            if (m.raw_attributes_json) |s| allocator.free(s);
+        }
+        out.deinit(allocator);
+    }
+
+    // Iterate via index because we may need to remove (DLQ route) mid-pass.
+    var i: usize = 0;
+    while (i < slot.messages.items.len) {
+        if (out.items.len >= max) break;
+        const m = slot.messages.items[i];
+        if (m.visible_unix > now) {
+            i += 1;
+            continue;
+        }
+
+        // DLQ check: a message that's been delivered maxReceiveCount
+        // times before this attempt moves to the DLQ instead of being
+        // returned. (AWS-real triggers when receive_count >= max.)
+        if (redrive) |rd| if (m.receive_count >= rd.max_receive_count) {
+            if (self.sqs_queues.get(rd.dlq_name)) |dlq| {
+                _ = slot.messages.orderedRemove(i);
+                // Persist the move: write to DLQ's messages dir, delete
+                // from source.
+                m.visible_unix = now;
+                m.receive_count = 0;
+                writeMessageJson(self, dlq.name, m) catch return storage.Error.Io;
+                var path_buf: [4096]u8 = undefined;
+                const src_path = messagePath(self, slot.name, m.id, &path_buf) catch return storage.Error.Io;
+                Io.Dir.cwd().deleteFile(self.io, src_path) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return storage.Error.Io,
+                };
+                dlq.messages.append(self.allocator, m) catch return storage.Error.OutOfMemory;
+                continue; // don't increment i — element at i was removed
+            }
+            // No DLQ found — fall through and deliver normally (matches
+            // AWS behaviour when the DLQ has been deleted).
+        };
+
+        m.receive_count += 1;
+        m.visible_unix = now + vt;
+        writeMessageJson(self, slot.name, m) catch return storage.Error.Io;
+
+        const receipt = buildReceiptHandle(allocator, slot.name, m.id, m.receive_count) catch
+            return storage.Error.OutOfMemory;
+        try out.append(allocator, .{
+            .message_id = allocator.dupe(u8, m.id) catch return storage.Error.OutOfMemory,
+            .receipt_handle = receipt,
+            .body = allocator.dupe(u8, m.body) catch return storage.Error.OutOfMemory,
+            .md5_of_body = allocator.dupe(u8, &m.md5_of_body) catch return storage.Error.OutOfMemory,
+            .raw_attributes_json = if (m.raw_attributes_json) |s|
+                (allocator.dupe(u8, s) catch return storage.Error.OutOfMemory)
+            else
+                null,
+        });
+        i += 1;
+    }
+
+    return .{ .messages = out.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory };
+}
+
+const Redrive = struct {
+    dlq_name: []const u8,
+    max_receive_count: u32,
+};
+
+/// Parse a RedrivePolicy JSON string of the form
+/// `{"deadLetterTargetArn":"arn:aws:sqs:region:account:name","maxReceiveCount":N}`.
+/// Returns null on missing-or-malformed (we don't reject — matches AWS).
+/// The returned `dlq_name` slice points into the input `json_str`, so
+/// callers must hold the slot's lifetime for the duration of use.
+fn parseRedrivePolicy(json_str: ?[]const u8) ?Redrive {
+    const s = json_str orelse return null;
+    // Find "deadLetterTargetArn":"...":name" by manual scan to avoid
+    // depending on parsed-arena lifetimes. We accept whitespace + ASCII
+    // only; the JSON shape AWS sends is always tight.
+    const arn_key = "\"deadLetterTargetArn\"";
+    const max_key = "\"maxReceiveCount\"";
+    const arn_idx = std.mem.indexOf(u8, s, arn_key) orelse return null;
+
+    // Skip `:`, whitespace, then expect `"...arn..."`.
+    var cur = arn_idx + arn_key.len;
+    while (cur < s.len and (s[cur] == ':' or s[cur] == ' ')) : (cur += 1) {}
+    if (cur >= s.len or s[cur] != '"') return null;
+    cur += 1;
+    const arn_start = cur;
+    while (cur < s.len and s[cur] != '"') : (cur += 1) {}
+    if (cur >= s.len) return null;
+    const arn = s[arn_start..cur];
+
+    const max_idx = std.mem.indexOf(u8, s, max_key) orelse return null;
+    cur = max_idx + max_key.len;
+    while (cur < s.len and (s[cur] == ':' or s[cur] == ' ')) : (cur += 1) {}
+    // maxReceiveCount may be quoted (string) or unquoted (integer).
+    var num_start = cur;
+    if (s[cur] == '"') {
+        cur += 1;
+        num_start = cur;
+        while (cur < s.len and s[cur] != '"') : (cur += 1) {}
+    } else {
+        while (cur < s.len and (s[cur] == '-' or (s[cur] >= '0' and s[cur] <= '9'))) : (cur += 1) {}
+    }
+    const max_str = s[num_start..cur];
+    const max: u32 = std.fmt.parseInt(u32, max_str, 10) catch return null;
+
+    const last_colon = std.mem.lastIndexOfScalar(u8, arn, ':') orelse return null;
+    return .{ .dlq_name = arn[last_colon + 1 ..], .max_receive_count = max };
+}
+
+pub fn sqsDeleteMessage(self: *Fs, in: storage.DeleteMessageInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(in.queue_name) orelse return storage.Error.QueueNotFound;
+    var decoded_arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer decoded_arena.deinit();
+    const dec = decodeReceiptHandle(decoded_arena.allocator(), in.receipt_handle) catch
+        return storage.Error.InvalidReceiptHandle;
+    if (!std.mem.eql(u8, dec.queue_name, slot.name)) return storage.Error.InvalidReceiptHandle;
+
+    var found_idx: ?usize = null;
+    for (slot.messages.items, 0..) |m, i| {
+        if (std.mem.eql(u8, m.id, dec.message_id)) {
+            found_idx = i;
+            break;
+        }
+    }
+    // AWS: DeleteMessage on an already-deleted message is idempotent.
+    const idx = found_idx orelse return;
+
+    const m = slot.messages.orderedRemove(idx);
+    var path_buf: [4096]u8 = undefined;
+    const path = messagePath(self, slot.name, m.id, &path_buf) catch return storage.Error.Io;
+    Io.Dir.cwd().deleteFile(self.io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return storage.Error.Io,
+    };
+    m.deinit(self.allocator);
+    self.allocator.destroy(m);
+}
+
+// ---------------------------------------------------------------------------
+// SQS tags (v0.3.0 Phase 5)
+
+fn queueTagsPath(self: *Fs, name: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/sqs/queues/{s}/tags.json", .{ self.base_dir, name });
+}
+
+fn writeQueueTags(self: *Fs, slot: *const storage.SqsQueueSlot) !void {
+    var dir_buf: [4096]u8 = undefined;
+    const dir_path = try queueDirPath(self, slot.name, &dir_buf);
+    try Io.Dir.cwd().createDirPath(self.io, dir_path);
+
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    var it = slot.tags.iterator();
+    while (it.next()) |entry| {
+        try s.objectField(entry.key_ptr.*);
+        try s.write(entry.value_ptr.*);
+    }
+    try s.endObject();
+    const body = try aw.toOwnedSlice();
+    defer self.allocator.free(body);
+
+    var path_buf: [4096]u8 = undefined;
+    const path = try queueTagsPath(self, slot.name, &path_buf);
+    try writeAtomic(self.io, path, body);
+}
+
+fn loadQueueTags(self: *Fs, slot: *storage.SqsQueueSlot) void {
+    var path_buf: [4096]u8 = undefined;
+    const path = queueTagsPath(self, slot.name, &path_buf) catch return;
+    const body = Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(64 * 1024)) catch return;
+    defer self.allocator.free(body);
+    var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        const k = self.allocator.dupe(u8, entry.key_ptr.*) catch return;
+        const v = self.allocator.dupe(u8, entry.value_ptr.*.string) catch {
+            self.allocator.free(k);
+            return;
+        };
+        slot.tags.put(self.allocator, k, v) catch {
+            self.allocator.free(k);
+            self.allocator.free(v);
+            return;
+        };
+    }
+}
+
+pub fn sqsTagQueue(self: *Fs, in: storage.TagQueueInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(in.queue_name) orelse return storage.Error.QueueNotFound;
+    for (in.tags) |t| {
+        // Replace if present (free old value), insert otherwise.
+        if (slot.tags.fetchRemove(t.key)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
+        }
+        if (slot.tags.count() >= 50) return storage.Error.TooManyEntries;
+        const k = self.allocator.dupe(u8, t.key) catch return storage.Error.OutOfMemory;
+        const v = self.allocator.dupe(u8, t.value) catch {
+            self.allocator.free(k);
+            return storage.Error.OutOfMemory;
+        };
+        slot.tags.put(self.allocator, k, v) catch {
+            self.allocator.free(k);
+            self.allocator.free(v);
+            return storage.Error.OutOfMemory;
+        };
+    }
+    writeQueueTags(self, slot) catch return storage.Error.Io;
+}
+
+pub fn sqsUntagQueue(self: *Fs, in: storage.UntagQueueInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(in.queue_name) orelse return storage.Error.QueueNotFound;
+    for (in.keys) |k| {
+        if (slot.tags.fetchRemove(k)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
+        }
+    }
+    writeQueueTags(self, slot) catch return storage.Error.Io;
+}
+
+pub fn sqsListQueueTags(self: *Fs, allocator: Allocator, queue_name: []const u8) storage.Error!storage.ListQueueTagsOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(queue_name) orelse return storage.Error.QueueNotFound;
+    var out = allocator.alloc(storage.Tag, slot.tags.count()) catch return storage.Error.OutOfMemory;
+    var i: usize = 0;
+    var it = slot.tags.iterator();
+    while (it.next()) |entry| : (i += 1) {
+        out[i] = .{
+            .key = allocator.dupe(u8, entry.key_ptr.*) catch return storage.Error.OutOfMemory,
+            .value = allocator.dupe(u8, entry.value_ptr.*) catch return storage.Error.OutOfMemory,
+        };
+    }
+    return .{ .tags = out };
+}
+
+pub fn sqsChangeMessageVisibility(self: *Fs, in: storage.ChangeMessageVisibilityInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(in.queue_name) orelse return storage.Error.QueueNotFound;
+    var decoded_arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer decoded_arena.deinit();
+    const dec = decodeReceiptHandle(decoded_arena.allocator(), in.receipt_handle) catch
+        return storage.Error.InvalidReceiptHandle;
+    if (!std.mem.eql(u8, dec.queue_name, slot.name)) return storage.Error.InvalidReceiptHandle;
+
+    for (slot.messages.items) |m| {
+        if (std.mem.eql(u8, m.id, dec.message_id)) {
+            const now = nowUnixSeconds(self.io);
+            m.visible_unix = now + @as(i64, @intCast(in.visibility_timeout));
+            writeMessageJson(self, slot.name, m) catch return storage.Error.Io;
+            return;
+        }
+    }
+    return storage.Error.MessageNotFound;
 }
 
 // ---------------------------------------------------------------------------

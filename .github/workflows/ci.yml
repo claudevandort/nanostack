@@ -66,7 +66,7 @@ jobs:
           NANOSTACK_PORT: '14566'
         run: |
           rm -rf "$RUNNER_TEMP/ns-fs"
-          ./zig-out/bin/nanostack --port "$NANOSTACK_PORT" --data-dir "$RUNNER_TEMP/ns-fs" --services s3,dynamodb > nanostack.log 2>&1 &
+          ./zig-out/bin/nanostack --port "$NANOSTACK_PORT" --data-dir "$RUNNER_TEMP/ns-fs" --services s3,dynamodb,sqs > nanostack.log 2>&1 &
           echo $! > nanostack.pid
           for i in $(seq 1 50); do
             if curl -s -o /dev/null "http://127.0.0.1:${NANOSTACK_PORT}/"; then
