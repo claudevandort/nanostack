@@ -72,30 +72,60 @@ pub fn deleteBackup(ctx: Context) Result {
     return .{ .ok = .{ .body = body } };
 }
 
-// Phase 2 stubs.
-
 pub fn restoreTableFromBackup(ctx: Context) Result {
-    _ = ctx;
-    return unsupported("RestoreTableFromBackup lands in Phase 2 of v0.2.5.");
+    const req = wire.parseRestoreTableFromBackup(ctx.allocator, ctx.request.body) catch |err|
+        return .{ .err = mapParseErr(err) };
+
+    const slot = ctx.backend.restoreTableFromBackup(ctx.allocator, .{
+        .backup_arn = req.backup_arn,
+        .target_table_name = req.target_table_name,
+    }) catch |err| return .{ .err = mapStorageErr(err) };
+
+    const body = wire.renderTableDescriptionMin(ctx.allocator, "TableDescription", slot) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
 }
 
 pub fn updateContinuousBackups(ctx: Context) Result {
-    _ = ctx;
-    return unsupported("UpdateContinuousBackups lands in Phase 2 of v0.2.5.");
+    const req = wire.parseUpdateContinuousBackups(ctx.allocator, ctx.request.body) catch |err|
+        return .{ .err = mapParseErr(err) };
+
+    const desc = ctx.backend.updateContinuousBackups(.{
+        .table_name = req.table_name,
+        .pitr_enabled = req.pitr_enabled,
+    }) catch |err| return .{ .err = mapStorageErr(err) };
+
+    const body = wire.renderContinuousBackups(ctx.allocator, desc) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
 }
 
 pub fn describeContinuousBackups(ctx: Context) Result {
-    _ = ctx;
-    return unsupported("DescribeContinuousBackups lands in Phase 2 of v0.2.5.");
+    const table_name = wire.parseDescribeContinuousBackups(ctx.allocator, ctx.request.body) catch |err|
+        return .{ .err = mapParseErr(err) };
+
+    const desc = ctx.backend.describeContinuousBackups(table_name) catch |err|
+        return .{ .err = mapStorageErr(err) };
+
+    const body = wire.renderContinuousBackups(ctx.allocator, desc) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
 }
 
 pub fn restoreTableToPointInTime(ctx: Context) Result {
-    _ = ctx;
-    return unsupported("RestoreTableToPointInTime lands in Phase 2 of v0.2.5.");
-}
+    const req = wire.parseRestoreTableToPointInTime(ctx.allocator, ctx.request.body) catch |err|
+        return .{ .err = mapParseErr(err) };
 
-fn unsupported(msg: []const u8) Result {
-    return .{ .err = .{ .code = .validation_exception, .message = msg } };
+    const slot = ctx.backend.restoreTableToPointInTime(ctx.allocator, .{
+        .source_table_name = req.source_table_name,
+        .target_table_name = req.target_table_name,
+        .restore_date_time = req.restore_date_time,
+        .use_latest_restorable_time = req.use_latest_restorable_time,
+    }) catch |err| return .{ .err = mapStorageErr(err) };
+
+    const body = wire.renderTableDescriptionMin(ctx.allocator, "TableDescription", slot) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +142,7 @@ fn mapParseErr(e: wire.ParseError) ErrorBody {
 fn mapStorageErr(e: storage.Error) ErrorBody {
     return switch (e) {
         storage.Error.TableNotFound => .{ .code = .resource_not_found_exception },
+        storage.Error.TableAlreadyExists => .{ .code = .resource_in_use_exception },
         storage.Error.BackupNotFound => .{ .code = .backup_not_found_exception },
         storage.Error.InvalidBackupArn => .{ .code = .validation_exception, .message = "Invalid BackupArn." },
         storage.Error.OutOfMemory => .{ .code = .internal_server_error },

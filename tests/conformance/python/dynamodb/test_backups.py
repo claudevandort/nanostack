@@ -216,6 +216,117 @@ def _spawn_nanostack(bin_path: str, data_dir: str, port: int) -> subprocess.Pope
     raise AssertionError(f"nanostack did not bind :{port} within 5s")
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: RestoreTableFromBackup
+
+
+def test_restore_from_backup_round_trips_items(ddb, seeded_table):
+    arn = ddb.create_backup(TableName=seeded_table, BackupName="snap")["BackupDetails"]["BackupArn"]
+    # Corrupt the live table.
+    ddb.put_item(TableName=seeded_table, Item={"id": {"S": "k0"}, "n": {"N": "999"}})
+    target = _unique_table("restored")
+    out = ddb.restore_table_from_backup(BackupArn=arn, TargetTableName=target)
+    assert out["TableDescription"]["TableName"] == target
+    try:
+        # Every snapshotted item is present in the restored table.
+        items = ddb.scan(TableName=target)["Items"]
+        ids = sorted(it["id"]["S"] for it in items)
+        assert ids == ["k0", "k1", "k2"]
+        # And the restored k0 has the pre-corruption value.
+        k0 = ddb.get_item(TableName=target, Key={"id": {"S": "k0"}})["Item"]
+        assert k0["n"]["N"] == "0"
+    finally:
+        ddb.delete_table(TableName=target)
+
+
+def test_restore_target_name_conflict_returns_in_use(ddb, seeded_table):
+    arn = ddb.create_backup(TableName=seeded_table, BackupName="conflict")["BackupDetails"]["BackupArn"]
+    with pytest.raises(botocore.exceptions.ClientError) as ei:
+        ddb.restore_table_from_backup(BackupArn=arn, TargetTableName=seeded_table)
+    assert ei.value.response["Error"]["Code"] == "ResourceInUseException"
+
+
+def test_restore_with_missing_backup_returns_not_found(ddb):
+    fake = "arn:aws:dynamodb:us-east-1:000000000000:table/x/backup/00000000000000-deadbeef"
+    target = _unique_table("nope")
+    with pytest.raises(botocore.exceptions.ClientError) as ei:
+        ddb.restore_table_from_backup(BackupArn=fake, TargetTableName=target)
+    assert ei.value.response["Error"]["Code"] == "BackupNotFoundException"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: PITR (UpdateContinuousBackups + DescribeContinuousBackups)
+
+
+def test_describe_continuous_backups_default_disabled(ddb, seeded_table):
+    out = ddb.describe_continuous_backups(TableName=seeded_table)["ContinuousBackupsDescription"]
+    assert out["ContinuousBackupsStatus"] == "ENABLED"
+    assert out["PointInTimeRecoveryDescription"]["PointInTimeRecoveryStatus"] == "DISABLED"
+
+
+def test_enable_pitr_then_describe(ddb, seeded_table):
+    out = ddb.update_continuous_backups(
+        TableName=seeded_table,
+        PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True},
+    )["ContinuousBackupsDescription"]
+    assert out["PointInTimeRecoveryDescription"]["PointInTimeRecoveryStatus"] == "ENABLED"
+    assert "EarliestRestorableDateTime" in out["PointInTimeRecoveryDescription"]
+
+    desc = ddb.describe_continuous_backups(TableName=seeded_table)["ContinuousBackupsDescription"]
+    assert desc["PointInTimeRecoveryDescription"]["PointInTimeRecoveryStatus"] == "ENABLED"
+
+
+def test_disable_pitr_after_enable(ddb, seeded_table):
+    ddb.update_continuous_backups(
+        TableName=seeded_table,
+        PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True},
+    )
+    out = ddb.update_continuous_backups(
+        TableName=seeded_table,
+        PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": False},
+    )["ContinuousBackupsDescription"]
+    assert out["PointInTimeRecoveryDescription"]["PointInTimeRecoveryStatus"] == "DISABLED"
+
+
+def test_pitr_on_missing_table_returns_not_found(ddb):
+    with pytest.raises(botocore.exceptions.ClientError) as ei:
+        ddb.describe_continuous_backups(TableName="nonexistent_pitr_xyz")
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: RestoreTableToPointInTime
+
+
+def test_restore_to_point_in_time_snapshots_current(ddb, seeded_table):
+    # NOTE: nanostack's PITR restore ignores RestoreDateTime and
+    # snapshots the current table state. Documented divergence from
+    # AWS-real (which would time-travel to the target).
+    target = _unique_table("pit")
+    out = ddb.restore_table_to_point_in_time(
+        SourceTableName=seeded_table,
+        TargetTableName=target,
+        UseLatestRestorableTime=True,
+    )
+    try:
+        assert out["TableDescription"]["TableName"] == target
+        items = ddb.scan(TableName=target)["Items"]
+        ids = sorted(it["id"]["S"] for it in items)
+        assert ids == ["k0", "k1", "k2"]
+    finally:
+        ddb.delete_table(TableName=target)
+
+
+def test_restore_to_point_in_time_target_conflict(ddb, seeded_table):
+    with pytest.raises(botocore.exceptions.ClientError) as ei:
+        ddb.restore_table_to_point_in_time(
+            SourceTableName=seeded_table,
+            TargetTableName=seeded_table,
+            UseLatestRestorableTime=True,
+        )
+    assert ei.value.response["Error"]["Code"] == "ResourceInUseException"
+
+
 def test_backup_persists_across_restart():
     bin_path = os.environ.get("NANOSTACK_BIN")
     if not bin_path:

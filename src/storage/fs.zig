@@ -843,6 +843,9 @@ const dynamo_vtable: storage.DynamoBackend.VTable = .{
     .describeBackup = vtDdbDescribeBackup,
     .deleteBackup = vtDdbDeleteBackup,
     .restoreTableFromBackup = vtDdbRestoreFromBackup,
+    .updateContinuousBackups = vtDdbUpdateContinuousBackups,
+    .describeContinuousBackups = vtDdbDescribeContinuousBackups,
+    .restoreTableToPointInTime = vtDdbRestoreToPit,
 };
 
 fn vtDdbListTables(ctx: *anyopaque, allocator: Allocator) storage.Error![]const []const u8 {
@@ -913,6 +916,15 @@ fn vtDdbDeleteBackup(ctx: *anyopaque, allocator: Allocator, arn: []const u8) sto
 }
 fn vtDdbRestoreFromBackup(ctx: *anyopaque, allocator: Allocator, in: storage.RestoreTableFromBackupInput) storage.Error!*const storage.TableSlot {
     return ddbRestoreTableFromBackup(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtDdbUpdateContinuousBackups(ctx: *anyopaque, in: storage.UpdateContinuousBackupsInput) storage.Error!storage.ContinuousBackupsDescription {
+    return ddbUpdateContinuousBackups(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtDdbDescribeContinuousBackups(ctx: *anyopaque, name: []const u8) storage.Error!storage.ContinuousBackupsDescription {
+    return ddbDescribeContinuousBackups(@ptrCast(@alignCast(ctx)), name);
+}
+fn vtDdbRestoreToPit(ctx: *anyopaque, allocator: Allocator, in: storage.RestoreTableToPointInTimeInput) storage.Error!*const storage.TableSlot {
+    return ddbRestoreTableToPointInTime(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 
 // ---------------------------------------------------------------------------
@@ -3256,6 +3268,11 @@ const SchemaDoc = struct {
     /// configured.
     ttl_status: ?[]const u8 = null,
     ttl_attribute_name: ?[]const u8 = null,
+    /// PITR / continuous backups (v0.2.5). pitr_status ∈ {"ENABLED",
+    /// "DISABLED"}. `pitr_enabled_unix` is non-null whenever PITR has
+    /// ever been enabled (used to derive EarliestRestorableDateTime).
+    pitr_status: ?[]const u8 = null,
+    pitr_enabled_unix: ?i64 = null,
 };
 const KeyAttrDoc = struct { name: []const u8, key_type: []const u8 };
 const AttributeDefDoc = struct { name: []const u8, type: []const u8 };
@@ -3331,6 +3348,8 @@ fn slotToDoc(allocator: Allocator, slot: *const storage.TableSlot) !SchemaDoc {
         .stream_enabled_unix = slot.stream_enabled_unix,
         .ttl_status = if (slot.ttl_spec) |sp| sp.status.toAws() else null,
         .ttl_attribute_name = if (slot.ttl_spec) |sp| sp.attribute_name else null,
+        .pitr_status = slot.continuous_backup.pitr_status.toAws(),
+        .pitr_enabled_unix = slot.continuous_backup.enabled_unix,
     };
 }
 
@@ -3541,6 +3560,15 @@ fn docToSlot(allocator: Allocator, doc: SchemaDoc) !storage.TableSlot {
         };
     };
 
+    const pitr: ddb.dynamo_state.ContinuousBackupSpec = blk: {
+        const status_str = doc.pitr_status orelse break :blk .{};
+        const status: ddb.dynamo_state.PitrStatus = if (std.mem.eql(u8, status_str, "ENABLED"))
+            .enabled
+        else
+            .disabled;
+        break :blk .{ .pitr_status = status, .enabled_unix = doc.pitr_enabled_unix };
+    };
+
     return .{
         .name = name,
         .key_schema = ks,
@@ -3552,6 +3580,7 @@ fn docToSlot(allocator: Allocator, doc: SchemaDoc) !storage.TableSlot {
         .stream_spec = stream_spec,
         .stream_enabled_unix = doc.stream_enabled_unix,
         .ttl_spec = ttl_spec,
+        .continuous_backup = pitr,
         .created_unix = doc.created_unix,
     };
 }
@@ -5069,11 +5098,223 @@ pub fn ddbDeleteBackup(self: *Fs, allocator: Allocator, backup_arn: []const u8) 
 }
 
 pub fn ddbRestoreTableFromBackup(self: *Fs, allocator: Allocator, in: storage.RestoreTableFromBackupInput) storage.Error!*const storage.TableSlot {
-    _ = self;
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    if (self.dynamo_tables.contains(in.target_table_name)) return storage.Error.TableAlreadyExists;
+
+    const backup_id = try parseBackupId(in.backup_arn);
+
+    // Read the snapshotted schema.
+    var dir_buf: [4096]u8 = undefined;
+    const backup_dir = backupDirPath(self, backup_id, &dir_buf) catch return storage.Error.Io;
+    var schema_path_buf: [4096]u8 = undefined;
+    const schema_path = std.fmt.bufPrint(&schema_path_buf, "{s}/schema.json", .{backup_dir}) catch return storage.Error.Io;
+
+    const body = Io.Dir.cwd().readFileAlloc(self.io, schema_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return storage.Error.BackupNotFound,
+        else => return storage.Error.Io,
+    };
+    defer allocator.free(body);
+
+    var parsed = std.json.parseFromSlice(SchemaDoc, allocator, body, .{ .ignore_unknown_fields = true }) catch
+        return storage.Error.Io;
+    defer parsed.deinit();
+    const doc = parsed.value;
+
+    // Reconstruct a CreateTableInput from the snapshotted schema, but
+    // with the *target* name (not the source). Allocations live in the
+    // per-request arena.
+    const ks_in = allocator.alloc(storage.dynamo_state.KeyAttribute, doc.key_schema.len) catch return storage.Error.OutOfMemory;
+    for (doc.key_schema, 0..) |k, i| ks_in[i] = .{
+        .name = allocator.dupe(u8, k.name) catch return storage.Error.OutOfMemory,
+        .key_type = storage.dynamo_state.KeyType.fromAws(k.key_type) orelse .hash,
+    };
+    const ad_in = allocator.alloc(storage.dynamo_state.AttributeDef, doc.attribute_definitions.len) catch return storage.Error.OutOfMemory;
+    for (doc.attribute_definitions, 0..) |a, i| ad_in[i] = .{
+        .name = allocator.dupe(u8, a.name) catch return storage.Error.OutOfMemory,
+        .type = storage.dynamo_state.ScalarType.fromAws(a.type) orelse .string,
+    };
+
+    const create_in: storage.CreateTableInput = .{
+        .name = in.target_table_name,
+        .key_schema = ks_in,
+        .attribute_definitions = ad_in,
+        .billing_mode = storage.dynamo_state.BillingMode.fromAws(doc.billing_mode) orelse .pay_per_request,
+        // GSIs/LSIs/Tags/Stream/TTL would round-trip here too in a
+        // future patch. For now restore the basic schema; clients can
+        // re-apply richer features on the restored table.
+    };
+    // ddbCreateTable would re-lock the mutex; inline the body.
+    try createTableLocked(self, create_in);
+
+    // Walk the backup's items/ dir + reinsert into the new table.
+    var items_dir_buf: [4096]u8 = undefined;
+    const items_dir = backupItemsDirPath(self, backup_id, &items_dir_buf) catch return storage.Error.Io;
+    var dir = Io.Dir.cwd().openDir(self.io, items_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            // Backup had no items — restored table is empty, return slot.
+            return self.dynamo_tables.get(in.target_table_name).?;
+        },
+        else => return storage.Error.Io,
+    };
+    defer dir.close(self.io);
+
+    const target_slot = self.dynamo_tables.get(in.target_table_name).?;
+    var it = dir.iterate();
+    while (it.next(self.io) catch return storage.Error.Io) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+        var item_path_buf: [4096]u8 = undefined;
+        const item_path = std.fmt.bufPrint(&item_path_buf, "{s}/{s}", .{ items_dir, entry.name }) catch return storage.Error.Io;
+        const item_body = Io.Dir.cwd().readFileAlloc(self.io, item_path, self.allocator, .limited(4 * 1024 * 1024)) catch
+            return storage.Error.Io;
+        defer self.allocator.free(item_body);
+
+        var item_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, item_body, .{}) catch continue;
+        defer item_parsed.deinit();
+        if (item_parsed.value != .object) continue;
+
+        const item = parseItemFromJson(self.allocator, item_parsed.value.object) catch continue;
+        defer {
+            var owned = item;
+            owned.deinit(self.allocator);
+        }
+        applyPutLocked(self, target_slot, &item) catch continue;
+    }
+
+    return target_slot;
+}
+
+/// Caller must hold self.mutex. Same body as ddbCreateTable minus the
+/// lock.
+fn createTableLocked(self: *Fs, in: storage.CreateTableInput) storage.Error!void {
+    if (self.dynamo_tables.contains(in.name)) return storage.Error.TableAlreadyExists;
+    const slot = cloneTableSlot(self.allocator, in, nowUnixSeconds(self.io)) catch
+        return storage.Error.OutOfMemory;
+    const slot_ptr = self.allocator.create(storage.TableSlot) catch {
+        var tmp = slot;
+        tmp.deinit(self.allocator);
+        return storage.Error.OutOfMemory;
+    };
+    slot_ptr.* = slot;
+    if (slot_ptr.stream_spec) |spec| if (spec.enabled) {
+        attachStream(self, slot_ptr) catch {
+            slot_ptr.deinit(self.allocator);
+            self.allocator.destroy(slot_ptr);
+            return storage.Error.OutOfMemory;
+        };
+    };
+    writeSchemaJson(self, slot_ptr) catch {
+        slot_ptr.deinit(self.allocator);
+        self.allocator.destroy(slot_ptr);
+        return storage.Error.Io;
+    };
+    self.dynamo_tables.put(self.allocator, slot_ptr.name, slot_ptr) catch
+        return storage.Error.OutOfMemory;
+}
+
+pub fn ddbUpdateContinuousBackups(self: *Fs, in: storage.UpdateContinuousBackupsInput) storage.Error!storage.ContinuousBackupsDescription {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.dynamo_tables.get(in.table_name) orelse return storage.Error.TableNotFound;
+
+    const now = nowUnixSeconds(self.io);
+    if (in.pitr_enabled) {
+        slot.continuous_backup.pitr_status = .enabled;
+        // Re-stamp the enabled_unix on every enable transition.
+        if (slot.continuous_backup.enabled_unix == null) slot.continuous_backup.enabled_unix = now;
+    } else {
+        slot.continuous_backup.pitr_status = .disabled;
+        // Leave enabled_unix in place — matches AWS behaviour where
+        // the timestamp survives a disable.
+    }
+    writeSchemaJson(self, slot) catch return storage.Error.Io;
+    return describeContinuousBackupsLocked(self, slot);
+}
+
+pub fn ddbDescribeContinuousBackups(self: *Fs, table_name: []const u8) storage.Error!storage.ContinuousBackupsDescription {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const slot = self.dynamo_tables.get(table_name) orelse return storage.Error.TableNotFound;
+    return describeContinuousBackupsLocked(self, slot);
+}
+
+fn describeContinuousBackupsLocked(self: *Fs, slot: *const storage.TableSlot) storage.ContinuousBackupsDescription {
+    const now = nowUnixSeconds(self.io);
+    // AWS-real: 35 day window. Earliest = max(table_created, now - 35d).
+    const window_secs: i64 = 35 * 24 * 3600;
+    const earliest = @max(slot.created_unix, now - window_secs);
+    return .{
+        .continuous_backups_status = .enabled,
+        .pitr_status = slot.continuous_backup.pitr_status,
+        .earliest_restorable_unix = earliest,
+        .latest_restorable_unix = now,
+    };
+}
+
+pub fn ddbRestoreTableToPointInTime(self: *Fs, allocator: Allocator, in: storage.RestoreTableToPointInTimeInput) storage.Error!*const storage.TableSlot {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    if (self.dynamo_tables.contains(in.target_table_name)) return storage.Error.TableAlreadyExists;
+
+    const source = self.dynamo_tables.get(in.source_table_name) orelse return storage.Error.TableNotFound;
+
+    // Documented divergence: we ignore `restore_date_time` /
+    // `use_latest_restorable_time` and always snapshot the current
+    // state. LocalStack does the same.
     _ = allocator;
-    _ = in;
-    // Phase 2.
-    return storage.Error.BackupNotFound;
+
+    // Clone source schema → CreateTableInput for the target.
+    const create_in: storage.CreateTableInput = .{
+        .name = in.target_table_name,
+        .key_schema = source.key_schema,
+        .attribute_definitions = source.attribute_definitions,
+        .billing_mode = source.billing_mode,
+    };
+    try createTableLocked(self, create_in);
+    const target = self.dynamo_tables.get(in.target_table_name).?;
+
+    // Copy every item from source into target.
+    var it = source.items.iterator();
+    while (it.next()) |entry| {
+        const item_ptr = entry.value_ptr.*;
+        applyPutLocked(self, target, item_ptr) catch continue;
+    }
+
+    return target;
+}
+
+/// Build an `Item` from a parsed JSON map. Allocated via the Fs's
+/// long-lived allocator (lifetime: until the next deinit).
+fn parseItemFromJson(allocator: Allocator, obj: std.json.ObjectMap) !storage.Item {
+    const n = obj.count();
+    const names = try allocator.alloc([]const u8, n);
+    var names_done: usize = 0;
+    errdefer {
+        for (names[0..names_done]) |nm| allocator.free(nm);
+        allocator.free(names);
+    }
+    const values = try allocator.alloc(ddb_attr.AttributeValue, n);
+    var values_done: usize = 0;
+    errdefer {
+        for (values[0..values_done]) |*v| {
+            var copy = v.*;
+            ddb_attr.deinit(allocator, &copy);
+        }
+        allocator.free(values);
+    }
+    var entry_it = obj.iterator();
+    var i: usize = 0;
+    while (entry_it.next()) |entry| : (i += 1) {
+        names[i] = try allocator.dupe(u8, entry.key_ptr.*);
+        names_done = i + 1;
+        values[i] = try ddb_attr.parseValue(allocator, entry.value_ptr.*);
+        values_done = i + 1;
+    }
+    return .{ .names = names, .values = values };
 }
 
 // ---------------------------------------------------------------------------

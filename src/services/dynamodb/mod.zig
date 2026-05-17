@@ -214,7 +214,19 @@ const StubBackend = struct {
             .describeBackup = stubDescribeBackup,
             .deleteBackup = stubDeleteBackup,
             .restoreTableFromBackup = stubRestoreFromBackup,
+            .updateContinuousBackups = stubUpdateContinuousBackups,
+            .describeContinuousBackups = stubDescribeContinuousBackups,
+            .restoreTableToPointInTime = stubRestoreToPit,
         } };
+    }
+    fn stubUpdateContinuousBackups(_: *anyopaque, _: storage.UpdateContinuousBackupsInput) storage.Error!storage.ContinuousBackupsDescription {
+        unreachable;
+    }
+    fn stubDescribeContinuousBackups(_: *anyopaque, _: []const u8) storage.Error!storage.ContinuousBackupsDescription {
+        unreachable;
+    }
+    fn stubRestoreToPit(_: *anyopaque, _: Allocator, _: storage.RestoreTableToPointInTimeInput) storage.Error!*const storage.TableSlot {
+        unreachable;
     }
     fn stubUpdateTimeToLive(_: *anyopaque, _: storage.UpdateTimeToLiveInput) storage.Error!storage.dynamo_state.TimeToLiveSpec {
         unreachable;

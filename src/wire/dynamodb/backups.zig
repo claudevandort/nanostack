@@ -205,6 +205,170 @@ pub fn renderDeleteBackup(allocator: Allocator, desc: storage.BackupDescription)
 }
 
 // ---------------------------------------------------------------------------
+// RestoreTableFromBackup
+
+pub const RestoreFromBackupRequest = struct {
+    backup_arn: []const u8,
+    target_table_name: []const u8,
+};
+
+pub fn parseRestoreTableFromBackup(allocator: Allocator, body: []const u8) ParseError!RestoreFromBackupRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const root = parsed.value.object;
+    const arn_v = root.get("BackupArn") orelse return ParseError.Malformed;
+    const target_v = root.get("TargetTableName") orelse return ParseError.Malformed;
+    if (arn_v != .string or target_v != .string) return ParseError.Malformed;
+    if (target_v.string.len == 0) return ParseError.Malformed;
+    return .{
+        .backup_arn = try allocator.dupe(u8, arn_v.string),
+        .target_table_name = try allocator.dupe(u8, target_v.string),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// UpdateContinuousBackups + DescribeContinuousBackups
+
+pub const UpdateContinuousBackupsRequest = struct {
+    table_name: []const u8,
+    pitr_enabled: bool,
+};
+
+pub fn parseUpdateContinuousBackups(allocator: Allocator, body: []const u8) ParseError!UpdateContinuousBackupsRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const root = parsed.value.object;
+    const tn_v = root.get("TableName") orelse return ParseError.Malformed;
+    if (tn_v != .string) return ParseError.Malformed;
+
+    const pitr_spec_v = root.get("PointInTimeRecoverySpecification") orelse return ParseError.Malformed;
+    if (pitr_spec_v != .object) return ParseError.Malformed;
+    const enabled_v = pitr_spec_v.object.get("PointInTimeRecoveryEnabled") orelse return ParseError.Malformed;
+    if (enabled_v != .bool) return ParseError.Malformed;
+
+    return .{
+        .table_name = try allocator.dupe(u8, tn_v.string),
+        .pitr_enabled = enabled_v.bool,
+    };
+}
+
+pub fn parseDescribeContinuousBackups(allocator: Allocator, body: []const u8) ParseError![]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const tn_v = parsed.value.object.get("TableName") orelse return ParseError.Malformed;
+    if (tn_v != .string) return ParseError.Malformed;
+    return try allocator.dupe(u8, tn_v.string);
+}
+
+pub fn renderContinuousBackups(allocator: Allocator, desc: storage.ContinuousBackupsDescription) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("ContinuousBackupsDescription");
+    try s.beginObject();
+    try s.objectField("ContinuousBackupsStatus");
+    try s.write(switch (desc.continuous_backups_status) {
+        .enabled => "ENABLED",
+        .disabled => "DISABLED",
+    });
+    try s.objectField("PointInTimeRecoveryDescription");
+    try s.beginObject();
+    try s.objectField("PointInTimeRecoveryStatus");
+    try s.write(desc.pitr_status.toAws());
+    if (desc.pitr_status == .enabled) {
+        try s.objectField("EarliestRestorableDateTime");
+        try s.print("{d}", .{@as(f64, @floatFromInt(desc.earliest_restorable_unix))});
+        try s.objectField("LatestRestorableDateTime");
+        try s.print("{d}", .{@as(f64, @floatFromInt(desc.latest_restorable_unix))});
+    }
+    try s.endObject();
+    try s.endObject();
+    try s.endObject();
+    return aw.toOwnedSlice();
+}
+
+// ---------------------------------------------------------------------------
+// RestoreTableToPointInTime
+
+pub const RestoreToPitRequest = struct {
+    source_table_name: []const u8,
+    target_table_name: []const u8,
+    restore_date_time: ?i64 = null,
+    use_latest_restorable_time: bool = false,
+};
+
+pub fn parseRestoreTableToPointInTime(allocator: Allocator, body: []const u8) ParseError!RestoreToPitRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const root = parsed.value.object;
+    const src_v = root.get("SourceTableName") orelse return ParseError.Malformed;
+    const dst_v = root.get("TargetTableName") orelse return ParseError.Malformed;
+    if (src_v != .string or dst_v != .string) return ParseError.Malformed;
+    var req: RestoreToPitRequest = .{
+        .source_table_name = try allocator.dupe(u8, src_v.string),
+        .target_table_name = try allocator.dupe(u8, dst_v.string),
+    };
+    if (root.get("RestoreDateTime")) |v| switch (v) {
+        .float => |f| req.restore_date_time = @intFromFloat(f),
+        .integer => |i| req.restore_date_time = i,
+        else => {},
+    };
+    if (root.get("UseLatestRestorableTime")) |v| if (v == .bool) {
+        req.use_latest_restorable_time = v.bool;
+    };
+    return req;
+}
+
+/// Render a TableDescription-wrapping response. We don't have the full
+/// TableSlot here so we render the minimal subset: TableName +
+/// TableStatus = ACTIVE + KeySchema + CreationDateTime. Clients call
+/// DescribeTable on the restored table if they need the full schema.
+pub fn renderTableDescriptionMin(
+    allocator: Allocator,
+    wrapper: []const u8,
+    slot: *const storage.TableSlot,
+) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    try s.objectField(wrapper);
+    try s.beginObject();
+    try s.objectField("TableName");
+    try s.write(slot.name);
+    try s.objectField("TableStatus");
+    try s.write("ACTIVE");
+    try s.objectField("CreationDateTime");
+    try s.print("{d}", .{@as(f64, @floatFromInt(slot.created_unix))});
+    try s.objectField("KeySchema");
+    try s.beginArray();
+    for (slot.key_schema) |k| {
+        try s.beginObject();
+        try s.objectField("AttributeName");
+        try s.write(k.name);
+        try s.objectField("KeyType");
+        try s.write(k.key_type.toAws());
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.objectField("ItemCount");
+    try s.write(slot.items.count());
+    try s.endObject();
+    try s.endObject();
+    return aw.toOwnedSlice();
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 
 const testing = std.testing;

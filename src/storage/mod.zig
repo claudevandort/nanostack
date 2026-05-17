@@ -1371,6 +1371,31 @@ pub const RestoreTableFromBackupInput = struct {
     target_table_name: []const u8,
 };
 
+pub const UpdateContinuousBackupsInput = struct {
+    table_name: []const u8,
+    pitr_enabled: bool,
+};
+
+pub const ContinuousBackupsDescription = struct {
+    /// AWS reports continuous backups as ENABLED at the account level;
+    /// only the PITR sub-status reflects the per-table toggle.
+    continuous_backups_status: enum { enabled, disabled },
+    pitr_status: dynamo_state.PitrStatus,
+    /// Wall-clock unix seconds. Synthetic if PITR is disabled (we still
+    /// return a value to match AWS-real wire shape).
+    earliest_restorable_unix: i64,
+    latest_restorable_unix: i64,
+};
+
+pub const RestoreTableToPointInTimeInput = struct {
+    source_table_name: []const u8,
+    target_table_name: []const u8,
+    /// Accepted but ignored; we always snapshot the current state.
+    /// Documented divergence — LocalStack does the same.
+    restore_date_time: ?i64 = null,
+    use_latest_restorable_time: bool = false,
+};
+
 /// A pre-evaluated condition predicate. Storage holds the mutex and
 /// calls `evaluate` against the existing item. Returns true if the
 /// condition passes; false → the storage op fails with
@@ -1655,6 +1680,10 @@ pub const DynamoBackend = struct {
         describeBackup: *const fn (ctx: *anyopaque, allocator: Allocator, backup_arn: []const u8) Error!BackupDescription,
         deleteBackup: *const fn (ctx: *anyopaque, allocator: Allocator, backup_arn: []const u8) Error!BackupDescription,
         restoreTableFromBackup: *const fn (ctx: *anyopaque, allocator: Allocator, in: RestoreTableFromBackupInput) Error!*const TableSlot,
+        // v0.2.5 PITR.
+        updateContinuousBackups: *const fn (ctx: *anyopaque, in: UpdateContinuousBackupsInput) Error!ContinuousBackupsDescription,
+        describeContinuousBackups: *const fn (ctx: *anyopaque, table_name: []const u8) Error!ContinuousBackupsDescription,
+        restoreTableToPointInTime: *const fn (ctx: *anyopaque, allocator: Allocator, in: RestoreTableToPointInTimeInput) Error!*const TableSlot,
     };
 
     pub fn listTables(self: DynamoBackend, allocator: Allocator) Error![]const []const u8 {
@@ -1730,6 +1759,15 @@ pub const DynamoBackend = struct {
     }
     pub fn restoreTableFromBackup(self: DynamoBackend, allocator: Allocator, in: RestoreTableFromBackupInput) Error!*const TableSlot {
         return self.vtable.restoreTableFromBackup(self.ctx, allocator, in);
+    }
+    pub fn updateContinuousBackups(self: DynamoBackend, in: UpdateContinuousBackupsInput) Error!ContinuousBackupsDescription {
+        return self.vtable.updateContinuousBackups(self.ctx, in);
+    }
+    pub fn describeContinuousBackups(self: DynamoBackend, table_name: []const u8) Error!ContinuousBackupsDescription {
+        return self.vtable.describeContinuousBackups(self.ctx, table_name);
+    }
+    pub fn restoreTableToPointInTime(self: DynamoBackend, allocator: Allocator, in: RestoreTableToPointInTimeInput) Error!*const TableSlot {
+        return self.vtable.restoreTableToPointInTime(self.ctx, allocator, in);
     }
 };
 
