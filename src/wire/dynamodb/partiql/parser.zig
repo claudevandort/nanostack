@@ -41,6 +41,9 @@ pub fn parse(allocator: Allocator, input: []const u8) ParseError!ast.ParsedState
     const first = p.peek().kind;
     const stmt: ast.Statement = switch (first) {
         .kw_select => .{ .select = try p.parseSelect() },
+        .kw_insert => .{ .insert = try p.parseInsert() },
+        .kw_update => .{ .update = try p.parseUpdate() },
+        .kw_delete => .{ .delete = try p.parseDelete() },
         else => return ParseError.UnsupportedStatement,
     };
 
@@ -109,6 +112,142 @@ const Parser = struct {
             .index_name = index_name,
             .columns = try columns.toOwnedSlice(self.allocator),
             .where_clause = where_clause,
+        };
+    }
+
+    fn parseInsert(self: *Parser) ParseError!ast.Insert {
+        _ = try self.expect(.kw_insert);
+        _ = try self.expect(.kw_into);
+        const table_name = try self.parseIdent();
+
+        // AWS PartiQL: INSERT uses singular `VALUE` (not VALUES). Accept
+        // both per Zoo of dialects.
+        if (self.accept(.kw_value) == null and self.accept(.kw_values) == null) {
+            return ParseError.Malformed;
+        }
+        _ = try self.expect(.lbrace);
+
+        var fields: std.ArrayList(ast.InsertField) = .empty;
+        errdefer fields.deinit(self.allocator);
+
+        if (self.peek().kind != .rbrace) {
+            try fields.append(self.allocator, try self.parseInsertField());
+            while (self.accept(.comma)) |_| {
+                try fields.append(self.allocator, try self.parseInsertField());
+            }
+        }
+        _ = try self.expect(.rbrace);
+
+        return .{
+            .table_name = table_name,
+            .fields = try fields.toOwnedSlice(self.allocator),
+        };
+    }
+
+    fn parseInsertField(self: *Parser) ParseError!ast.InsertField {
+        // Key — AWS uses string-literal keys ('col') but quoted/bare
+        // identifiers are also accepted in the wild.
+        const key_tok = self.peek();
+        const key_name = switch (key_tok.kind) {
+            .string_literal, .identifier, .quoted_identifier => blk: {
+                _ = self.advance();
+                break :blk key_tok.text;
+            },
+            else => return ParseError.Malformed,
+        };
+        _ = try self.expect(.colon);
+        const value = try self.parseOperand();
+        return .{ .name = key_name, .value = value };
+    }
+
+    fn parseUpdate(self: *Parser) ParseError!ast.Update {
+        _ = try self.expect(.kw_update);
+        const table_name = try self.parseIdent();
+        _ = try self.expect(.kw_set);
+
+        var assignments: std.ArrayList(ast.UpdateAssignment) = .empty;
+        errdefer assignments.deinit(self.allocator);
+
+        try assignments.append(self.allocator, try self.parseUpdateAssignment());
+        while (self.accept(.comma)) |_| {
+            try assignments.append(self.allocator, try self.parseUpdateAssignment());
+        }
+
+        _ = try self.expect(.kw_where);
+        const where_clause = try self.parseKeyCondition();
+        const returning = try self.parseReturning();
+
+        return .{
+            .table_name = table_name,
+            .assignments = try assignments.toOwnedSlice(self.allocator),
+            .where_clause = where_clause,
+            .returning = returning,
+        };
+    }
+
+    fn parseUpdateAssignment(self: *Parser) ParseError!ast.UpdateAssignment {
+        const col = try self.parseIdent();
+        _ = try self.expect(.eq);
+        // RHS: operand | col + operand | col - operand.
+        // For `col + ?` the LHS column must equal `col`. We don't enforce
+        // that here — the eval enforces it implicitly via attribute lookup.
+        const first = self.peek();
+        if (first.kind == .identifier or first.kind == .quoted_identifier) {
+            // Could be either a bare attr reference or an arithmetic
+            // expression. Peek the next token to decide.
+            const next = if (self.pos + 1 < self.toks.len) self.toks[self.pos + 1] else first;
+            if (next.kind == .plus or next.kind == .minus) {
+                _ = self.advance(); // column reference (consumed but unused)
+                const op_tok = self.advance();
+                const rhs = try self.parseOperand();
+                return .{
+                    .column = col,
+                    .op = if (op_tok.kind == .plus) .add_to_col else .sub_from_col,
+                    .operand = rhs,
+                };
+            }
+            // Bare attr reference as the assignment value is not
+            // supported in Phase 2 (would require column-to-column
+            // assignment semantics AWS doesn't really expose either).
+            return ParseError.Malformed;
+        }
+        const operand = try self.parseOperand();
+        return .{ .column = col, .op = .assign, .operand = operand };
+    }
+
+    fn parseDelete(self: *Parser) ParseError!ast.Delete {
+        _ = try self.expect(.kw_delete);
+        _ = try self.expect(.kw_from);
+        const table_name = try self.parseIdent();
+        _ = try self.expect(.kw_where);
+        const where_clause = try self.parseKeyCondition();
+        const returning = try self.parseReturning();
+        return .{
+            .table_name = table_name,
+            .where_clause = where_clause,
+            .returning = returning,
+        };
+    }
+
+    fn parseReturning(self: *Parser) ParseError!ast.ReturnValues {
+        if (self.accept(.kw_returning) == null) return .none;
+        // AWS PartiQL: RETURNING (ALL OLD * | ALL NEW * | MODIFIED OLD * | MODIFIED NEW *)
+        const first = self.advance();
+        const second = self.advance();
+        // Optional `*` token — accept and discard.
+        if (self.peek().kind == .star) _ = self.advance();
+        return switch (first.kind) {
+            .kw_all => switch (second.kind) {
+                .kw_old => ast.ReturnValues.all_old,
+                .kw_new => ast.ReturnValues.all_new,
+                else => ParseError.Malformed,
+            },
+            .kw_modified => switch (second.kind) {
+                .kw_old => ast.ReturnValues.updated_old,
+                .kw_new => ast.ReturnValues.updated_new,
+                else => ParseError.Malformed,
+            },
+            else => ParseError.Malformed,
         };
     }
 

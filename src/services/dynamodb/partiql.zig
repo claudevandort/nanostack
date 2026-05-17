@@ -53,6 +53,9 @@ pub fn executeStatement(ctx: Context) Result {
 
     return switch (ast_doc.statement) {
         .select => |sel| executeSelect(ctx, sel, params, root),
+        .insert => |ins| executeInsert(ctx, ins, params),
+        .update => |upd| executeUpdate(ctx, upd, params),
+        .delete => |del| executeDelete(ctx, del, params),
     };
 }
 
@@ -202,6 +205,222 @@ fn resolveOperand(op: partiql_ast.Operand, params: []const AttributeValue) ?Attr
         .literal => |v| v,
         .param_index => |i| if (i < params.len) params[i] else null,
     };
+}
+
+// ---------------------------------------------------------------------------
+// INSERT
+
+fn executeInsert(ctx: Context, ins: partiql_ast.Insert, params: []const AttributeValue) Result {
+    // Build the Item from the field list.
+    const n = ins.fields.len;
+    const names = ctx.allocator.alloc([]const u8, n) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    const values = ctx.allocator.alloc(AttributeValue, n) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    for (ins.fields, 0..) |f, i| {
+        names[i] = f.name;
+        const v = resolveOperand(f.value, params) orelse
+            return .{ .err = .{ .code = .validation_exception, .message = "INSERT value references an unbound parameter." } };
+        values[i] = v;
+    }
+    const item: storage.Item = .{ .names = names, .values = values };
+
+    _ = ctx.backend.putItem(ctx.allocator, .{
+        .table = ins.table_name,
+        .item = &item,
+    }) catch |err| return .{ .err = mapStorageErr(err) };
+
+    // AWS-real INSERT returns an empty body on success.
+    return .{ .ok = .{ .body = "{}" } };
+}
+
+// ---------------------------------------------------------------------------
+// UPDATE
+
+const UpdateApplierCtx = struct {
+    assignments: []const partiql_ast.UpdateAssignment,
+    params: []const AttributeValue,
+    allocator: Allocator,
+};
+
+fn updateApplyFn(ctx_ptr: *anyopaque, item: *storage.Item) bool {
+    const uctx: *UpdateApplierCtx = @ptrCast(@alignCast(ctx_ptr));
+    return applyAssignments(uctx, item) catch false;
+}
+
+fn applyAssignments(uctx: *UpdateApplierCtx, item: *storage.Item) !bool {
+    for (uctx.assignments) |a| {
+        const operand_val = resolveOperand(a.operand, uctx.params) orelse return false;
+        const new_val: AttributeValue = switch (a.op) {
+            .assign => operand_val,
+            .add_to_col, .sub_from_col => blk: {
+                // Atomic counter: numeric add/sub of operand to existing
+                // column value. Reuses the existing decimal helper.
+                const existing_av: AttributeValue = if (item.attributeValue(a.column)) |p|
+                    p.*
+                else
+                    .{ .n = "0" };
+                const lhs = switch (existing_av) {
+                    .n => |s| s,
+                    else => return false,
+                };
+                const rhs = switch (operand_val) {
+                    .n => |s| s,
+                    else => return false,
+                };
+                const a_f = std.fmt.parseFloat(f64, lhs) catch return false;
+                const b_f = std.fmt.parseFloat(f64, rhs) catch return false;
+                const result = if (a.op == .add_to_col) a_f + b_f else a_f - b_f;
+                // Render — drop trailing .0 to match the existing
+                // UpdateExpression arithmetic output where reasonable.
+                const formatted = try std.fmt.allocPrint(uctx.allocator, "{d}", .{result});
+                break :blk AttributeValue{ .n = formatted };
+            },
+        };
+        try setItemAttribute(uctx.allocator, item, a.column, new_val);
+    }
+    return true;
+}
+
+fn setItemAttribute(allocator: Allocator, item: *storage.Item, name: []const u8, value: AttributeValue) !void {
+    // Replace if present.
+    for (item.names, 0..) |n, i| {
+        if (std.mem.eql(u8, n, name)) {
+            item.values[i] = value;
+            return;
+        }
+    }
+    // Otherwise grow names + values.
+    const new_names = try allocator.alloc([]const u8, item.names.len + 1);
+    @memcpy(new_names[0..item.names.len], item.names);
+    new_names[item.names.len] = name;
+    const new_values = try allocator.alloc(AttributeValue, item.values.len + 1);
+    @memcpy(new_values[0..item.values.len], item.values);
+    new_values[item.values.len] = value;
+    item.names = new_names;
+    item.values = new_values;
+}
+
+fn executeUpdate(ctx: Context, upd: partiql_ast.Update, params: []const AttributeValue) Result {
+    // Build a key-only Item from WHERE for the backend call.
+    const key_item = buildKeyItem(ctx.allocator, upd.where_clause, params) catch |err| switch (err) {
+        error.UnresolvableOperand => return .{ .err = .{
+            .code = .validation_exception,
+            .message = "WHERE clause references an unbound parameter.",
+        } },
+        else => return .{ .err = .{ .code = .internal_server_error } },
+    };
+
+    var applier_ctx: UpdateApplierCtx = .{
+        .assignments = upd.assignments,
+        .params = params,
+        .allocator = ctx.allocator,
+    };
+
+    const result = ctx.backend.updateItem(ctx.allocator, .{
+        .table = upd.table_name,
+        .key = &key_item,
+        .apply_fn = updateApplyFn,
+        .apply_ctx = @ptrCast(&applier_ctx),
+    }) catch |err| return .{ .err = mapStorageErr(err) };
+
+    const body = renderUpdateResult(ctx.allocator, result, upd.returning) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
+}
+
+// ---------------------------------------------------------------------------
+// DELETE
+
+fn executeDelete(ctx: Context, del: partiql_ast.Delete, params: []const AttributeValue) Result {
+    const key_item = buildKeyItem(ctx.allocator, del.where_clause, params) catch |err| switch (err) {
+        error.UnresolvableOperand => return .{ .err = .{
+            .code = .validation_exception,
+            .message = "WHERE clause references an unbound parameter.",
+        } },
+        else => return .{ .err = .{ .code = .internal_server_error } },
+    };
+
+    const result = ctx.backend.deleteItem(ctx.allocator, .{
+        .table = del.table_name,
+        .key = &key_item,
+    }) catch |err| return .{ .err = mapStorageErr(err) };
+
+    const body = renderDeleteResult(ctx.allocator, result, del.returning) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers for UPDATE / DELETE WHERE → key-only Item
+
+/// Build a key-only `Item` from a Phase-1 KeyCondition. Only handles
+/// `pk = X` and `pk = X AND sk = Y` shapes (AWS PartiQL requires the
+/// WHERE to identify a single item by key for UPDATE / DELETE).
+fn buildKeyItem(allocator: Allocator, cond: partiql_ast.KeyCondition, params: []const AttributeValue) !storage.Item {
+    var n: usize = 1;
+    if (cond.sk_name != null) n += 1;
+    const names = try allocator.alloc([]const u8, n);
+    const values = try allocator.alloc(AttributeValue, n);
+    names[0] = cond.pk_name;
+    values[0] = resolveOperand(cond.pk_value, params) orelse return error.UnresolvableOperand;
+    if (cond.sk_name) |sk_name| {
+        const sk_pred = cond.sk_predicate orelse return error.UnresolvableOperand;
+        const sk_value = switch (sk_pred) {
+            .eq => |op| resolveOperand(op, params) orelse return error.UnresolvableOperand,
+            else => return error.UnsupportedWhereForWrite,
+        };
+        names[1] = sk_name;
+        values[1] = sk_value;
+    }
+    return .{ .names = names, .values = values };
+}
+
+fn renderUpdateResult(allocator: Allocator, result: storage.UpdateItemResult, ret: partiql_ast.ReturnValues) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    switch (ret) {
+        .none => {},
+        .all_old => if (result.old_item) |old| {
+            try s.objectField("Items");
+            try s.beginArray();
+            try items_wire.renderItem(&s, allocator, &old);
+            try s.endArray();
+        },
+        .all_new, .updated_new => if (result.new_item) |new| {
+            try s.objectField("Items");
+            try s.beginArray();
+            try items_wire.renderItem(&s, allocator, &new);
+            try s.endArray();
+        },
+        .updated_old => if (result.old_item) |old| {
+            try s.objectField("Items");
+            try s.beginArray();
+            try items_wire.renderItem(&s, allocator, &old);
+            try s.endArray();
+        },
+    }
+    try s.endObject();
+    return aw.toOwnedSlice();
+}
+
+fn renderDeleteResult(allocator: Allocator, result: storage.DeleteItemResult, ret: partiql_ast.ReturnValues) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    if (ret == .all_old) {
+        if (result.old_item) |old| {
+            try s.objectField("Items");
+            try s.beginArray();
+            try items_wire.renderItem(&s, allocator, &old);
+            try s.endArray();
+        }
+    }
+    try s.endObject();
+    return aw.toOwnedSlice();
 }
 
 // ---------------------------------------------------------------------------

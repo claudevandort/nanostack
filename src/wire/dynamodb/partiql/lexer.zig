@@ -71,6 +71,7 @@ pub const TokenKind = enum {
     rbracket,
     comma,
     dot,
+    colon,
     star,
     eof,
 };
@@ -176,6 +177,10 @@ pub fn tokenize(allocator: Allocator, input: []const u8) LexError![]Token {
             },
             '.' => {
                 try toks.append(allocator, .{ .kind = .dot, .text = input[i .. i + 1], .offset = start });
+                i += 1;
+            },
+            ':' => {
+                try toks.append(allocator, .{ .kind = .colon, .text = input[i .. i + 1], .offset = start });
                 i += 1;
             },
             '*' => {

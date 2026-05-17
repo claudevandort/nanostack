@@ -62,8 +62,55 @@ pub const Select = struct {
     where_clause: ?KeyCondition = null,
 };
 
+/// One entry of an INSERT's VALUE map.
+pub const InsertField = struct {
+    name: []const u8,
+    value: Operand,
+};
+
+pub const Insert = struct {
+    table_name: []const u8,
+    fields: []const InsertField,
+};
+
+/// One SET assignment inside UPDATE. Either a direct value or
+/// "col + operand" / "col - operand" for atomic counters.
+pub const UpdateOp = enum { assign, add_to_col, sub_from_col };
+
+pub const UpdateAssignment = struct {
+    column: []const u8,
+    op: UpdateOp,
+    operand: Operand,
+};
+
+/// AWS RETURNING modifier on UPDATE / DELETE. Maps to the underlying
+/// `ReturnValues` field on the storage op.
+pub const ReturnValues = enum {
+    none,
+    all_old,
+    all_new,
+    updated_old,
+    updated_new,
+};
+
+pub const Update = struct {
+    table_name: []const u8,
+    assignments: []const UpdateAssignment,
+    where_clause: KeyCondition,
+    returning: ReturnValues = .none,
+};
+
+pub const Delete = struct {
+    table_name: []const u8,
+    where_clause: KeyCondition,
+    returning: ReturnValues = .none,
+};
+
 pub const Statement = union(enum) {
     select: Select,
+    insert: Insert,
+    update: Update,
+    delete: Delete,
 };
 
 /// Output of the parser: the AST + a count of `?` parameters seen, so

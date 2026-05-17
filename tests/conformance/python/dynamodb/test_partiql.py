@@ -221,6 +221,143 @@ def test_parameter_count_mismatch_returns_validation(ddb, simple_table):
     assert ei.value.response["Error"]["Code"] == "ValidationException"
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: INSERT / UPDATE / DELETE
+
+
+def test_insert_simple(ddb, simple_table):
+    ddb.execute_statement(
+        Statement=f"INSERT INTO \"{simple_table}\" VALUE {{'id': ?, 'name': ?}}",
+        Parameters=[{"S": "k1"}, {"S": "Alice"}],
+    )
+    item = ddb.get_item(TableName=simple_table, Key={"id": {"S": "k1"}})["Item"]
+    assert item["id"]["S"] == "k1"
+    assert item["name"]["S"] == "Alice"
+
+
+def test_insert_with_inline_string_literal(ddb, simple_table):
+    ddb.execute_statement(
+        Statement=f"INSERT INTO \"{simple_table}\" VALUE {{'id': 'k_inline', 'name': 'Charlie'}}",
+    )
+    item = ddb.get_item(TableName=simple_table, Key={"id": {"S": "k_inline"}})["Item"]
+    assert item["name"]["S"] == "Charlie"
+
+
+def test_insert_with_number_literal(ddb, simple_table):
+    ddb.execute_statement(
+        Statement=f"INSERT INTO \"{simple_table}\" VALUE {{'id': ?, 'count': 42}}",
+        Parameters=[{"S": "kn"}],
+    )
+    item = ddb.get_item(TableName=simple_table, Key={"id": {"S": "kn"}})["Item"]
+    assert item["count"]["N"] == "42"
+
+
+def test_insert_with_boolean_and_null(ddb, simple_table):
+    ddb.execute_statement(
+        Statement=f"INSERT INTO \"{simple_table}\" VALUE {{'id': ?, 'active': true, 'missing': null}}",
+        Parameters=[{"S": "kb"}],
+    )
+    item = ddb.get_item(TableName=simple_table, Key={"id": {"S": "kb"}})["Item"]
+    assert item["active"]["BOOL"] is True
+    assert item["missing"]["NULL"] is True
+
+
+def test_update_set_simple_replace(ddb, simple_table):
+    ddb.put_item(TableName=simple_table, Item={"id": {"S": "k1"}, "v": {"S": "old"}})
+    ddb.execute_statement(
+        Statement=f"UPDATE \"{simple_table}\" SET v = ? WHERE id = ?",
+        Parameters=[{"S": "new"}, {"S": "k1"}],
+    )
+    item = ddb.get_item(TableName=simple_table, Key={"id": {"S": "k1"}})["Item"]
+    assert item["v"]["S"] == "new"
+
+
+def test_update_set_atomic_counter(ddb, simple_table):
+    ddb.put_item(TableName=simple_table, Item={"id": {"S": "ctr"}, "count": {"N": "10"}})
+    ddb.execute_statement(
+        Statement=f"UPDATE \"{simple_table}\" SET count = count + ? WHERE id = ?",
+        Parameters=[{"N": "5"}, {"S": "ctr"}],
+    )
+    item = ddb.get_item(TableName=simple_table, Key={"id": {"S": "ctr"}})["Item"]
+    assert item["count"]["N"] in {"15", "15.0"}
+
+
+def test_update_set_creates_new_attribute(ddb, simple_table):
+    ddb.put_item(TableName=simple_table, Item={"id": {"S": "k1"}})
+    ddb.execute_statement(
+        Statement=f"UPDATE \"{simple_table}\" SET added = ? WHERE id = ?",
+        Parameters=[{"S": "yes"}, {"S": "k1"}],
+    )
+    item = ddb.get_item(TableName=simple_table, Key={"id": {"S": "k1"}})["Item"]
+    assert item["added"]["S"] == "yes"
+
+
+def test_update_multi_assignment(ddb, simple_table):
+    ddb.put_item(TableName=simple_table, Item={"id": {"S": "k1"}})
+    ddb.execute_statement(
+        Statement=f"UPDATE \"{simple_table}\" SET a = ?, b = ?, c = ? WHERE id = ?",
+        Parameters=[{"S": "av"}, {"N": "2"}, {"BOOL": True}, {"S": "k1"}],
+    )
+    item = ddb.get_item(TableName=simple_table, Key={"id": {"S": "k1"}})["Item"]
+    assert item["a"]["S"] == "av"
+    assert item["b"]["N"] == "2"
+    assert item["c"]["BOOL"] is True
+
+
+def test_update_returning_all_old(ddb, simple_table):
+    ddb.put_item(TableName=simple_table, Item={"id": {"S": "k1"}, "v": {"S": "old"}})
+    out = ddb.execute_statement(
+        Statement=f"UPDATE \"{simple_table}\" SET v = ? WHERE id = ? RETURNING ALL OLD *",
+        Parameters=[{"S": "new"}, {"S": "k1"}],
+    )
+    assert out["Items"][0]["v"]["S"] == "old"
+
+
+def test_update_returning_all_new(ddb, simple_table):
+    ddb.put_item(TableName=simple_table, Item={"id": {"S": "k1"}, "v": {"S": "old"}})
+    out = ddb.execute_statement(
+        Statement=f"UPDATE \"{simple_table}\" SET v = ? WHERE id = ? RETURNING ALL NEW *",
+        Parameters=[{"S": "new"}, {"S": "k1"}],
+    )
+    assert out["Items"][0]["v"]["S"] == "new"
+
+
+def test_delete_simple(ddb, simple_table):
+    ddb.put_item(TableName=simple_table, Item={"id": {"S": "k1"}})
+    ddb.execute_statement(
+        Statement=f"DELETE FROM \"{simple_table}\" WHERE id = ?",
+        Parameters=[{"S": "k1"}],
+    )
+    assert "Item" not in ddb.get_item(TableName=simple_table, Key={"id": {"S": "k1"}})
+
+
+def test_delete_returning_all_old(ddb, simple_table):
+    ddb.put_item(TableName=simple_table, Item={"id": {"S": "k1"}, "v": {"S": "to-go"}})
+    out = ddb.execute_statement(
+        Statement=f"DELETE FROM \"{simple_table}\" WHERE id = ? RETURNING ALL OLD *",
+        Parameters=[{"S": "k1"}],
+    )
+    assert out["Items"][0]["v"]["S"] == "to-go"
+
+
+def test_delete_composite_key(ddb, composite_table):
+    ddb.put_item(TableName=composite_table, Item={"pk": {"S": "p1"}, "sk": {"S": "a"}})
+    ddb.put_item(TableName=composite_table, Item={"pk": {"S": "p1"}, "sk": {"S": "b"}})
+    ddb.execute_statement(
+        Statement=f"DELETE FROM \"{composite_table}\" WHERE pk = ? AND sk = ?",
+        Parameters=[{"S": "p1"}, {"S": "a"}],
+    )
+    remaining = ddb.scan(TableName=composite_table)["Items"]
+    sks = sorted(it["sk"]["S"] for it in remaining)
+    assert sks == ["b"]
+
+
+def test_update_without_where_returns_validation(ddb, simple_table):
+    with pytest.raises(botocore.exceptions.ClientError) as ei:
+        ddb.execute_statement(Statement=f"UPDATE \"{simple_table}\" SET v = ?", Parameters=[{"S": "x"}])
+    assert ei.value.response["Error"]["Code"] == "ValidationException"
+
+
 def test_unsupported_transaction_phase_returns_validation(ddb):
     # ExecuteTransaction is stubbed until Phase 3.
     with pytest.raises(botocore.exceptions.ClientError) as ei:
