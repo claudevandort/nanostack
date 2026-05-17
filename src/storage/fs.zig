@@ -3302,6 +3302,12 @@ fn loadSingleTable(self: *Fs, name: []const u8) !void {
     const slot_ptr = try self.allocator.create(storage.TableSlot);
     slot_ptr.* = slot;
 
+    // Streams: spec persists, records do not. If the spec is enabled,
+    // attach a fresh (empty) ring buffer.
+    if (slot_ptr.stream_spec) |spec| if (spec.enabled) {
+        attachStream(self, slot_ptr) catch {};
+    };
+
     // Map key shares ownership with slot.name.
     try self.dynamo_tables.put(self.allocator, slot_ptr.name, slot_ptr);
 
@@ -3506,6 +3512,15 @@ pub fn ddbCreateTable(self: *Fs, in: storage.CreateTableInput) storage.Error!voi
     };
     slot_ptr.* = slot;
 
+    // If streams were enabled at create, allocate the in-memory ring.
+    if (slot_ptr.stream_spec) |spec| if (spec.enabled) {
+        attachStream(self, slot_ptr) catch {
+            slot_ptr.deinit(self.allocator);
+            self.allocator.destroy(slot_ptr);
+            return storage.Error.OutOfMemory;
+        };
+    };
+
     writeSchemaJson(self, slot_ptr) catch {
         slot_ptr.deinit(self.allocator);
         self.allocator.destroy(slot_ptr);
@@ -3517,6 +3532,25 @@ pub fn ddbCreateTable(self: *Fs, in: storage.CreateTableInput) storage.Error!voi
         // next startup will load it via loadDynamoTables. Surface OOM.
         return storage.Error.OutOfMemory;
     };
+}
+
+/// Allocate + attach a Stream to a slot. Caller must guarantee
+/// `slot.stream_spec.?.enabled and slot.stream_enabled_unix != null`.
+/// Tears down any prior stream on the same slot.
+fn attachStream(self: *Fs, slot: *storage.TableSlot) !void {
+    if (slot.stream) |old| {
+        old.deinit();
+        self.allocator.destroy(old);
+        slot.stream = null;
+    }
+    const enable_unix = slot.stream_enabled_unix orelse return;
+    const view_type = slot.stream_spec.?.view_type;
+    const shard_id = try storage.dynamo_streams.formatShardId(self.allocator, enable_unix);
+    defer self.allocator.free(shard_id);
+    const stream_ptr = try self.allocator.create(storage.Stream);
+    errdefer self.allocator.destroy(stream_ptr);
+    stream_ptr.* = try storage.Stream.init(self.allocator, view_type, shard_id);
+    slot.stream = stream_ptr;
 }
 
 fn cloneTableSlot(allocator: Allocator, in: storage.CreateTableInput, created_unix: i64) !storage.TableSlot {
@@ -3621,7 +3655,14 @@ pub fn ddbUpdateTable(self: *Fs, in: storage.UpdateTableInput) storage.Error!*co
         // observed AWS behaviour. Disable leaves the prior timestamp
         // in place — AWS keeps the label around until streams are
         // re-enabled.
-        if (sp.enabled) slot.stream_enabled_unix = nowUnixSeconds(self.io);
+        if (sp.enabled) {
+            slot.stream_enabled_unix = nowUnixSeconds(self.io);
+            attachStream(self, slot) catch return storage.Error.OutOfMemory;
+        } else if (slot.stream) |old| {
+            old.deinit();
+            self.allocator.destroy(old);
+            slot.stream = null;
+        }
     }
     writeSchemaJson(self, slot) catch return storage.Error.Io;
     return slot;
@@ -3676,61 +3717,7 @@ fn renderItem(s: *std.json.Stringify, allocator: Allocator, item: *const storage
 }
 
 fn cloneItem(allocator: Allocator, item: *const storage.Item) !storage.Item {
-    const names = try allocator.alloc([]const u8, item.names.len);
-    var names_done: usize = 0;
-    errdefer {
-        for (names[0..names_done]) |n| allocator.free(n);
-        allocator.free(names);
-    }
-    const values = try allocator.alloc(ddb_attr.AttributeValue, item.values.len);
-    var values_done: usize = 0;
-    errdefer {
-        for (values[0..values_done]) |*v| {
-            var copy = v.*;
-            ddb_attr.deinit(allocator, &copy);
-        }
-        allocator.free(values);
-    }
-    for (item.names, 0..) |n, i| {
-        names[i] = try allocator.dupe(u8, n);
-        names_done = i + 1;
-    }
-    for (item.values, 0..) |v, i| {
-        values[i] = try cloneAttributeValue(allocator, v);
-        values_done = i + 1;
-    }
-    return .{ .names = names, .values = values };
-}
-
-fn cloneAttributeValue(allocator: Allocator, v: ddb_attr.AttributeValue) !ddb_attr.AttributeValue {
-    return switch (v) {
-        .s => |s| .{ .s = try allocator.dupe(u8, s) },
-        .n => |s| .{ .n = try allocator.dupe(u8, s) },
-        .b => |bytes| .{ .b = try allocator.dupe(u8, bytes) },
-        .bool => |b| .{ .bool = b },
-        .null => .null,
-        .list => |items| blk: {
-            const out = try allocator.alloc(ddb_attr.AttributeValue, items.len);
-            for (items, 0..) |child, i| out[i] = try cloneAttributeValue(allocator, child);
-            break :blk .{ .list = out };
-        },
-        .map => |m| blk: {
-            const names = try allocator.alloc([]const u8, m.names.len);
-            for (m.names, 0..) |n, i| names[i] = try allocator.dupe(u8, n);
-            const values = try allocator.alloc(ddb_attr.AttributeValue, m.values.len);
-            for (m.values, 0..) |child, i| values[i] = try cloneAttributeValue(allocator, child);
-            break :blk .{ .map = .{ .names = names, .values = values } };
-        },
-        .ss => |elems| .{ .ss = try dupSlices(allocator, elems) },
-        .ns => |elems| .{ .ns = try dupSlices(allocator, elems) },
-        .bs => |elems| .{ .bs = try dupSlices(allocator, elems) },
-    };
-}
-
-fn dupSlices(allocator: Allocator, src: []const []const u8) ![]const []const u8 {
-    const out = try allocator.alloc([]const u8, src.len);
-    for (src, 0..) |s, i| out[i] = try allocator.dupe(u8, s);
-    return out;
+    return storage.dynamo_state.cloneItem(allocator, item);
 }
 
 pub fn ddbPutItem(self: *Fs, allocator: Allocator, in: storage.PutItemInput) storage.Error!storage.PutItemResult {
@@ -3751,10 +3738,12 @@ pub fn ddbPutItem(self: *Fs, allocator: Allocator, in: storage.PutItemInput) sto
     }
 
     var result: storage.PutItemResult = .{};
+    var had_existing = false;
 
     // If an item already exists at this key, surface it as old_item (using
     // the caller's allocator) and free the in-memory copy.
     if (slot.items.fetchRemove(key_str)) |existing| {
+        had_existing = true;
         result.old_item = cloneItem(allocator, existing.value) catch return storage.Error.OutOfMemory;
         self.allocator.free(existing.key);
         existing.value.deinit(self.allocator);
@@ -3775,7 +3764,29 @@ pub fn ddbPutItem(self: *Fs, allocator: Allocator, in: storage.PutItemInput) sto
     };
 
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
+
+    captureWrite(self, slot, if (had_existing) .modify else .insert, in.item, if (result.old_item) |*oi| oi else null, owned_ptr);
     return result;
+}
+
+/// Stream capture wrapper — no-op when the slot has no attached stream.
+/// `kind` is the AWS-flavoured INSERT / MODIFY / REMOVE; `key_src`
+/// supplies the keys (we project them down to the table's KeySchema);
+/// `old_item` / `new_item` are the pre-/post-images (either may be
+/// null for inserts / deletes respectively). The Stream itself decides
+/// what to keep based on view-type.
+fn captureWrite(
+    self: *Fs,
+    slot: *storage.TableSlot,
+    kind: storage.dynamo_streams.RecordKind,
+    key_src: *const storage.Item,
+    old_item: ?*const storage.Item,
+    new_item: ?*const storage.Item,
+) void {
+    const stream = slot.stream orelse return;
+    var keys = storage.dynamo_state.projectKeys(self.allocator, slot, key_src) catch return;
+    defer keys.deinit(self.allocator);
+    _ = stream.capture(kind, &keys, new_item, old_item, nowUnixSeconds(self.io)) catch {};
 }
 
 pub fn ddbGetItem(self: *Fs, allocator: Allocator, in: storage.GetItemInput) storage.Error!storage.GetItemResult {
@@ -3820,6 +3831,8 @@ pub fn ddbDeleteItem(self: *Fs, allocator: Allocator, in: storage.DeleteItemInpu
     self.allocator.free(removed.key);
     removed.value.deinit(self.allocator);
     self.allocator.destroy(removed.value);
+
+    captureWrite(self, slot, .remove, in.key, &old, null);
     return .{ .old_item = old };
 }
 
@@ -3878,6 +3891,9 @@ pub fn ddbUpdateItem(self: *Fs, allocator: Allocator, in: storage.UpdateItemInpu
         self.allocator.destroy(old.value);
     }
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
+
+    const kind: storage.dynamo_streams.RecordKind = if (existing_ptr == null) .insert else .modify;
+    captureWrite(self, slot, kind, in.key, if (result.old_item) |*oi| oi else null, owned_ptr);
     return result;
 }
 
@@ -4056,11 +4072,18 @@ fn applyPutLocked(self: *Fs, slot: *storage.TableSlot, item: *const storage.Item
         return storage.Error.OutOfMemory;
     errdefer self.allocator.free(key_str);
 
+    // Snapshot the existing item before mutation so capture can carry
+    // it as old_image on a MODIFY.
+    var had_existing = false;
+    var old_snapshot: storage.Item = undefined;
     if (slot.items.fetchRemove(key_str)) |existing| {
+        had_existing = true;
+        old_snapshot = cloneItem(self.allocator, existing.value) catch return storage.Error.OutOfMemory;
         self.allocator.free(existing.key);
         existing.value.deinit(self.allocator);
         self.allocator.destroy(existing.value);
     }
+    defer if (had_existing) old_snapshot.deinit(self.allocator);
 
     const owned = cloneItem(self.allocator, item) catch return storage.Error.OutOfMemory;
     const owned_ptr = self.allocator.create(storage.Item) catch return storage.Error.OutOfMemory;
@@ -4070,6 +4093,8 @@ fn applyPutLocked(self: *Fs, slot: *storage.TableSlot, item: *const storage.Item
     writeItemJson(self, slot.name, &key_hash, owned_ptr) catch return storage.Error.Io;
 
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
+
+    captureWrite(self, slot, if (had_existing) .modify else .insert, item, if (had_existing) &old_snapshot else null, owned_ptr);
 }
 
 fn applyDeleteLocked(self: *Fs, slot: *storage.TableSlot, key_item: *const storage.Item) storage.Error!void {
@@ -4085,9 +4110,16 @@ fn applyDeleteLocked(self: *Fs, slot: *storage.TableSlot, key_item: *const stora
         error.FileNotFound => {},
         else => return storage.Error.Io,
     };
+
+    // Snapshot the removed item so capture can carry it as old_image.
+    var old_snapshot = cloneItem(self.allocator, removed.value) catch return storage.Error.OutOfMemory;
+    defer old_snapshot.deinit(self.allocator);
+
     self.allocator.free(removed.key);
     removed.value.deinit(self.allocator);
     self.allocator.destroy(removed.value);
+
+    captureWrite(self, slot, .remove, key_item, &old_snapshot, null);
 }
 
 fn applyUpdateLocked(
@@ -4108,6 +4140,15 @@ fn applyUpdateLocked(
     else
         cloneItem(allocator, key_item) catch return storage.Error.OutOfMemory;
 
+    // Snapshot the pre-image for capture.
+    var had_existing = false;
+    var old_snapshot: storage.Item = undefined;
+    if (existing_ptr) |ep| {
+        had_existing = true;
+        old_snapshot = cloneItem(self.allocator, ep) catch return storage.Error.OutOfMemory;
+    }
+    defer if (had_existing) old_snapshot.deinit(self.allocator);
+
     if (!apply_fn(apply_ctx, &working)) return storage.Error.TransactionCanceled;
 
     const owned = cloneItem(self.allocator, &working) catch return storage.Error.OutOfMemory;
@@ -4123,6 +4164,8 @@ fn applyUpdateLocked(
         self.allocator.destroy(old.value);
     }
     slot.items.put(self.allocator, key_str, owned_ptr) catch return storage.Error.OutOfMemory;
+
+    captureWrite(self, slot, if (had_existing) .modify else .insert, key_item, if (had_existing) &old_snapshot else null, owned_ptr);
 }
 
 // ---------------------------------------------------------------------------

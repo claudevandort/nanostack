@@ -20,6 +20,7 @@ pub const policy_parser = @import("wire/policy_parser.zig");
 pub const policy_doc = @import("wire/policy_doc.zig");
 pub const ddb_attribute_value = @import("wire/dynamodb/attribute_value.zig");
 pub const dynamo_state = @import("storage/dynamo_state.zig");
+pub const dynamo_streams = @import("storage/dynamo_streams.zig");
 pub const ddb_errors = @import("wire/dynamodb/errors.zig");
 pub const ddb_tables_wire = @import("wire/dynamodb/tables.zig");
 pub const ddb_items_wire = @import("wire/dynamodb/items.zig");
@@ -114,6 +115,7 @@ test {
     _ = policy_doc;
     _ = ddb_attribute_value;
     _ = dynamo_state;
+    _ = dynamo_streams;
     _ = ddb_errors;
     _ = ddb_tables_wire;
     _ = ddb_items_wire;

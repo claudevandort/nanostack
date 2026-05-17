@@ -7,7 +7,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const attribute_value = @import("../wire/dynamodb/attribute_value.zig");
+const dynamo_streams = @import("dynamo_streams.zig");
 pub const AttributeValue = attribute_value.AttributeValue;
+pub const Stream = dynamo_streams.Stream;
 
 pub const KeyType = enum {
     hash,
@@ -185,6 +187,66 @@ pub const Item = struct {
     }
 };
 
+/// Deep-clone an `Item` into the given allocator. Companion to
+/// `Item.deinit` — every allocation here must have a matching free
+/// there.
+pub fn cloneItem(allocator: Allocator, src: *const Item) !Item {
+    const names = try allocator.alloc([]const u8, src.names.len);
+    var names_done: usize = 0;
+    errdefer {
+        for (names[0..names_done]) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    for (src.names, 0..) |n, i| {
+        names[i] = try allocator.dupe(u8, n);
+        names_done = i + 1;
+    }
+
+    const values = try allocator.alloc(AttributeValue, src.values.len);
+    var values_done: usize = 0;
+    errdefer {
+        for (values[0..values_done]) |*v| {
+            var copy = v.*;
+            attribute_value.deinit(allocator, &copy);
+        }
+        allocator.free(values);
+    }
+    for (src.values, 0..) |v, i| {
+        values[i] = try attribute_value.cloneValue(allocator, v);
+        values_done = i + 1;
+    }
+    return .{ .names = names, .values = values };
+}
+
+/// Project an Item down to only its key attributes (as defined by the
+/// table's KeySchema). The returned Item owns its slices via the given
+/// allocator; freeing is via `Item.deinit`.
+pub fn projectKeys(allocator: Allocator, slot: *const TableSlot, src: *const Item) !Item {
+    const names = try allocator.alloc([]const u8, slot.key_schema.len);
+    var names_done: usize = 0;
+    errdefer {
+        for (names[0..names_done]) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    const values = try allocator.alloc(AttributeValue, slot.key_schema.len);
+    var values_done: usize = 0;
+    errdefer {
+        for (values[0..values_done]) |*v| {
+            var copy = v.*;
+            attribute_value.deinit(allocator, &copy);
+        }
+        allocator.free(values);
+    }
+    for (slot.key_schema, 0..) |k, i| {
+        const src_v = src.attributeValue(k.name) orelse return error.MissingKey;
+        names[i] = try allocator.dupe(u8, k.name);
+        names_done = i + 1;
+        values[i] = try attribute_value.cloneValue(allocator, src_v.*);
+        values_done = i + 1;
+    }
+    return .{ .names = names, .values = values };
+}
+
 /// One DynamoDB table's persisted state. Strings + slices live in the
 /// `Fs.allocator` long-lived arena and are freed via `deinit`.
 pub const TableSlot = struct {
@@ -202,6 +264,10 @@ pub const TableSlot = struct {
     /// when `stream_spec != null and stream_spec.enabled`.
     stream_spec: ?StreamSpecification = null,
     stream_enabled_unix: ?i64 = null,
+    /// In-memory streams ring buffer. Allocated when streams are first
+    /// enabled; freed when disabled or the table is deleted. Records
+    /// are lost on restart (Phase 2 design — see dynamo_streams.zig).
+    stream: ?*Stream = null,
     created_unix: i64,
     /// In-memory item store, keyed on a stable composite "<pk>|<sk?>"
     /// string. Populated by ddbPutItem on every write and rebuilt on
@@ -223,6 +289,10 @@ pub const TableSlot = struct {
             allocator.free(t.value);
         }
         allocator.free(self.tags);
+        if (self.stream) |stream| {
+            stream.deinit();
+            allocator.destroy(stream);
+        }
         var it = self.items.iterator();
         while (it.next()) |entry| {
             allocator.free(entry.key_ptr.*);

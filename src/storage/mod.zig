@@ -1245,8 +1245,10 @@ pub const Backend = struct {
 // readable. `Fs` implements both — one struct, two backend views.
 
 pub const dynamo_state = @import("dynamo_state.zig");
+pub const dynamo_streams = @import("dynamo_streams.zig");
 pub const TableSlot = dynamo_state.TableSlot;
 pub const Item = dynamo_state.Item;
+pub const Stream = dynamo_streams.Stream;
 
 /// Inputs for CreateTable. All slices are borrowed from the request
 /// arena; the backend is responsible for copying anything it persists.
