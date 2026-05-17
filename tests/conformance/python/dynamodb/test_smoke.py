@@ -57,14 +57,23 @@ def test_list_tables_emits_aws_request_id_header(ddb):
 
 
 def test_unsupported_target_returns_validation_exception(ddb):
-    """Targets not yet implemented (e.g. PartiQL's ExecuteStatement, deferred
-    to v0.3) → 400 ValidationException with the target name in the message."""
+    """Targets still on the deferred list (Imports/Exports as of v0.2.4) →
+    400 ValidationException with the target name in the message."""
     with pytest.raises(botocore.exceptions.ClientError) as ei:
-        ddb.execute_statement(Statement="SELECT * FROM t")
+        ddb.import_table(
+            S3BucketSource={"S3Bucket": "anywhere"},
+            InputFormat="DYNAMODB_JSON",
+            TableCreationParameters={
+                "TableName": "anything",
+                "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+                "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            },
+        )
     err = ei.value.response["Error"]
     assert err["Code"] == "ValidationException"
     assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
-    assert "ExecuteStatement" in err.get("Message", ""), \
+    assert "ImportTable" in err.get("Message", ""), \
         f"expected target name in message, got {err.get('Message')!r}"
 
 
