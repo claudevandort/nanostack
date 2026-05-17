@@ -16,6 +16,65 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-17
+
+**First minor release: DynamoDB joins S3.**
+
+Per the [versioning scheme](#versioning-scheme), minor releases mark "one AWS service fully implemented against the real-AWS surface." nanostack now covers two services on the same port: S3 (since v0.1.x) and DynamoDB. The architecture proven on S3 generalises — service detection via `X-Amz-Target` header, parallel storage backend vtable, JSON wire layer alongside the existing XML.
+
+Opt-in via `--services s3,dynamodb`. S3 stays default-on; DynamoDB is silent unless explicitly enabled.
+
+### Added — DynamoDB v1 surface (18 ops)
+
+**Table management** (M15-tables):
+- `CreateTable` — full KeySchema, AttributeDefinitions, GSI/LSI definitions, BillingMode, Tags.
+- `DescribeTable` — returns ACTIVE status, item count, GSI/LSI summaries.
+- `ListTables` — paginated; `Limit` + `ExclusiveStartTableName`; lex-ascending.
+- `DeleteTable` — immediate; returns TableDescription.
+- `UpdateTable` — BillingMode mutation; online GSI add/remove deferred.
+
+**Item CRUD** (M15-items, M15-expressions):
+- `GetItem` — full AttributeValue type coverage (S/N/B/BOOL/NULL/L/M/SS/NS/BS); N preserves 38-digit decimal precision.
+- `PutItem` — auto-overwrite; ReturnValues NONE/ALL_OLD; **ConditionExpression** supported.
+- `DeleteItem` — idempotent; ReturnValues NONE/ALL_OLD; ConditionExpression supported.
+- `UpdateItem` — UpdateExpression (SET / REMOVE / ADD / DELETE) with `if_not_exists`, `list_append`, atomic counters; full ReturnValues (NONE / ALL_OLD / ALL_NEW / UPDATED_OLD / UPDATED_NEW); ConditionExpression.
+
+**Expressions** (M15-expressions):
+- `ConditionExpression` — comparison (=, <>, <, <=, >, >=), logical (AND/OR/NOT), `BETWEEN`, `IN`, `attribute_exists`, `attribute_not_exists`, `attribute_type`, `begins_with`, `contains`, parentheses.
+- `UpdateExpression` — SET (incl. arithmetic, `if_not_exists`, `list_append`), REMOVE, ADD (numeric + set union), DELETE (set subtraction).
+- Recursive-descent parsers, no allocations on the happy path. `ExpressionAttributeNames` (`#x`) + `ExpressionAttributeValues` (`:v`) placeholders.
+
+**Query + Scan** (M15-query, M15-scan, M15-gsi):
+- `Query` on base table — `KeyConditionExpression` (PK + optional SK predicate including `BETWEEN`, `begins_with`); `FilterExpression`; `Limit`; `ScanIndexForward`; `ExclusiveStartKey`/`LastEvaluatedKey` cursor.
+- `Query` on **GSI / LSI** via `IndexName` — projection types `ALL` / `KEYS_ONLY` / `INCLUDE` respected; FilterExpression after projection.
+- `Scan` — full table iteration with FilterExpression; pagination via cursor. `TotalSegments > 1` returns ValidationException.
+
+**Batch + Transactions** (M15-batch, M15-tx):
+- `BatchGetItem` — up to 100 keys across N tables.
+- `BatchWriteItem` — up to 25 Put + Delete ops across N tables.
+- `TransactGetItems` — atomic snapshot read of up to 100 items.
+- `TransactWriteItems` — all-or-nothing across up to 100 Put/Update/Delete/ConditionCheck ops; per-op `CancellationReasons` on failure; two-pass validate-then-apply under the Fs mutex.
+
+**Misc** (M15-polish):
+- `DescribeLimits` — returns synthetic AWS account-level defaults.
+- `TagResource` / `UntagResource` / `ListTagsOfResource` — metadata-only.
+
+### Changed
+- `--services` flag (was a placeholder string) now parsed into an enabled-services set. Default `"s3"` preserves v0.1.x behaviour.
+- `server.zig` branches on `X-Amz-Target` header presence to dispatch DynamoDB requests through a separate handler. SigV4 service-scope validation catches mismatched credential scopes.
+- New `storage.DynamoBackend` vtable sibling of `storage.Backend`. `Fs` implements both — one struct, two backend views.
+- New `storage.Error` variants: `TableAlreadyExists`, `TableNotFound`, `ConditionalCheckFailed`, `TransactionCanceled`.
+
+### Divergences (intentional, won't change in v0.2.0)
+- **No persistence of items across nanostack restart for full-write-through**: schema.json persists; per-item JSON files persist on every mutation. Cold-start item rebuild is a v0.3 task.
+- **Parallel scan (`TotalSegments > 1`)** → ValidationException. Single-segment scans work normally.
+- **Index queries are O(N)** — every IndexName query walks the base table. A per-index sorted structure is a v0.3 optimisation.
+- **Tags** are metadata-only and lost on restart.
+- **DynamoDB Streams**, **PartiQL**, **TTL background sweeper**, **Backups/PITR**, **Global Tables**, **Imports/Exports**, **DAX**: out of v0.2.0 scope. Targets return ValidationException with the unsupported-target message.
+
+### Strategic note
+v0.2.0 is the inflection point at which nanostack genuinely replaces LocalStack for the "S3 + DynamoDB local dev" workflow. With real bucket-policy enforcement (from v0.1.2) on S3 and atomic transactions + queryable GSIs on DynamoDB, both services are honestly useful — not stubs.
+
 ## [0.1.3] — 2026-05-16
 
 **Patch release: Wave 3 drift fixes — `SUPPORT.md` "Known drift" table is now empty.**

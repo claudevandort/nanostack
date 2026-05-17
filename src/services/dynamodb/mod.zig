@@ -18,6 +18,7 @@ const query_handler = @import("query.zig");
 const scan_handler = @import("scan.zig");
 const batch_handler = @import("batch.zig");
 const tx_handler = @import("transactions.zig");
+const misc_handler = @import("misc.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -95,6 +96,12 @@ pub fn handle(ctx: Context) Result {
     // Transactions (M15-tx, Phase 9).
     if (std.mem.eql(u8, target, "TransactGetItems")) return tx_handler.transactGetItems(ctx);
     if (std.mem.eql(u8, target, "TransactWriteItems")) return tx_handler.transactWriteItems(ctx);
+
+    // Misc + metadata (M15-polish, Phase 10).
+    if (std.mem.eql(u8, target, "DescribeLimits")) return misc_handler.describeLimits(ctx);
+    if (std.mem.eql(u8, target, "TagResource")) return misc_handler.tagResource(ctx);
+    if (std.mem.eql(u8, target, "UntagResource")) return misc_handler.untagResource(ctx);
+    if (std.mem.eql(u8, target, "ListTagsOfResource")) return misc_handler.listTagsOfResource(ctx);
 
     // Anything else gets 400 ValidationException with a message that
     // names the unsupported target. AWS-correct: unknown targets return
