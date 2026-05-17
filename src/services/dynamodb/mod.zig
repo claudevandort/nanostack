@@ -118,6 +118,10 @@ fn handleCore(ctx: Context) Result {
     if (std.mem.eql(u8, target, "UntagResource")) return misc_handler.untagResource(ctx);
     if (std.mem.eql(u8, target, "ListTagsOfResource")) return misc_handler.listTagsOfResource(ctx);
 
+    // TTL (v0.2.3) — UpdateTimeToLive / DescribeTimeToLive.
+    if (std.mem.eql(u8, target, "UpdateTimeToLive")) return tables.updateTimeToLive(ctx);
+    if (std.mem.eql(u8, target, "DescribeTimeToLive")) return tables.describeTimeToLive(ctx);
+
     // Kinesis-streaming-destination ops are on the core DDB service
     // (not the Streams sub-service). We explicitly reject them so they
     // don't fall through to "Unsupported operation" — Kinesis isn't
@@ -186,7 +190,15 @@ const StubBackend = struct {
             .describeStream = stubDescribeStream,
             .getShardIterator = stubGetShardIterator,
             .getRecords = stubGetRecords,
+            .updateTimeToLive = stubUpdateTimeToLive,
+            .describeTimeToLive = stubDescribeTimeToLive,
         } };
+    }
+    fn stubUpdateTimeToLive(_: *anyopaque, _: storage.UpdateTimeToLiveInput) storage.Error!storage.dynamo_state.TimeToLiveSpec {
+        unreachable;
+    }
+    fn stubDescribeTimeToLive(_: *anyopaque, _: []const u8) storage.Error!?storage.dynamo_state.TimeToLiveSpec {
+        unreachable;
     }
     fn stubListStreams(_: *anyopaque, _: Allocator, _: storage.ListStreamsInput) storage.Error!storage.ListStreamsOutput {
         unreachable;

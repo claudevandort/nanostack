@@ -1277,6 +1277,16 @@ pub const UpdateTableInput = struct {
     stream_spec: ?dynamo_state.StreamSpecification = null,
 };
 
+/// UpdateTimeToLive request (v0.2.3). When `enabled` is true the
+/// background sweeper begins evicting items whose `attribute_name`
+/// holds a Number ≤ wall-clock unix seconds. Disable leaves the
+/// attribute name persisted (matches AWS).
+pub const UpdateTimeToLiveInput = struct {
+    name: []const u8,
+    enabled: bool,
+    attribute_name: []const u8,
+};
+
 /// A pre-evaluated condition predicate. Storage holds the mutex and
 /// calls `evaluate` against the existing item. Returns true if the
 /// condition passes; false → the storage op fails with
@@ -1549,6 +1559,9 @@ pub const DynamoBackend = struct {
         describeStream: *const fn (ctx: *anyopaque, allocator: Allocator, in: DescribeStreamInput) Error!DescribeStreamOutput,
         getShardIterator: *const fn (ctx: *anyopaque, allocator: Allocator, in: GetShardIteratorInput) Error![]const u8,
         getRecords: *const fn (ctx: *anyopaque, allocator: Allocator, in: GetRecordsInput) Error!GetRecordsOutput,
+        // v0.2.3 TTL.
+        updateTimeToLive: *const fn (ctx: *anyopaque, in: UpdateTimeToLiveInput) Error!dynamo_state.TimeToLiveSpec,
+        describeTimeToLive: *const fn (ctx: *anyopaque, name: []const u8) Error!?dynamo_state.TimeToLiveSpec,
     };
 
     pub fn listTables(self: DynamoBackend, allocator: Allocator) Error![]const []const u8 {
@@ -1603,6 +1616,12 @@ pub const DynamoBackend = struct {
     }
     pub fn getRecords(self: DynamoBackend, allocator: Allocator, in: GetRecordsInput) Error!GetRecordsOutput {
         return self.vtable.getRecords(self.ctx, allocator, in);
+    }
+    pub fn updateTimeToLive(self: DynamoBackend, in: UpdateTimeToLiveInput) Error!dynamo_state.TimeToLiveSpec {
+        return self.vtable.updateTimeToLive(self.ctx, in);
+    }
+    pub fn describeTimeToLive(self: DynamoBackend, name: []const u8) Error!?dynamo_state.TimeToLiveSpec {
+        return self.vtable.describeTimeToLive(self.ctx, name);
     }
 };
 

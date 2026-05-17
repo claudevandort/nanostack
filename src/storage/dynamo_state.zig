@@ -127,6 +127,37 @@ pub const StreamSpecification = struct {
     view_type: StreamViewType,
 };
 
+/// DynamoDB TTL status. AWS shows ENABLING / DISABLING transient states
+/// for ~1h while the change propagates; nanostack snaps directly to the
+/// terminal state (documented divergence).
+pub const TimeToLiveStatus = enum {
+    enabling,
+    enabled,
+    disabling,
+    disabled,
+
+    pub fn toAws(self: TimeToLiveStatus) []const u8 {
+        return switch (self) {
+            .enabling => "ENABLING",
+            .enabled => "ENABLED",
+            .disabling => "DISABLING",
+            .disabled => "DISABLED",
+        };
+    }
+};
+
+/// Persisted TTL config on a table. When `status == .enabled`, the
+/// background sweeper evicts items whose `attribute_name` is a Number
+/// attribute ≤ wall-clock unix seconds. Wrong-type or missing
+/// attributes are ignored per AWS semantics.
+pub const TimeToLiveSpec = struct {
+    status: TimeToLiveStatus,
+    /// Owned by the parent `TableSlot`'s allocator. Non-empty when
+    /// `status ∈ {.enabling, .enabled}`; empty string allowed when
+    /// disabled (matches the spec being cleared on disable).
+    attribute_name: []const u8,
+};
+
 /// One entry in a `KeySchema` list. AWS keys are exactly 1 HASH or
 /// (1 HASH + 1 RANGE); the validator enforces that on Put.
 pub const KeyAttribute = struct {
@@ -268,6 +299,9 @@ pub const TableSlot = struct {
     /// enabled; freed when disabled or the table is deleted. Records
     /// are lost on restart (Phase 2 design — see dynamo_streams.zig).
     stream: ?*Stream = null,
+    /// TTL config (v0.2.3). Null when never configured. The background
+    /// sweeper in fs.zig consults this on each tick.
+    ttl_spec: ?TimeToLiveSpec = null,
     created_unix: i64,
     /// In-memory item store, keyed on a stable composite "<pk>|<sk?>"
     /// string. Populated by ddbPutItem on every write and rebuilt on
@@ -292,6 +326,9 @@ pub const TableSlot = struct {
         if (self.stream) |stream| {
             stream.deinit();
             allocator.destroy(stream);
+        }
+        if (self.ttl_spec) |spec| {
+            allocator.free(spec.attribute_name);
         }
         var it = self.items.iterator();
         while (it.next()) |entry| {
@@ -444,6 +481,13 @@ test "KeyType.fromAws / toAws round-trip" {
     try testing.expectEqual(KeyType.hash, KeyType.fromAws("HASH").?);
     try testing.expectEqual(KeyType.range, KeyType.fromAws("RANGE").?);
     try testing.expectEqual(@as(?KeyType, null), KeyType.fromAws("hash")); // case-sensitive
+}
+
+test "TimeToLiveStatus.toAws" {
+    try testing.expectEqualStrings("ENABLED", TimeToLiveStatus.enabled.toAws());
+    try testing.expectEqualStrings("DISABLED", TimeToLiveStatus.disabled.toAws());
+    try testing.expectEqualStrings("ENABLING", TimeToLiveStatus.enabling.toAws());
+    try testing.expectEqualStrings("DISABLING", TimeToLiveStatus.disabling.toAws());
 }
 
 test "StreamViewType.fromAws / toAws round-trip" {

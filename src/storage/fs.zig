@@ -802,6 +802,8 @@ const dynamo_vtable: storage.DynamoBackend.VTable = .{
     .describeStream = vtDdbDescribeStream,
     .getShardIterator = vtDdbGetShardIterator,
     .getRecords = vtDdbGetRecords,
+    .updateTimeToLive = vtDdbUpdateTimeToLive,
+    .describeTimeToLive = vtDdbDescribeTimeToLive,
 };
 
 fn vtDdbListTables(ctx: *anyopaque, allocator: Allocator) storage.Error![]const []const u8 {
@@ -851,6 +853,12 @@ fn vtDdbGetShardIterator(ctx: *anyopaque, allocator: Allocator, in: storage.GetS
 }
 fn vtDdbGetRecords(ctx: *anyopaque, allocator: Allocator, in: storage.GetRecordsInput) storage.Error!storage.GetRecordsOutput {
     return ddbGetRecords(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtDdbUpdateTimeToLive(ctx: *anyopaque, in: storage.UpdateTimeToLiveInput) storage.Error!storage.dynamo_state.TimeToLiveSpec {
+    return ddbUpdateTimeToLive(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtDdbDescribeTimeToLive(ctx: *anyopaque, name: []const u8) storage.Error!?storage.dynamo_state.TimeToLiveSpec {
+    return ddbDescribeTimeToLive(@ptrCast(@alignCast(ctx)), name);
 }
 
 // ---------------------------------------------------------------------------
@@ -3182,6 +3190,12 @@ const SchemaDoc = struct {
     stream_enabled: ?bool = null,
     stream_view_type: ?[]const u8 = null,
     stream_enabled_unix: ?i64 = null,
+    /// TTL config (v0.2.3). `ttl_status` ∈ {"ENABLED", "DISABLED"};
+    /// we never persist the transient ENABLING / DISABLING states
+    /// because we snap directly to the terminal state. Null when never
+    /// configured.
+    ttl_status: ?[]const u8 = null,
+    ttl_attribute_name: ?[]const u8 = null,
 };
 const KeyAttrDoc = struct { name: []const u8, key_type: []const u8 };
 const AttributeDefDoc = struct { name: []const u8, type: []const u8 };
@@ -3255,6 +3269,8 @@ fn slotToDoc(allocator: Allocator, slot: *const storage.TableSlot) !SchemaDoc {
         .stream_enabled = if (slot.stream_spec) |sp| sp.enabled else null,
         .stream_view_type = if (slot.stream_spec) |sp| sp.view_type.toAws() else null,
         .stream_enabled_unix = slot.stream_enabled_unix,
+        .ttl_status = if (slot.ttl_spec) |sp| sp.status.toAws() else null,
+        .ttl_attribute_name = if (slot.ttl_spec) |sp| sp.attribute_name else null,
     };
 }
 
@@ -3452,6 +3468,19 @@ fn docToSlot(allocator: Allocator, doc: SchemaDoc) !storage.TableSlot {
             .new_and_old_images,
     } else null;
 
+    const ttl_spec: ?ddb.dynamo_state.TimeToLiveSpec = blk: {
+        const status_str = doc.ttl_status orelse break :blk null;
+        const status: ddb.dynamo_state.TimeToLiveStatus = if (std.mem.eql(u8, status_str, "ENABLED"))
+            .enabled
+        else
+            .disabled;
+        const attr_src = doc.ttl_attribute_name orelse "";
+        break :blk .{
+            .status = status,
+            .attribute_name = try allocator.dupe(u8, attr_src),
+        };
+    };
+
     return .{
         .name = name,
         .key_schema = ks,
@@ -3462,6 +3491,7 @@ fn docToSlot(allocator: Allocator, doc: SchemaDoc) !storage.TableSlot {
         .tags = tags,
         .stream_spec = stream_spec,
         .stream_enabled_unix = doc.stream_enabled_unix,
+        .ttl_spec = ttl_spec,
         .created_unix = doc.created_unix,
     };
 }
@@ -4490,6 +4520,42 @@ fn decodeIterator(allocator: Allocator, token: []const u8) !IteratorBlob {
         else => return error.InvalidShardIterator,
     };
     return .{ .arn = arn_owned, .shard_id = shard_owned, .position = pos };
+}
+
+// ---------------------------------------------------------------------------
+// DynamoDB TTL (v0.2.3)
+
+pub fn ddbUpdateTimeToLive(self: *Fs, in: storage.UpdateTimeToLiveInput) storage.Error!storage.dynamo_state.TimeToLiveSpec {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.dynamo_tables.get(in.name) orelse return storage.Error.TableNotFound;
+
+    // Free the old attribute_name if any. AWS allows changing the
+    // attribute name on a re-enable; we accept any spec the user
+    // sends and overwrite. Simpler than modelling the transient
+    // DISABLING→ENABLING handoff AWS uses.
+    if (slot.ttl_spec) |existing| self.allocator.free(existing.attribute_name);
+    const attr_owned = self.allocator.dupe(u8, in.attribute_name) catch return storage.Error.OutOfMemory;
+    const new_spec: storage.dynamo_state.TimeToLiveSpec = .{
+        .status = if (in.enabled) .enabled else .disabled,
+        .attribute_name = attr_owned,
+    };
+    slot.ttl_spec = new_spec;
+
+    writeSchemaJson(self, slot) catch {
+        self.allocator.free(attr_owned);
+        slot.ttl_spec = null;
+        return storage.Error.Io;
+    };
+    return new_spec;
+}
+
+pub fn ddbDescribeTimeToLive(self: *Fs, name: []const u8) storage.Error!?storage.dynamo_state.TimeToLiveSpec {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const slot = self.dynamo_tables.get(name) orelse return storage.Error.TableNotFound;
+    return slot.ttl_spec;
 }
 
 // ---------------------------------------------------------------------------

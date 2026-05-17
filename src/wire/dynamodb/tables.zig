@@ -273,6 +273,108 @@ pub fn parseUpdateTable(allocator: Allocator, body: []const u8) ParseError!Updat
 }
 
 // ---------------------------------------------------------------------------
+// UpdateTimeToLive + DescribeTimeToLive (v0.2.3)
+
+pub const UpdateTimeToLiveRequest = struct {
+    name: []const u8,
+    enabled: bool,
+    /// Required when `enabled == true`. Owned by the caller's arena.
+    attribute_name: []const u8,
+};
+
+pub fn parseUpdateTimeToLive(allocator: Allocator, body: []const u8) ParseError!UpdateTimeToLiveRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const root = parsed.value.object;
+
+    const name_v = root.get("TableName") orelse return ParseError.Malformed;
+    if (name_v != .string) return ParseError.Malformed;
+    const name = try allocator.dupe(u8, name_v.string);
+
+    const spec_v = root.get("TimeToLiveSpecification") orelse return ParseError.Malformed;
+    if (spec_v != .object) return ParseError.Malformed;
+    const enabled_v = spec_v.object.get("Enabled") orelse return ParseError.Malformed;
+    if (enabled_v != .bool) return ParseError.Malformed;
+    const attr_v = spec_v.object.get("AttributeName") orelse return ParseError.Malformed;
+    if (attr_v != .string) return ParseError.Malformed;
+    // AWS requires AttributeName non-empty in both enable + disable
+    // requests. Match that strictly so misconfigured callers see a
+    // ValidationException right away.
+    if (attr_v.string.len == 0) return ParseError.Malformed;
+    return .{
+        .name = name,
+        .enabled = enabled_v.bool,
+        .attribute_name = try allocator.dupe(u8, attr_v.string),
+    };
+}
+
+pub const DescribeTimeToLiveRequest = struct {
+    name: []const u8,
+};
+
+pub fn parseDescribeTimeToLive(allocator: Allocator, body: []const u8) ParseError!DescribeTimeToLiveRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const root = parsed.value.object;
+    const name_v = root.get("TableName") orelse return ParseError.Malformed;
+    if (name_v != .string) return ParseError.Malformed;
+    return .{ .name = try allocator.dupe(u8, name_v.string) };
+}
+
+/// Render `{TimeToLiveDescription: {TimeToLiveStatus, AttributeName?}}`.
+/// Used by `DescribeTimeToLive`.
+pub fn renderTimeToLiveDescription(allocator: Allocator, spec: ?dynamo_state.TimeToLiveSpec) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("TimeToLiveDescription");
+    try s.beginObject();
+    if (spec) |sp| {
+        try s.objectField("TimeToLiveStatus");
+        try s.write(sp.status.toAws());
+        // AWS only emits AttributeName when it's non-empty.
+        if (sp.attribute_name.len > 0) {
+            try s.objectField("AttributeName");
+            try s.write(sp.attribute_name);
+        }
+    } else {
+        // Never configured → AWS returns DISABLED with no AttributeName.
+        try s.objectField("TimeToLiveStatus");
+        try s.write("DISABLED");
+    }
+    try s.endObject();
+    try s.endObject();
+    return aw.toOwnedSlice();
+}
+
+/// Render `{TimeToLiveSpecification: {Enabled, AttributeName}}`. Used
+/// by `UpdateTimeToLive` — AWS deliberately uses a different wrapper
+/// shape than Describe, with `Enabled: bool` instead of
+/// `TimeToLiveStatus: string`.
+pub fn renderUpdateTimeToLive(allocator: Allocator, spec: dynamo_state.TimeToLiveSpec) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("TimeToLiveSpecification");
+    try s.beginObject();
+    try s.objectField("Enabled");
+    try s.write(spec.status == .enabled);
+    try s.objectField("AttributeName");
+    try s.write(spec.attribute_name);
+    try s.endObject();
+    try s.endObject();
+    return aw.toOwnedSlice();
+}
+
+// ---------------------------------------------------------------------------
 // ListTables request (paginated)
 
 pub const ListTablesRequest = struct {
@@ -645,6 +747,61 @@ test "formatStreamLabel: well-known epoch" {
     // Add a non-midnight check too.
     const got2 = try formatStreamLabel(1705276800 + 12 * 3600 + 34 * 60 + 56, &buf);
     try testing.expectEqualStrings("2024-01-15T12:34:56.000", got2);
+}
+
+test "parseUpdateTimeToLive: enable" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const req = try parseUpdateTimeToLive(arena.allocator(),
+        \\{"TableName":"tbl","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expires_at"}}
+    );
+    try testing.expectEqualStrings("tbl", req.name);
+    try testing.expect(req.enabled);
+    try testing.expectEqualStrings("expires_at", req.attribute_name);
+}
+
+test "parseUpdateTimeToLive: disable" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const req = try parseUpdateTimeToLive(arena.allocator(),
+        \\{"TableName":"tbl","TimeToLiveSpecification":{"Enabled":false,"AttributeName":"ttl"}}
+    );
+    try testing.expect(!req.enabled);
+    try testing.expectEqualStrings("ttl", req.attribute_name);
+}
+
+test "parseUpdateTimeToLive: empty attribute name → Malformed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(ParseError.Malformed, parseUpdateTimeToLive(arena.allocator(),
+        \\{"TableName":"tbl","TimeToLiveSpecification":{"Enabled":true,"AttributeName":""}}
+    ));
+}
+
+test "parseUpdateTimeToLive: missing TimeToLiveSpecification → Malformed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(ParseError.Malformed, parseUpdateTimeToLive(arena.allocator(),
+        \\{"TableName":"tbl"}
+    ));
+}
+
+test "renderTimeToLiveDescription: enabled" {
+    const got = try renderTimeToLiveDescription(testing.allocator, .{ .status = .enabled, .attribute_name = "expires_at" });
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(
+        "{\"TimeToLiveDescription\":{\"TimeToLiveStatus\":\"ENABLED\",\"AttributeName\":\"expires_at\"}}",
+        got,
+    );
+}
+
+test "renderTimeToLiveDescription: never-configured → DISABLED, no AttributeName" {
+    const got = try renderTimeToLiveDescription(testing.allocator, null);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(
+        "{\"TimeToLiveDescription\":{\"TimeToLiveStatus\":\"DISABLED\"}}",
+        got,
+    );
 }
 
 test "renderListTables: empty + populated + with-cursor shapes" {
