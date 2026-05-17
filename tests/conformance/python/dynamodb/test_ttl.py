@@ -162,6 +162,118 @@ def _spawn_nanostack(bin_path: str, data_dir: str, port: int, *extra: str) -> su
     raise AssertionError(f"nanostack did not bind :{port} within 5s")
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: background sweeper eviction
+#
+# All sweeper tests spawn a dedicated nanostack with --ttl-sweep-interval-seconds=1
+# so the assertion only needs to sleep ~1.5s for the sweep to fire.
+
+
+def _ttl_table(ddb, attr: str = "exp") -> str:
+    name = _unique_table("sweep")
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.update_time_to_live(
+        TableName=name,
+        TimeToLiveSpecification={"Enabled": True, "AttributeName": attr},
+    )
+    return name
+
+
+@pytest.fixture
+def sweep_nanostack():
+    """Spawn a dedicated nanostack with --ttl-sweep-interval-seconds 1
+    so eviction tests don't need to wait the default 5s tick."""
+    bin_path = os.environ.get("NANOSTACK_BIN")
+    if not bin_path:
+        pytest.skip("NANOSTACK_BIN not set; skipping sweeper conformance tests")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    data_dir = tempfile.mkdtemp(prefix="ns-ttl-sweep-")
+    ep = f"http://127.0.0.1:{port}"
+    proc = _spawn_nanostack(bin_path, data_dir, port, "--ttl-sweep-interval-seconds", "1")
+    try:
+        yield ep
+    finally:
+        proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        import shutil
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def test_sweeper_evicts_expired_item(sweep_nanostack):
+    ddb = _make_ddb(sweep_nanostack)
+    name = _ttl_table(ddb)
+    past = int(time.time()) - 60
+    ddb.put_item(TableName=name, Item={"id": {"S": "stale"}, "exp": {"N": str(past)}})
+    # Sweep runs at 1s; allow >= 1.5s for eviction.
+    time.sleep(1.6)
+    assert ddb.scan(TableName=name)["Count"] == 0
+
+
+def test_sweeper_keeps_unexpired_item(sweep_nanostack):
+    ddb = _make_ddb(sweep_nanostack)
+    name = _ttl_table(ddb)
+    future = int(time.time()) + 600
+    ddb.put_item(TableName=name, Item={"id": {"S": "fresh"}, "exp": {"N": str(future)}})
+    time.sleep(1.6)
+    assert ddb.scan(TableName=name)["Count"] == 1
+
+
+def test_sweeper_ignores_item_with_no_ttl_attribute(sweep_nanostack):
+    ddb = _make_ddb(sweep_nanostack)
+    name = _ttl_table(ddb)
+    ddb.put_item(TableName=name, Item={"id": {"S": "no_exp"}})
+    time.sleep(1.6)
+    assert ddb.scan(TableName=name)["Count"] == 1
+
+
+def test_sweeper_ignores_wrong_type_ttl_attribute(sweep_nanostack):
+    # AWS: items whose TTL attribute is not a Number are kept.
+    ddb = _make_ddb(sweep_nanostack)
+    name = _ttl_table(ddb)
+    past = str(int(time.time()) - 60)
+    # Put the expiry timestamp as a string (S), not number (N).
+    ddb.put_item(TableName=name, Item={"id": {"S": "wrong_type"}, "exp": {"S": past}})
+    time.sleep(1.6)
+    assert ddb.scan(TableName=name)["Count"] == 1
+
+
+def test_sweeper_ignores_disabled_tables(sweep_nanostack):
+    ddb = _make_ddb(sweep_nanostack)
+    name = _unique_table("sweep_dis")
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    # TTL never enabled → past-expiry item is kept indefinitely.
+    past = int(time.time()) - 60
+    ddb.put_item(TableName=name, Item={"id": {"S": "stale"}, "exp": {"N": str(past)}})
+    time.sleep(1.6)
+    assert ddb.scan(TableName=name)["Count"] == 1
+
+
+def test_sweeper_evicts_multiple_items_one_tick(sweep_nanostack):
+    ddb = _make_ddb(sweep_nanostack)
+    name = _ttl_table(ddb)
+    past = int(time.time()) - 60
+    for i in range(5):
+        ddb.put_item(TableName=name, Item={"id": {"S": f"k{i}"}, "exp": {"N": str(past)}})
+    time.sleep(1.6)
+    assert ddb.scan(TableName=name)["Count"] == 0
+
+
 def test_ttl_spec_persists_across_restart():
     bin_path = os.environ.get("NANOSTACK_BIN")
     if not bin_path:

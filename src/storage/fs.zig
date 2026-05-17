@@ -724,13 +724,35 @@ restored_objects: std.StringHashMapUnmanaged(void),
 /// at `<base>/dynamodb/tables/<name>/schema.json`. Lock via `mutex` for
 /// any mutation.
 dynamo_tables: std.StringHashMapUnmanaged(*storage.TableSlot),
+/// TTL sweeper state (v0.2.3). The thread runs `ttlSweepLoop` until
+/// `sweeper_stop` is set; on each tick it scans every TTL-enabled
+/// table and evicts expired items.
+ttl_sweep_interval_secs: u32,
+sweeper_thread: ?std.Thread,
+sweeper_stop: std.atomic.Value(bool),
 
 pub const InitError = error{
     OutOfMemory,
     Io,
+    ThreadSpawn,
 };
 
+pub const Options = struct {
+    /// Default 5s for local-dev responsiveness. AWS uses hours.
+    ttl_sweep_interval_seconds: u32 = 5,
+    /// Spawn the TTL sweeper thread? Default true in production; tests
+    /// use the 3-arg `init` shim which disables the sweeper because the
+    /// Zig test runner doesn't tolerate dangling threads at teardown.
+    spawn_ttl_sweeper: bool = true,
+};
+
+/// Test-friendly init: no background sweeper. Use `initWithOptions` in
+/// production / `main.zig`.
 pub fn init(allocator: Allocator, io: Io, base_dir: []const u8) InitError!*Fs {
+    return initWithOptions(allocator, io, base_dir, .{ .spawn_ttl_sweeper = false });
+}
+
+pub fn initWithOptions(allocator: Allocator, io: Io, base_dir: []const u8, opts: Options) InitError!*Fs {
     const self = try allocator.create(Fs);
     errdefer allocator.destroy(self);
 
@@ -745,16 +767,27 @@ pub fn init(allocator: Allocator, io: Io, base_dir: []const u8) InitError!*Fs {
         .buckets = .empty,
         .restored_objects = .empty,
         .dynamo_tables = .empty,
+        .ttl_sweep_interval_secs = opts.ttl_sweep_interval_seconds,
+        .sweeper_thread = null,
+        .sweeper_stop = .init(false),
     };
 
     ensureS3Dir(self) catch return InitError.Io;
     loadRegistry(self) catch return InitError.Io;
     ensureDynamoDir(self) catch return InitError.Io;
     loadDynamoTables(self) catch return InitError.Io;
+
+    if (opts.spawn_ttl_sweeper) {
+        self.sweeper_thread = std.Thread.spawn(.{}, ttlSweepLoop, .{self}) catch return InitError.ThreadSpawn;
+    }
     return self;
 }
 
 pub fn deinit(self: *Fs) void {
+    if (self.sweeper_thread) |t| {
+        self.sweeper_stop.store(true, .release);
+        t.join();
+    }
     for (self.buckets.items) |*b| b.deinit(self.allocator);
     self.buckets.deinit(self.allocator);
     {
@@ -4556,6 +4589,84 @@ pub fn ddbDescribeTimeToLive(self: *Fs, name: []const u8) storage.Error!?storage
     defer self.mutex.unlock(self.io);
     const slot = self.dynamo_tables.get(name) orelse return storage.Error.TableNotFound;
     return slot.ttl_spec;
+}
+
+/// Sweeper main loop. Spawned from `init`; runs until `sweeper_stop`
+/// is set by `deinit`. Sleeps in small chunks so shutdown observes the
+/// stop flag promptly even when the interval is set high.
+fn ttlSweepLoop(self: *Fs) void {
+    const tick_ms: u32 = 250;
+    while (true) {
+        const interval_ms: u32 = self.ttl_sweep_interval_secs * 1000;
+        var slept: u32 = 0;
+        while (slept < interval_ms) {
+            if (self.sweeper_stop.load(.acquire)) return;
+            const chunk: u32 = @min(tick_ms, interval_ms - slept);
+            // Use Linux nanosleep directly. std.posix.poll(&[], ms) is
+            // tempting but panics with EFAULT on an empty slice in Zig
+            // 0.16 (the slice's .ptr is non-null but invalid).
+            const req: std.os.linux.timespec = .{
+                .sec = @intCast(@divTrunc(chunk, 1000)),
+                .nsec = @intCast(@as(i64, @mod(chunk, 1000)) * std.time.ns_per_ms),
+            };
+            _ = std.os.linux.nanosleep(&req, null);
+            slept += chunk;
+        }
+        if (self.sweeper_stop.load(.acquire)) return;
+        ttlSweepOnce(self);
+    }
+}
+
+/// One pass: lock the table mutex, iterate every TTL-enabled table,
+/// collect expired item keys (TTL attribute is a Number ≤ now()), and
+/// evict each via the existing transaction-write delete path.
+/// Wrong-type or missing TTL attributes are ignored per AWS semantics.
+pub fn ttlSweepOnce(self: *Fs) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const now = nowUnixSeconds(self.io);
+    var it = self.dynamo_tables.iterator();
+    while (it.next()) |entry| {
+        const slot = entry.value_ptr.*;
+        const spec = slot.ttl_spec orelse continue;
+        if (spec.status != .enabled) continue;
+        sweepTableLocked(self, slot, spec.attribute_name, now);
+    }
+}
+
+fn sweepTableLocked(self: *Fs, slot: *storage.TableSlot, attr_name: []const u8, now_unix: i64) void {
+    // Snapshot the expired keys first; we can't mutate the map while
+    // iterating it (Zig hash-map iterator is invalidated on modify).
+    var victims: std.ArrayList(storage.Item) = .empty;
+    defer {
+        for (victims.items) |*v| v.deinit(self.allocator);
+        victims.deinit(self.allocator);
+    }
+
+    var it = slot.items.iterator();
+    while (it.next()) |entry| {
+        const item = entry.value_ptr.*;
+        const av = item.attributeValue(attr_name) orelse continue;
+        const n_str = switch (av.*) {
+            .n => |n| n,
+            else => continue, // wrong type → ignored per AWS
+        };
+        const ttl_val = std.fmt.parseFloat(f64, n_str) catch continue;
+        if (ttl_val > @as(f64, @floatFromInt(now_unix))) continue;
+
+        // Project keys for the delete call.
+        const key_only = storage.dynamo_state.projectKeys(self.allocator, slot, item) catch continue;
+        victims.append(self.allocator, key_only) catch {
+            var k = key_only;
+            k.deinit(self.allocator);
+            continue;
+        };
+    }
+
+    for (victims.items) |*key_only| {
+        applyDeleteLocked(self, slot, key_only) catch {};
+    }
 }
 
 // ---------------------------------------------------------------------------
