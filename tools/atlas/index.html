@@ -24,6 +24,20 @@
   </header>
 
   <main class="layout">
+    <section class="panel panel-overview">
+      <h2>System overview</h2>
+
+      <div class="wedge-strip" id="wedge-strip"></div>
+
+      <h3 class="overview-h3">Request lifecycle</h3>
+      <p class="overview-hint">Hover any stage for the source file + a one-line summary.</p>
+      <div class="lifecycle" id="lifecycle"></div>
+
+      <h3 class="overview-h3">Service fleet</h3>
+      <p class="overview-hint">Stacked bar shows enforcement-level mix; bar width is proportional to total ops. Click a tile to filter the matrix below.</p>
+      <div class="fleet" id="fleet"></div>
+    </section>
+
     <section class="panel panel-matrix">
       <h2>Service surface</h2>
       <p class="panel-hint">Hover an op for the verbatim SUPPORT.md status. Filter by status using the badges. The matrix renders the first <code>Operation</code>-column table per service — multi-table sections (S3 cross-cutting / lock / config) live in SUPPORT.md.</p>

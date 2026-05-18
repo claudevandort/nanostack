@@ -32,12 +32,171 @@ async function init() {
 
   renderHero();
   renderTiles();
+  renderOverview();
   renderLegend();
   renderMatrix();
   renderWiring();
   renderTimeline();
   renderBench();
   attachTooltip();
+}
+
+// ---------------------------------------------------------------- OVERVIEW
+
+const LIFECYCLE = [
+  { id: "http",    label: "HTTP",     sub: "httpz takeover",         path: "src/server.zig" },
+  { id: "sigv4",   label: "SigV4",    sub: "header + presigned auth", path: "src/auth/sigv4.zig" },
+  { id: "router",  label: "Router",   sub: "→ Operation enum",       path: "src/router.zig" },
+  { id: "service", label: "Service",  sub: "per-service handlers",   path: "src/services/" },
+  { id: "storage", label: "Storage",  sub: "fs backend (vtable)",    path: "src/storage/fs.zig" },
+];
+
+const STATUS_SEGMENT_ORDER = ["enforced", "supported", "roundtrip", "partial", "not_supported", "unknown"];
+
+function renderOverview() {
+  renderWedge();
+  renderLifecycle();
+  renderFleet();
+}
+
+function renderWedge() {
+  const root = document.getElementById("wedge-strip");
+  root.replaceChildren();
+  if (!DATA.wedge?.length) return;
+  const lead = document.createElement("div");
+  lead.className = "wedge-lead";
+  lead.textContent = "accuracy beats LocalStack on the surface we cover";
+  root.appendChild(lead);
+  DATA.wedge.forEach((row) => {
+    const item = document.createElement("div");
+    item.className = "wedge-row";
+    const n = document.createElement("span");
+    n.className = "wedge-n";
+    n.textContent = row.n;
+    const bhv = document.createElement("span");
+    bhv.className = "wedge-bhv";
+    bhv.innerHTML = inlineMd(row.behaviour);
+    item.append(n, bhv);
+    root.appendChild(item);
+  });
+}
+
+function renderLifecycle() {
+  const root = document.getElementById("lifecycle");
+  root.replaceChildren();
+  LIFECYCLE.forEach((stage, i) => {
+    const box = document.createElement("div");
+    box.className = "lifecycle-stage";
+    box.dataset.tooltip = `**${stage.label}** — ${stage.sub}\n${stage.path}`;
+    const lbl = document.createElement("div");
+    lbl.className = "lifecycle-label";
+    lbl.textContent = stage.label;
+    const sub = document.createElement("div");
+    sub.className = "lifecycle-sub";
+    sub.textContent = stage.sub;
+    box.append(lbl, sub);
+    root.appendChild(box);
+    if (i < LIFECYCLE.length - 1) {
+      const arrow = document.createElement("div");
+      arrow.className = "lifecycle-arrow";
+      arrow.setAttribute("aria-hidden", "true");
+      arrow.textContent = "→";
+      root.appendChild(arrow);
+    }
+  });
+}
+
+function renderFleet() {
+  const root = document.getElementById("fleet");
+  root.replaceChildren();
+  // Compute max op count for normalizing bar widths.
+  const maxOps = Math.max(...DATA.services.map((s) => s.ops.length), 1);
+  DATA.services.forEach((svc) => {
+    const counts = new Map();
+    svc.ops.forEach((op) => counts.set(op.status, (counts.get(op.status) || 0) + 1));
+    const total = svc.ops.length;
+    const enforced = counts.get("enforced") || 0;
+    const supported = counts.get("supported") || 0;
+    const roundtrip = counts.get("roundtrip") || 0;
+
+    const tile = document.createElement("article");
+    tile.className = "fleet-tile";
+    tile.addEventListener("click", () => {
+      // Smooth-scroll to the matrix column for this service.
+      const col = Array.from(document.querySelectorAll(".service-col"))
+        .find((c) => c.querySelector(".service-name")?.textContent === svc.name);
+      col?.scrollIntoView({ behavior: "smooth", block: "start" });
+      col?.animate(
+        [{ background: "var(--accent-soft)" }, { background: "var(--bg)" }],
+        { duration: 600, easing: "ease-out" },
+      );
+    });
+
+    const head = document.createElement("div");
+    head.className = "fleet-head";
+    const name = document.createElement("div");
+    name.className = "fleet-name";
+    name.textContent = svc.name;
+    const meta = document.createElement("div");
+    meta.className = "fleet-meta";
+    meta.textContent = `${total} ops`;
+    head.append(name, meta);
+    tile.appendChild(head);
+
+    // Stacked horizontal bar — width proportional to op count, segments to status mix.
+    const barWrap = document.createElement("div");
+    barWrap.className = "fleet-bar-wrap";
+    const bar = document.createElement("div");
+    bar.className = "fleet-bar";
+    bar.style.width = `${(total / maxOps) * 100}%`;
+    STATUS_SEGMENT_ORDER.forEach((status) => {
+      const n = counts.get(status) || 0;
+      if (n === 0) return;
+      const seg = document.createElement("div");
+      seg.className = "fleet-seg";
+      seg.dataset.status = status;
+      seg.style.flex = `${n} 0 0`;
+      seg.dataset.tooltip = `**${svc.name}** — ${n} ${STATUS_LABEL[status] || status}`;
+      seg.style.background = `var(--st-${status})`;
+      bar.appendChild(seg);
+    });
+    barWrap.appendChild(bar);
+    tile.appendChild(barWrap);
+
+    // Mini-stats row.
+    const stats = document.createElement("div");
+    stats.className = "fleet-stats";
+    if (enforced > 0) stats.append(statPill("enforced", `${enforced} enforced`));
+    if (supported > 0) stats.append(statPill("supported", `${supported} supported`));
+    if (roundtrip > 0) stats.append(statPill("roundtrip", `${roundtrip} roundtrip`));
+    tile.appendChild(stats);
+
+    root.appendChild(tile);
+  });
+}
+
+function statPill(status, text) {
+  const s = document.createElement("span");
+  s.className = "fleet-stat";
+  s.dataset.status = status;
+  const dot = document.createElement("span");
+  dot.className = "fleet-stat-dot";
+  dot.style.background = `var(--st-${status})`;
+  s.append(dot, document.createTextNode(text));
+  return s;
+}
+
+// Light inline markdown for wedge prose. Reuses the same shape as plan.js mdInline.
+function inlineMd(text) {
+  if (!text) return "";
+  let html = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return html;
 }
 
 // ---------------------------------------------------------------- THEME
