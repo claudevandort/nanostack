@@ -5520,8 +5520,177 @@ fn loadSingleQueue(self: *Fs, name: []const u8) !void {
     };
 
     loadQueueTags(self, slot_ptr);
+    loadQueueMessages(self, slot_ptr) catch |err| {
+        std.log.warn("sqs: failed to load messages for queue {s}: {s}", .{ slot_ptr.name, @errorName(err) });
+    };
+    if (slot_ptr.attrs.is_fifo) {
+        loadDedupHistory(self, slot_ptr) catch |err| {
+            std.log.warn("sqs: failed to load dedup_history for queue {s}: {s}", .{ slot_ptr.name, @errorName(err) });
+        };
+    }
 
     try self.sqs_queues.put(self.allocator, slot_ptr.name, slot_ptr);
+}
+
+/// Walk `<queue>/messages/*.json` and rebuild `slot.messages` in
+/// `sent_unix` ascending order. Corrupted files are skipped with a
+/// warning rather than failing the whole queue.
+fn loadQueueMessages(self: *Fs, slot: *storage.SqsQueueSlot) !void {
+    var dir_buf: [4096]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&dir_buf, "{s}/sqs/queues/{s}/messages", .{ self.base_dir, slot.name });
+
+    var dir = Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(self.io);
+
+    var it = dir.iterate();
+    while (try it.next(self.io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+
+        var path_buf: [4096]u8 = undefined;
+        const msg_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+        const body = Io.Dir.cwd().readFileAlloc(self.io, msg_path, self.allocator, .limited(1024 * 1024)) catch |err| {
+            std.log.warn("sqs: skipping unreadable message file {s}: {s}", .{ entry.name, @errorName(err) });
+            continue;
+        };
+        defer self.allocator.free(body);
+
+        var parsed = std.json.parseFromSlice(MessageDoc, self.allocator, body, .{ .ignore_unknown_fields = true }) catch |err| {
+            std.log.warn("sqs: skipping corrupted message file {s}: {s}", .{ entry.name, @errorName(err) });
+            continue;
+        };
+        defer parsed.deinit();
+        const doc = parsed.value;
+
+        const msg_ptr = try self.allocator.create(storage.Message);
+        errdefer self.allocator.destroy(msg_ptr);
+
+        var md5_buf: [32]u8 = undefined;
+        if (doc.md5_of_body.len == 32) {
+            @memcpy(&md5_buf, doc.md5_of_body);
+        } else {
+            // Shouldn't happen — md5_of_body is always 32 hex chars.
+            @memset(&md5_buf, '0');
+        }
+
+        msg_ptr.* = .{
+            .id = try self.allocator.dupe(u8, doc.id),
+            .body = try self.allocator.dupe(u8, doc.body),
+            .sent_unix = doc.sent_unix,
+            .visible_unix = doc.visible_unix,
+            .receive_count = doc.receive_count,
+            .md5_of_body = md5_buf,
+            .raw_attributes_json = if (doc.raw_attributes_json) |s| try self.allocator.dupe(u8, s) else null,
+            .message_group_id = if (doc.message_group_id) |s| try self.allocator.dupe(u8, s) else null,
+            .message_deduplication_id = if (doc.message_deduplication_id) |s| try self.allocator.dupe(u8, s) else null,
+            .sequence_number = doc.sequence_number,
+        };
+        try slot.messages.append(self.allocator, msg_ptr);
+    }
+
+    // Sort by (sent_unix, id) — preserves AWS semantics (insertion
+    // order). The on-disk iterate order is fs-dependent. The id is a
+    // nano-derived UUID so its lex order matches sub-second send order.
+    std.mem.sort(*storage.Message, slot.messages.items, {}, struct {
+        fn lt(_: void, a: *storage.Message, b: *storage.Message) bool {
+            if (a.sent_unix != b.sent_unix) return a.sent_unix < b.sent_unix;
+            return std.mem.lessThan(u8, a.id, b.id);
+        }
+    }.lt);
+}
+
+const DedupHistoryDoc = struct {
+    entries: []const DedupHistoryEntryDoc,
+};
+
+const DedupHistoryEntryDoc = struct {
+    key: []const u8,
+    message_id: []const u8,
+    /// Decimal-string form — JSON-number can't represent u128 natively.
+    sequence_number: []const u8,
+    /// Decimal-string form (i64 fits as a JSON number, but we use string
+    /// for symmetry with the renderer).
+    expire_unix: []const u8,
+};
+
+fn dedupHistoryPath(self: *Fs, queue_name: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/sqs/queues/{s}/dedup_history.json", .{ self.base_dir, queue_name });
+}
+
+/// Load `<queue>/dedup_history.json` and populate `slot.dedup_history`,
+/// pruning entries whose expire_unix <= now during the load.
+fn loadDedupHistory(self: *Fs, slot: *storage.SqsQueueSlot) !void {
+    var path_buf: [4096]u8 = undefined;
+    const path = try dedupHistoryPath(self, slot.name, &path_buf);
+
+    const body = Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer self.allocator.free(body);
+
+    var parsed = std.json.parseFromSlice(DedupHistoryDoc, self.allocator, body, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+
+    const now = nowUnixSeconds(self.io);
+    for (parsed.value.entries) |e| {
+        const expire_unix = std.fmt.parseInt(i64, e.expire_unix, 10) catch continue;
+        if (expire_unix <= now) continue;
+        const seq = std.fmt.parseInt(u128, e.sequence_number, 10) catch continue;
+        const key_owned = try self.allocator.dupe(u8, e.key);
+        errdefer self.allocator.free(key_owned);
+        const mid_owned = try self.allocator.dupe(u8, e.message_id);
+        errdefer self.allocator.free(mid_owned);
+        try slot.dedup_history.put(self.allocator, key_owned, .{
+            .message_id = mid_owned,
+            .sequence_number = seq,
+            .expire_unix = expire_unix,
+        });
+    }
+}
+
+/// Write `<queue>/dedup_history.json` atomically. Called after every
+/// new entry is added during sqsSendMessage.
+fn writeDedupHistory(self: *Fs, slot: *const storage.SqsQueueSlot) !void {
+    var dir_buf: [4096]u8 = undefined;
+    const dir_path = try queueDirPath(self, slot.name, &dir_buf);
+    try Io.Dir.cwd().createDirPath(self.io, dir_path);
+
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    try s.objectField("entries");
+    try s.beginArray();
+    var it = slot.dedup_history.iterator();
+    while (it.next()) |entry| {
+        try s.beginObject();
+        try s.objectField("key");
+        try s.write(entry.key_ptr.*);
+        try s.objectField("message_id");
+        try s.write(entry.value_ptr.message_id);
+        try s.objectField("sequence_number");
+        var seq_buf: [40]u8 = undefined;
+        const seq_txt = try std.fmt.bufPrint(&seq_buf, "{d}", .{entry.value_ptr.sequence_number});
+        try s.write(seq_txt);
+        try s.objectField("expire_unix");
+        var t_buf: [32]u8 = undefined;
+        const t_txt = try std.fmt.bufPrint(&t_buf, "{d}", .{entry.value_ptr.expire_unix});
+        try s.write(t_txt);
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.endObject();
+
+    const body = try aw.toOwnedSlice();
+    defer self.allocator.free(body);
+
+    var path_buf: [4096]u8 = undefined;
+    const path = try dedupHistoryPath(self, slot.name, &path_buf);
+    try writeAtomic(self.io, path, body);
 }
 
 pub fn sqsCreateQueue(self: *Fs, in: storage.CreateQueueInput) storage.Error!*const storage.SqsQueueSlot {
@@ -5938,6 +6107,9 @@ pub fn sqsSendMessage(self: *Fs, allocator: Allocator, in: storage.SendMessageIn
                 self.allocator.free(msg_id_owned);
                 return storage.Error.OutOfMemory;
             };
+            // Persist the updated dedup history so a restart within the
+            // 5-minute window still rejects duplicates.
+            writeDedupHistory(self, slot) catch return storage.Error.Io;
         }
     }
 
