@@ -15,6 +15,7 @@ const complete_parser = @import("../../wire/complete_multipart_parser.zig");
 const tagging_parser = @import("../../wire/tagging_parser.zig");
 const preconditions = @import("preconditions.zig");
 const mod = @import("mod.zig");
+const events = @import("events.zig");
 
 const Context = mod.Context;
 const Result = mod.Result;
@@ -210,6 +211,20 @@ pub fn completeMultipartUpload(ctx: Context, bucket: []const u8, key: []const u8
         .upload_id = upload_id,
         .parts = parsed.parts,
     }) catch |err| return .{ .err = mod.mapStorageErr(err) };
+
+    // Compute total object size by summing the merged parts' sizes.
+    var total_size: u64 = 0;
+    for (parsed.parts) |p| {
+        if (size_lookup.get(p.part_number)) |sz| total_size += sz;
+    }
+
+    events.dispatchObjectCreated(ctx, bucket, .{
+        .key = key,
+        .size = total_size,
+        .etag = out.etag,
+        .version_id = if (out.version_id.len > 0) out.version_id else null,
+        .event_name = "s3:ObjectCreated:CompleteMultipartUpload",
+    });
 
     const host_header = mod.findHeader(ctx.request.headers, "host") orelse "localhost";
     const location = std.fmt.allocPrint(ctx.allocator, "http://{s}/{s}/{s}", .{ host_header, bucket, key }) catch

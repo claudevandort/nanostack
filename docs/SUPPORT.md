@@ -371,7 +371,7 @@ These will only be added if a real user hits a setup-script gap; not on any road
 | CORS XML round-trip (rules: AllowedMethod/AllowedOrigin/AllowedHeader/ExposeHeader/MaxAgeSeconds) | supported (accept-store-roundtrip; no actual cross-origin enforcement) | M11 |
 | Server-side encryption config (AES256 / aws:kms / aws:kms:dsse; KMSMasterKeyID; BucketKeyEnabled) | supported (accept-store-roundtrip; **no actual cipher applied to object data**) | M11 |
 | Lifecycle rules (Filter, Prefix, Transition, Expiration, NoncurrentVersionTransition, NoncurrentVersionExpiration, AbortIncompleteMultipartUpload) | supported (accept-store-roundtrip; **rules never expire / transition objects**) | M11 |
-| Notification targets (TopicConfiguration → SNS, QueueConfiguration → SQS, CloudFunctionConfiguration → Lambda; events + filter rules) | supported (accept-store-roundtrip; **events never fire — no downstream services**) | M11 |
+| Notification targets (TopicConfiguration → SNS, QueueConfiguration → SQS, CloudFunctionConfiguration → Lambda; events + filter rules) | supported (**QueueConfiguration entries fire to SQS as of v0.3.4**; TopicConfiguration / CloudFunctionConfiguration still accept-store-roundtrip — SNS / Lambda not implemented) | M11, dispatch v0.3.4 |
 | Website config (IndexDocument / ErrorDocument / RedirectAllRequestsTo / RoutingRules) | supported (accept-store-roundtrip; **website-mode requests not honoured**) | M11 |
 | `GetObjectAttributes` ObjectParts detail | partial (`PartsCount` only; per-part rows out of scope) | M11 |
 | **Enforcement of any M11 config** | **not enforced** (accept-store-roundtrip only; documented divergence) | M11 |
@@ -403,3 +403,21 @@ These will only be added if a real user hits a setup-script gap; not on any road
 - Event notifications (S3 → SNS/SQS/Lambda). Requires those services to land first.
 - Select, inventory, analytics.
 - Server-side encryption (SSE-S3, SSE-KMS, SSE-C). Headers accepted, not enforced.
+
+## Cross-service wiring
+
+The first cross-service flow landed in v0.3.4: **S3 → SQS event notifications**. Configured via `PutBucketNotificationConfiguration` with a `QueueConfiguration` entry. Events fire fire-and-forget when `--services` includes both `s3` and `sqs`.
+
+| Flow | Status | Notes |
+|---|---|---|
+| S3 → SQS event notifications | supported (v0.3.4) | PutObject / CopyObject / CompleteMultipartUpload → `s3:ObjectCreated:*`; DeleteObject / DeleteObjects → `s3:ObjectRemoved:Delete` or `:DeleteMarkerCreated`. Filter rules (prefix + suffix). Wildcard event matchers (`s3:ObjectCreated:*`, `s3:*`). |
+| S3 → SNS notifications | not supported | TopicConfiguration is parsed + stored, never fires. SNS service not implemented (planned v0.4.0). |
+| S3 → Lambda notifications | not supported | CloudFunctionConfiguration is parsed + stored, never fires. Lambda service not implemented (planned v0.5.0). |
+| DynamoDB Streams → SQS | not supported | DDB Streams emit to their own `GetRecords` API (v0.2.2). Cross-service piping deferred. |
+
+Documented divergences (S3 → SQS):
+- **Sender principal**: AWS uses a service-principal model (`Principal: { Service: "s3.amazonaws.com" }` grants in queue policies). nanostack dispatches from the storage layer, bypassing the SQS authz hook entirely. Matches LocalStack.
+- **`sourceIPAddress` is hardcoded `127.0.0.1`** — we don't surface the real client IP through to the S3 handler.
+- **Request IDs in the event envelope are freshly minted** — they don't match the `x-amz-request-id` of the original S3 response.
+- **Fire-and-forget dispatch** — S3 op success doesn't depend on SQS reachability. Errors are logged + dropped (AWS retries internally; we don't).
+- **`sequencer` field** is a hex-encoded nanosecond timestamp + per-process counter. AWS's exact algorithm is undocumented; ours preserves the "monotonic increase per object key" property.
