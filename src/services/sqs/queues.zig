@@ -141,6 +141,81 @@ pub fn removePermission(ctx: Context) Result {
     return .{ .ok = .{ .body = "{}" } };
 }
 
+pub fn startMessageMoveTask(ctx: Context) Result {
+    const req = wire.parseStartMessageMoveTask(ctx.allocator, ctx.request.body) catch |err|
+        return .{ .err = mapParseErr(err) };
+
+    // Extract source queue name from the ARN (last segment after the
+    // final `:`).
+    const src_name = arnTail(req.source_arn) orelse
+        return .{ .err = .{ .code = .invalid_parameter_value, .message = "SourceArn is not a valid SQS queue ARN." } };
+
+    // The destination ARN is optional in AWS; when omitted, the
+    // service auto-derives it from the source DLQ's redrive-source.
+    // For local-dev we require an explicit destination — caller
+    // typically passes one.
+    var dst_arn: []const u8 = undefined;
+    var dst_name: []const u8 = undefined;
+    if (req.destination_arn) |d| {
+        dst_arn = d;
+        dst_name = arnTail(d) orelse
+            return .{ .err = .{ .code = .invalid_parameter_value, .message = "DestinationArn is not a valid SQS queue ARN." } };
+    } else {
+        // Auto-derive: find a source queue whose RedrivePolicy targets
+        // this DLQ, and use that source as the destination.
+        const sources = ctx.backend.listDeadLetterSourceQueues(ctx.allocator, .{ .dlq_name = src_name }) catch |err|
+            return .{ .err = mapStorageErr(err) };
+        if (sources.queue_names.len == 0) {
+            return .{ .err = .{ .code = .invalid_parameter_value, .message = "Source queue is not configured as a dead-letter queue and no DestinationArn was provided." } };
+        }
+        dst_name = sources.queue_names[0];
+        dst_arn = std.fmt.allocPrint(ctx.allocator, "arn:aws:sqs:{s}:{s}:{s}", .{ ctx.region, ctx.account_id, dst_name }) catch
+            return .{ .err = .{ .code = .internal_server_error } };
+    }
+
+    const out = ctx.backend.startMessageMoveTask(ctx.allocator, .{
+        .source_arn = req.source_arn,
+        .source_name = src_name,
+        .destination_arn = dst_arn,
+        .destination_name = dst_name,
+        .max_per_second = req.max_per_second,
+    }) catch |err| return .{ .err = mapStorageErr(err) };
+
+    const body = wire.renderStartMessageMoveTask(ctx.allocator, out.task_handle) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
+}
+
+pub fn cancelMessageMoveTask(ctx: Context) Result {
+    const handle = wire.parseCancelMessageMoveTask(ctx.allocator, ctx.request.body) catch |err|
+        return .{ .err = mapParseErr(err) };
+    const out = ctx.backend.cancelMessageMoveTask(.{ .task_handle = handle }) catch |err|
+        return .{ .err = mapStorageErr(err) };
+    const body = wire.renderCancelMessageMoveTask(ctx.allocator, out.approximate_number_of_messages_moved) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
+}
+
+pub fn listMessageMoveTasks(ctx: Context) Result {
+    const req = wire.parseListMessageMoveTasks(ctx.allocator, ctx.request.body) catch |err|
+        return .{ .err = mapParseErr(err) };
+    const out = ctx.backend.listMessageMoveTasks(ctx.allocator, .{
+        .source_arn = req.source_arn,
+        .max_results = req.max_results orelse 1,
+    }) catch |err| return .{ .err = mapStorageErr(err) };
+    const body = wire.renderListMessageMoveTasks(ctx.allocator, out) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
+}
+
+/// Extract the last `:`-separated segment of a queue ARN. Returns
+/// null if the ARN doesn't have at least one `:`.
+fn arnTail(arn: []const u8) ?[]const u8 {
+    const idx = std.mem.lastIndexOfScalar(u8, arn, ':') orelse return null;
+    if (idx + 1 >= arn.len) return null;
+    return arn[idx + 1 ..];
+}
+
 // ---------------------------------------------------------------------------
 // Error mapping
 

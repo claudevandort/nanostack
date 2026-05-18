@@ -1953,6 +1953,65 @@ pub const RemovePermissionInput = struct {
     label: []const u8,
 };
 
+/// MessageMoveTask types (v0.3.2). The handler builds the source +
+/// destination ARNs from the configured account_id + region.
+pub const StartMessageMoveTaskInput = struct {
+    /// Source DLQ ARN. The handler validates this is a known queue +
+    /// is being referenced as a DLQ by at least one source.
+    source_arn: []const u8,
+    source_name: []const u8,
+    /// Destination ARN. If `null`, the handler should auto-derive it
+    /// from the source DLQ's redrive-source (we keep this required at
+    /// the storage layer for simplicity).
+    destination_arn: []const u8,
+    destination_name: []const u8,
+    /// MaxNumberOfMessagesPerSecond — accepted but ignored
+    /// (synchronous execution model). Documented divergence.
+    max_per_second: ?u32 = null,
+};
+
+pub const StartMessageMoveTaskOutput = struct {
+    /// Opaque task handle. Caller-owned.
+    task_handle: []const u8,
+};
+
+pub const CancelMessageMoveTaskInput = struct {
+    task_handle: []const u8,
+};
+
+pub const CancelMessageMoveTaskOutput = struct {
+    /// AWS-real returns ApproximateNumberOfMessagesMoved on cancel.
+    approximate_number_of_messages_moved: u64,
+};
+
+pub const ListMessageMoveTasksInput = struct {
+    source_arn: []const u8,
+    /// Max tasks to return. Default 1, max 10.
+    max_results: u32 = 1,
+};
+
+pub const ListMessageMoveTasksOutput = struct {
+    /// Caller-owned slice of task snapshots (refs into the live tasks
+    /// — caller must not free the contents). Sorted newest-first.
+    tasks: []const MessageMoveTaskRow,
+};
+
+/// Wire-friendly snapshot of a MessageMoveTask. Strings are caller-
+/// owned dupes.
+pub const MessageMoveTaskRow = struct {
+    task_handle: []const u8,
+    source_arn: []const u8,
+    destination_arn: []const u8,
+    status: []const u8, // "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED"
+    approximate_messages_to_move: u64,
+    approximate_messages_moved: u64,
+    started_unix: i64,
+    failure_reason: ?[]const u8 = null,
+};
+
+pub const MessageMoveTask = sqs_state.MessageMoveTask;
+pub const MessageMoveTaskStatus = sqs_state.MessageMoveTaskStatus;
+
 pub const SqsBackend = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -1978,6 +2037,9 @@ pub const SqsBackend = struct {
         listDeadLetterSourceQueues: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListDeadLetterSourceQueuesInput) Error!ListDeadLetterSourceQueuesOutput,
         addPermission: *const fn (ctx: *anyopaque, in: AddPermissionInput) Error!void,
         removePermission: *const fn (ctx: *anyopaque, in: RemovePermissionInput) Error!void,
+        startMessageMoveTask: *const fn (ctx: *anyopaque, allocator: Allocator, in: StartMessageMoveTaskInput) Error!StartMessageMoveTaskOutput,
+        cancelMessageMoveTask: *const fn (ctx: *anyopaque, in: CancelMessageMoveTaskInput) Error!CancelMessageMoveTaskOutput,
+        listMessageMoveTasks: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListMessageMoveTasksInput) Error!ListMessageMoveTasksOutput,
     };
 
     pub fn createQueue(self: SqsBackend, in: CreateQueueInput) Error!*const SqsQueueSlot {
@@ -2030,6 +2092,15 @@ pub const SqsBackend = struct {
     }
     pub fn removePermission(self: SqsBackend, in: RemovePermissionInput) Error!void {
         return self.vtable.removePermission(self.ctx, in);
+    }
+    pub fn startMessageMoveTask(self: SqsBackend, allocator: Allocator, in: StartMessageMoveTaskInput) Error!StartMessageMoveTaskOutput {
+        return self.vtable.startMessageMoveTask(self.ctx, allocator, in);
+    }
+    pub fn cancelMessageMoveTask(self: SqsBackend, in: CancelMessageMoveTaskInput) Error!CancelMessageMoveTaskOutput {
+        return self.vtable.cancelMessageMoveTask(self.ctx, in);
+    }
+    pub fn listMessageMoveTasks(self: SqsBackend, allocator: Allocator, in: ListMessageMoveTasksInput) Error!ListMessageMoveTasksOutput {
+        return self.vtable.listMessageMoveTasks(self.ctx, allocator, in);
     }
 };
 

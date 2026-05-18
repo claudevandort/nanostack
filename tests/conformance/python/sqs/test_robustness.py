@@ -442,6 +442,90 @@ def test_remove_permission_unknown_label_rejected(fresh_sqs):
         fresh_sqs.delete_queue(QueueUrl=url)
 
 
+# ---------- Phase E — MessageMoveTask trio ----------
+
+
+def _setup_dlq_with_messages(sqs, num_msgs: int = 3):
+    """Create source + DLQ, configure redrive, send + receive +
+    over-receive messages so they land in the DLQ. Returns the source
+    URL + DLQ URL + DLQ ARN."""
+    dlq_name = f"dlq_{secrets.token_hex(4)}"
+    dlq_url = sqs.create_queue(QueueName=dlq_name)["QueueUrl"]
+    src_name = f"src_{secrets.token_hex(4)}"
+    src_url = sqs.create_queue(QueueName=src_name)["QueueUrl"]
+    dlq_arn = f"arn:aws:sqs:us-east-1:000000000000:{dlq_name}"
+    rd = '{"deadLetterTargetArn":"' + dlq_arn + '","maxReceiveCount":1}'
+    sqs.set_queue_attributes(QueueUrl=src_url, Attributes={"RedrivePolicy": rd})
+    for i in range(num_msgs):
+        sqs.send_message(QueueUrl=src_url, MessageBody=f"m{i}")
+    # Receive maxReceiveCount times to push to DLQ.
+    for _ in range(num_msgs):
+        sqs.receive_message(QueueUrl=src_url, VisibilityTimeout=0)
+    sqs.receive_message(QueueUrl=src_url, VisibilityTimeout=0)
+    # Messages now in DLQ.
+    return src_url, dlq_url, dlq_arn
+
+
+def test_start_message_move_task_drains_dlq(fresh_sqs):
+    src_url, dlq_url, dlq_arn = _setup_dlq_with_messages(fresh_sqs, num_msgs=3)
+    try:
+        out = fresh_sqs.start_message_move_task(SourceArn=dlq_arn)
+        assert "TaskHandle" in out
+        # All messages now in the source queue, DLQ empty.
+        src_recv = fresh_sqs.receive_message(QueueUrl=src_url, MaxNumberOfMessages=10)
+        dlq_recv = fresh_sqs.receive_message(QueueUrl=dlq_url, MaxNumberOfMessages=10)
+        assert len(src_recv["Messages"]) == 3
+        assert "Messages" not in dlq_recv or len(dlq_recv.get("Messages", [])) == 0
+    finally:
+        fresh_sqs.delete_queue(QueueUrl=src_url)
+        fresh_sqs.delete_queue(QueueUrl=dlq_url)
+
+
+def test_start_message_move_task_returns_handle(fresh_sqs):
+    src_url, dlq_url, dlq_arn = _setup_dlq_with_messages(fresh_sqs, num_msgs=1)
+    try:
+        out = fresh_sqs.start_message_move_task(SourceArn=dlq_arn)
+        assert "TaskHandle" in out
+        assert len(out["TaskHandle"]) > 0
+    finally:
+        fresh_sqs.delete_queue(QueueUrl=src_url)
+        fresh_sqs.delete_queue(QueueUrl=dlq_url)
+
+
+def test_list_message_move_tasks_shows_completed(fresh_sqs):
+    src_url, dlq_url, dlq_arn = _setup_dlq_with_messages(fresh_sqs, num_msgs=2)
+    try:
+        fresh_sqs.start_message_move_task(SourceArn=dlq_arn)
+        out = fresh_sqs.list_message_move_tasks(SourceArn=dlq_arn, MaxResults=10)
+        assert len(out["Results"]) == 1
+        task = out["Results"][0]
+        assert task["Status"] == "COMPLETED"
+        assert task["SourceArn"] == dlq_arn
+        assert task["ApproximateNumberOfMessagesMoved"] == 2
+    finally:
+        fresh_sqs.delete_queue(QueueUrl=src_url)
+        fresh_sqs.delete_queue(QueueUrl=dlq_url)
+
+
+def test_cancel_message_move_task_returns_moved_count(fresh_sqs):
+    src_url, dlq_url, dlq_arn = _setup_dlq_with_messages(fresh_sqs, num_msgs=3)
+    try:
+        start_out = fresh_sqs.start_message_move_task(SourceArn=dlq_arn)
+        handle = start_out["TaskHandle"]
+        # Synchronous model — task already COMPLETED; cancel just returns count.
+        cancel_out = fresh_sqs.cancel_message_move_task(TaskHandle=handle)
+        assert cancel_out["ApproximateNumberOfMessagesMoved"] == 3
+    finally:
+        fresh_sqs.delete_queue(QueueUrl=src_url)
+        fresh_sqs.delete_queue(QueueUrl=dlq_url)
+
+
+def test_cancel_message_move_task_unknown_handle_rejected(fresh_sqs):
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        fresh_sqs.cancel_message_move_task(TaskHandle="not-a-real-handle")
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+
 def test_sweep_interval_flag_validates_range():
     """`--sqs-retention-sweep-interval-seconds 0` is out of range."""
     bin_path = os.environ.get("NANOSTACK_BIN")

@@ -325,6 +325,139 @@ fn requestedHas(requested: []const []const u8, name: []const u8) bool {
 }
 
 // ---------------------------------------------------------------------------
+// MessageMoveTask trio (v0.3.2)
+
+pub const StartMessageMoveTaskRequest = struct {
+    source_arn: []const u8,
+    destination_arn: ?[]const u8,
+    max_per_second: ?u32,
+};
+
+pub fn parseStartMessageMoveTask(allocator: Allocator, body: []const u8) ParseError!StartMessageMoveTaskRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const root = parsed.value.object;
+    const src_v = root.get("SourceArn") orelse return ParseError.Malformed;
+    if (src_v != .string) return ParseError.Malformed;
+    var dst: ?[]const u8 = null;
+    if (root.get("DestinationArn")) |v| {
+        if (v != .string) return ParseError.Malformed;
+        dst = try allocator.dupe(u8, v.string);
+    }
+    var mps: ?u32 = null;
+    if (root.get("MaxNumberOfMessagesPerSecond")) |v| switch (v) {
+        .integer => |n| if (n > 0 and n <= 500) {
+            mps = @intCast(n);
+        } else return ParseError.InvalidAttribute,
+        .string => |s| {
+            const n = std.fmt.parseInt(u32, s, 10) catch return ParseError.InvalidAttribute;
+            if (n == 0 or n > 500) return ParseError.InvalidAttribute;
+            mps = n;
+        },
+        else => return ParseError.Malformed,
+    };
+    return .{
+        .source_arn = try allocator.dupe(u8, src_v.string),
+        .destination_arn = dst,
+        .max_per_second = mps,
+    };
+}
+
+pub fn renderStartMessageMoveTask(allocator: Allocator, task_handle: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    try s.objectField("TaskHandle");
+    try s.write(task_handle);
+    try s.endObject();
+    return aw.toOwnedSlice();
+}
+
+pub fn parseCancelMessageMoveTask(allocator: Allocator, body: []const u8) ParseError![]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const v = parsed.value.object.get("TaskHandle") orelse return ParseError.Malformed;
+    if (v != .string) return ParseError.Malformed;
+    return try allocator.dupe(u8, v.string);
+}
+
+pub fn renderCancelMessageMoveTask(allocator: Allocator, count: u64) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    try s.objectField("ApproximateNumberOfMessagesMoved");
+    try s.write(count);
+    try s.endObject();
+    return aw.toOwnedSlice();
+}
+
+pub const ListMessageMoveTasksWireRequest = struct {
+    source_arn: []const u8,
+    max_results: ?u32,
+};
+
+pub fn parseListMessageMoveTasks(allocator: Allocator, body: []const u8) ParseError!ListMessageMoveTasksWireRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const root = parsed.value.object;
+    const src_v = root.get("SourceArn") orelse return ParseError.Malformed;
+    if (src_v != .string) return ParseError.Malformed;
+    var maxr: ?u32 = null;
+    if (root.get("MaxResults")) |v| switch (v) {
+        .integer => |n| if (n >= 1 and n <= 10) {
+            maxr = @intCast(n);
+        } else return ParseError.InvalidAttribute,
+        else => return ParseError.Malformed,
+    };
+    return .{
+        .source_arn = try allocator.dupe(u8, src_v.string),
+        .max_results = maxr,
+    };
+}
+
+pub fn renderListMessageMoveTasks(allocator: Allocator, out: storage.ListMessageMoveTasksOutput) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    try s.objectField("Results");
+    try s.beginArray();
+    for (out.tasks) |t| {
+        try s.beginObject();
+        try s.objectField("TaskHandle");
+        try s.write(t.task_handle);
+        try s.objectField("SourceArn");
+        try s.write(t.source_arn);
+        try s.objectField("DestinationArn");
+        try s.write(t.destination_arn);
+        try s.objectField("Status");
+        try s.write(t.status);
+        try s.objectField("ApproximateNumberOfMessagesToMove");
+        try s.write(t.approximate_messages_to_move);
+        try s.objectField("ApproximateNumberOfMessagesMoved");
+        try s.write(t.approximate_messages_moved);
+        try s.objectField("StartedTimestamp");
+        try s.write(t.started_unix);
+        if (t.failure_reason) |fr| {
+            try s.objectField("FailureReason");
+            try s.write(fr);
+        }
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.endObject();
+    return aw.toOwnedSlice();
+}
+
+// ---------------------------------------------------------------------------
 // AddPermission / RemovePermission (v0.3.2)
 
 pub const AddPermissionRequest = struct {

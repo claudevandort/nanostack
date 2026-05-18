@@ -728,6 +728,10 @@ dynamo_tables: std.StringHashMapUnmanaged(*storage.TableSlot),
 /// the slot itself). Persistence layout:
 /// `<base>/sqs/queues/<name>/{attributes,tags}.json` + messages dir.
 sqs_queues: std.StringHashMapUnmanaged(*storage.SqsQueueSlot),
+/// MessageMoveTask records (v0.3.2). In-memory only; not persisted
+/// across restart (matches DDB Streams ring-buffer precedent).
+/// Newest-first ordering is established at append time.
+sqs_message_move_tasks: std.ArrayListUnmanaged(*storage.MessageMoveTask),
 /// TTL sweeper state (v0.2.3). The thread runs `ttlSweepLoop` until
 /// `sweeper_stop` is set; on each tick it scans every TTL-enabled
 /// table and evicts expired items.
@@ -785,6 +789,7 @@ pub fn initWithOptions(allocator: Allocator, io: Io, base_dir: []const u8, opts:
         .restored_objects = .empty,
         .dynamo_tables = .empty,
         .sqs_queues = .empty,
+        .sqs_message_move_tasks = .empty,
         .ttl_sweep_interval_secs = opts.ttl_sweep_interval_seconds,
         .sweeper_thread = null,
         .sweeper_stop = .init(false),
@@ -840,6 +845,11 @@ pub fn deinit(self: *Fs) void {
         }
         self.sqs_queues.deinit(self.allocator);
     }
+    for (self.sqs_message_move_tasks.items) |t| {
+        t.deinit(self.allocator);
+        self.allocator.destroy(t);
+    }
+    self.sqs_message_move_tasks.deinit(self.allocator);
     self.allocator.free(self.base_dir);
     self.allocator.destroy(self);
 }
@@ -880,6 +890,9 @@ const sqs_vtable: storage.SqsBackend.VTable = .{
     .listDeadLetterSourceQueues = vtSqsListDeadLetterSourceQueues,
     .addPermission = vtSqsAddPermission,
     .removePermission = vtSqsRemovePermission,
+    .startMessageMoveTask = vtSqsStartMessageMoveTask,
+    .cancelMessageMoveTask = vtSqsCancelMessageMoveTask,
+    .listMessageMoveTasks = vtSqsListMessageMoveTasks,
 };
 
 fn vtSqsCreateQueue(ctx: *anyopaque, in: storage.CreateQueueInput) storage.Error!*const storage.SqsQueueSlot {
@@ -932,6 +945,15 @@ fn vtSqsAddPermission(ctx: *anyopaque, in: storage.AddPermissionInput) storage.E
 }
 fn vtSqsRemovePermission(ctx: *anyopaque, in: storage.RemovePermissionInput) storage.Error!void {
     return sqsRemovePermission(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtSqsStartMessageMoveTask(ctx: *anyopaque, allocator: Allocator, in: storage.StartMessageMoveTaskInput) storage.Error!storage.StartMessageMoveTaskOutput {
+    return sqsStartMessageMoveTask(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtSqsCancelMessageMoveTask(ctx: *anyopaque, in: storage.CancelMessageMoveTaskInput) storage.Error!storage.CancelMessageMoveTaskOutput {
+    return sqsCancelMessageMoveTask(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtSqsListMessageMoveTasks(ctx: *anyopaque, allocator: Allocator, in: storage.ListMessageMoveTasksInput) storage.Error!storage.ListMessageMoveTasksOutput {
+    return sqsListMessageMoveTasks(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 
 const dynamo_vtable: storage.DynamoBackend.VTable = .{
@@ -6756,6 +6778,134 @@ pub fn sqsListDeadLetterSourceQueues(self: *Fs, allocator: Allocator, in: storag
         }
     }.lt);
     return .{ .queue_names = names.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory };
+}
+
+// ---------------------------------------------------------------------------
+// MessageMoveTask trio (v0.3.2)
+//
+// Synchronous execution model: StartMessageMoveTask drains every
+// message from the source DLQ into the destination at call time, then
+// records a COMPLETED task. Cancel + List operate on the recorded
+// snapshots. Tasks are in-memory only (matches DDB Streams precedent).
+
+pub fn sqsStartMessageMoveTask(self: *Fs, allocator: Allocator, in: storage.StartMessageMoveTaskInput) storage.Error!storage.StartMessageMoveTaskOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const src = self.sqs_queues.get(in.source_name) orelse return storage.Error.QueueNotFound;
+    const dst = self.sqs_queues.get(in.destination_name) orelse return storage.Error.QueueNotFound;
+
+    // Snapshot the count before the drain.
+    const to_move: u64 = @intCast(src.messages.items.len);
+
+    // Move each message: re-send to destination, remove from source.
+    var moved: u64 = 0;
+    // Drain front-to-back; orderedRemove + index walk handles it.
+    while (src.messages.items.len > 0) {
+        const m = src.messages.items[0];
+        _ = src.messages.orderedRemove(0);
+
+        // Delete the source's on-disk file.
+        var src_path_buf: [4096]u8 = undefined;
+        const src_path = messagePath(self, src.name, m.id, &src_path_buf) catch {
+            // Failed before we lost track of the message — push it back.
+            src.messages.insert(self.allocator, 0, m) catch return storage.Error.OutOfMemory;
+            return storage.Error.Io;
+        };
+        Io.Dir.cwd().deleteFile(self.io, src_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => {},
+        };
+
+        // Reset receive_count + visible_unix for the new queue.
+        m.receive_count = 0;
+        m.visible_unix = nowUnixSeconds(self.io);
+
+        // Write to destination's messages dir.
+        writeMessageJson(self, dst.name, m) catch {
+            // Re-attach to source so we don't lose the message entirely.
+            src.messages.insert(self.allocator, 0, m) catch return storage.Error.OutOfMemory;
+            return storage.Error.Io;
+        };
+        dst.messages.append(self.allocator, m) catch return storage.Error.OutOfMemory;
+        moved += 1;
+    }
+
+    // Record the task.
+    const handle = generateMessageId(self.allocator, self.io) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(handle);
+
+    const task_ptr = self.allocator.create(storage.MessageMoveTask) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.destroy(task_ptr);
+
+    task_ptr.* = .{
+        .task_handle = handle,
+        .source_arn = self.allocator.dupe(u8, in.source_arn) catch return storage.Error.OutOfMemory,
+        .destination_arn = self.allocator.dupe(u8, in.destination_arn) catch return storage.Error.OutOfMemory,
+        .approximate_messages_to_move = to_move,
+        .approximate_messages_moved = moved,
+        .status = .COMPLETED,
+        .started_unix = nowUnixSeconds(self.io),
+        .failure_reason = null,
+    };
+    self.sqs_message_move_tasks.append(self.allocator, task_ptr) catch return storage.Error.OutOfMemory;
+
+    return .{ .task_handle = allocator.dupe(u8, handle) catch return storage.Error.OutOfMemory };
+}
+
+pub fn sqsCancelMessageMoveTask(self: *Fs, in: storage.CancelMessageMoveTaskInput) storage.Error!storage.CancelMessageMoveTaskOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    for (self.sqs_message_move_tasks.items) |t| {
+        if (std.mem.eql(u8, t.task_handle, in.task_handle)) {
+            // For RUNNING tasks (never happens in our sync model) we'd
+            // flip to CANCELLED. For already-COMPLETED tasks AWS still
+            // returns the moved count, no mutation.
+            return .{ .approximate_number_of_messages_moved = t.approximate_messages_moved };
+        }
+    }
+    return storage.Error.InvalidParameterValue;
+}
+
+pub fn sqsListMessageMoveTasks(self: *Fs, allocator: Allocator, in: storage.ListMessageMoveTasksInput) storage.Error!storage.ListMessageMoveTasksOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    var rows: std.ArrayList(storage.MessageMoveTaskRow) = .empty;
+    errdefer {
+        for (rows.items) |r| {
+            allocator.free(r.task_handle);
+            allocator.free(r.source_arn);
+            allocator.free(r.destination_arn);
+            if (r.failure_reason) |fr| allocator.free(fr);
+        }
+        rows.deinit(allocator);
+    }
+
+    const cap = @min(@as(usize, in.max_results), 10);
+    // Iterate newest-first.
+    var i: usize = self.sqs_message_move_tasks.items.len;
+    while (i > 0 and rows.items.len < cap) {
+        i -= 1;
+        const t = self.sqs_message_move_tasks.items[i];
+        if (!std.mem.eql(u8, t.source_arn, in.source_arn)) continue;
+        const row: storage.MessageMoveTaskRow = .{
+            .task_handle = allocator.dupe(u8, t.task_handle) catch return storage.Error.OutOfMemory,
+            .source_arn = allocator.dupe(u8, t.source_arn) catch return storage.Error.OutOfMemory,
+            .destination_arn = allocator.dupe(u8, t.destination_arn) catch return storage.Error.OutOfMemory,
+            .status = t.status.toAwsString(),
+            .approximate_messages_to_move = t.approximate_messages_to_move,
+            .approximate_messages_moved = t.approximate_messages_moved,
+            .started_unix = t.started_unix,
+            .failure_reason = if (t.failure_reason) |fr|
+                (allocator.dupe(u8, fr) catch return storage.Error.OutOfMemory)
+            else
+                null,
+        };
+        rows.append(allocator, row) catch return storage.Error.OutOfMemory;
+    }
+    return .{ .tasks = rows.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory };
 }
 
 pub fn sqsChangeMessageVisibility(self: *Fs, in: storage.ChangeMessageVisibilityInput) storage.Error!void {

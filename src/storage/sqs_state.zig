@@ -141,6 +141,57 @@ pub const Message = struct {
     }
 };
 
+/// MessageMoveTask state (v0.3.2). Task records sit on `Fs` in an
+/// ArrayList; they're in-memory only (same precedent as DDB Streams).
+/// Tasks execute synchronously on Start so they're always immediately
+/// COMPLETED — the API surface matches AWS but Cancel is effectively a
+/// no-op for completed tasks.
+pub const MessageMoveTaskStatus = enum {
+    RUNNING,
+    COMPLETED,
+    FAILED,
+    CANCELLED,
+
+    pub fn toAwsString(self: MessageMoveTaskStatus) []const u8 {
+        return switch (self) {
+            .RUNNING => "RUNNING",
+            .COMPLETED => "COMPLETED",
+            .FAILED => "FAILED",
+            .CANCELLED => "CANCELLED",
+        };
+    }
+};
+
+pub const MessageMoveTask = struct {
+    /// Opaque task handle, ULID-shaped. Owned by `Fs.allocator`.
+    task_handle: []const u8,
+    /// Source DLQ ARN (the queue being drained).
+    source_arn: []const u8,
+    /// Destination queue ARN. AWS allows null (= "auto-derive from
+    /// RedrivePolicy"), but for the simple case we always require an
+    /// explicit destination at the storage layer; the handler can
+    /// derive it from the DLQ's source.
+    destination_arn: []const u8,
+    /// Approximate number of messages we expected to move at Start
+    /// time (snapshot of the source queue length).
+    approximate_messages_to_move: u64,
+    /// Number of messages actually moved.
+    approximate_messages_moved: u64,
+    /// Synchronous execution → always immediately COMPLETED.
+    status: MessageMoveTaskStatus,
+    /// Wall-clock seconds when the task was started.
+    started_unix: i64,
+    /// Reason string when status is FAILED. Owned by `Fs.allocator`.
+    failure_reason: ?[]const u8 = null,
+
+    pub fn deinit(self: *MessageMoveTask, allocator: Allocator) void {
+        allocator.free(self.task_handle);
+        allocator.free(self.source_arn);
+        allocator.free(self.destination_arn);
+        if (self.failure_reason) |s| allocator.free(s);
+    }
+};
+
 /// Validate an SQS queue name per AWS rules:
 ///   - 1..=80 chars total (FIFO suffix `.fifo` counts)
 ///   - alphanumeric + `_` + `-`
