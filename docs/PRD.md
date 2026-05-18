@@ -335,17 +335,34 @@ Time estimate end-to-end: **~6 weeks** with focused effort, assuming the foundat
 
 ---
 
-## 15. Post-v1 Roadmap (directional only — no commitments)
+## 15. Roadmap — state of the project (2026-05-18, post-v0.3.1)
 
-The order is informed by both *user demand* and *how cleanly the service shares infrastructure with what we already have*.
+The original §15 ordering (S3 v1.1 → SQS → DDB → Lambda) anchored against pre-v0.1 scope. As of v0.3.1, three services have shipped — most of the original v1.x roadmap is already done. This section is rewritten as a live state-of-the-world.
 
-1. **v1.1 — S3 versioning + tagging + ACLs/policies.** Closes the biggest S3 gaps left by v1.
-2. **v1.2 — SQS.** Small surface, exercises long-polling and request cancellation. Good second service to validate the abstractions.
-3. **v1.3 — DynamoDB.** The other foundational service; pulls in conditional expressions (real parser work, but worth it).
-4. **v1.4 — Lambda + S3 → Lambda event notifications.** The first cross-service wiring. Forces us to design the event bus abstraction.
-5. **v2 — Windows support.** Requires either swapping the HTTP server (likely `http.zig`) or contributing Windows support upstream to zap.
+### Where each service stands
 
-Anything beyond that (SNS, EventBridge, Kinesis, IAM) is reconsidered after v1.4 lands.
+**S3 — comprehensive.** 68/107 Smithy ops. v1 must-have done (M1–M14, plus the v1.1 trio of versioning + tagging + ACL/policy/PAB enforcement and M12 Object Lock + WORM enforcement). M11 bucket configurations (CORS / encryption / lifecycle / notification / website) are **accept-store-roundtrip only** — rules never expire, no actual cipher, events never fire, website-mode requests not served. ~39 deferred ops (metrics / inventory / analytics CRUDs, S3 Express, Object Lambda, Select, BitTorrent, bucket metadata tables) are explicitly post-v1 — not on the roadmap unless a user files a real gap.
+
+**DynamoDB — comprehensive.** 18 base ops + DynamoDBStreams sub-service + TTL sweeper + PartiQL (ExecuteStatement / ExecuteTransaction / BatchExecuteStatement) + Backups (5 ops) + PITR (3 ops). Imports/Exports + Global Tables + DAX are out of scope. Parallel scan (`TotalSegments > 1`) returns ValidationException.
+
+**SQS — solid for Standard + FIFO ordering, but with known robustness gaps.** 17 ops; FIFO with MessageGroupId, MessageDeduplicationId / ContentBasedDeduplication 5-minute window, monotonic per-queue SequenceNumber, per-group head-of-line blocking. **Gaps** (see `docs/SUPPORT.md` § SQS): 6 unrouted ops (`AddPermission` / `RemovePermission` / `ListDeadLetterSourceQueues` / 3× `MessageMoveTask`); MessageRetentionPeriod configured but not enforced; Queue Policy attribute accept-store-roundtrip only; FIFO dedup history not persisted across restart; cold-start message rehydration not wired (SUPPORT.md claims it works, but `loadSingleQueue` only reloads attrs + tags).
+
+### Cross-service wiring — NOT YET STARTED
+
+Nothing fires across service boundaries. `PutBucketNotificationConfiguration` accepts S3 → SQS / Lambda / SNS targets but no events fire on PutObject / DeleteObject / Copy / CompleteMultipartUpload. DynamoDB Streams emits to its own `GetRecords` API but doesn't push to SQS or Lambda. This is the **v1.0 inflection point** — "multi-service workflow-ready" requires at minimum S3 → SQS notifications to work end-to-end, because that's the canonical local-dev serverless workflow (upload object → message in queue → worker picks up).
+
+### Recommended trajectory toward v1.0
+
+| Version | Scope | Why this order |
+|---|---|---|
+| **v0.3.2 — SQS robustness** | Cold-start message rehydration; MessageRetentionPeriod sweeper; ListDeadLetterSourceQueues (cheap free win). | Closes the SUPPORT.md ↔ behaviour drift before piling on new features. Bug-fix first. (Patch.) |
+| **v0.3.3 — SQS surface completion** | AddPermission / RemovePermission + Queue Policy evaluation hook (mirroring the S3 authz pattern); StartMessageMoveTask / Cancel / List trio. | SQS becomes "fully implemented" before next minor. (Patch.) |
+| **v0.3.4 — S3 → SQS event notifications** | Wire `PutBucketNotificationConfiguration` QueueConfiguration entries to actually fire on PutObject / DeleteObject / Copy / CompleteMultipartUpload, with prefix/suffix filter eval and AWS-format event envelope. | **The strategic unlock.** Most of the wire surface already exists. Unblocks the canonical local-dev serverless workflow. Architecturally the same pattern future DDB Streams → SQS and Lambda triggers will reuse. (Patch — no new service.) |
+| **v0.4.0 — SNS** | ~10 ops (CreateTopic / Subscribe / Publish / etc.). Wire SNS → SQS subscriptions so fan-out works locally. Add S3 → SNS as a notification target. | First minor since v0.3.0 SQS. Small surface, natural fit with the event-notification work. (Minor.) |
+| **v0.5.0 — Lambda** | Function CRUD + Invoke + S3 / SQS / DDB-Streams event-source mappings. Likely a sidecar-process execution model (we don't host an in-Zig runtime). | The big multi-service hop. Highest payoff for the v1.0 claim. (Minor.) |
+| **v1.0.0 — Polish + multi-profile + bench** | Multi-profile state isolation (deferred from v1 per §17a); end-to-end performance pass against the broader surface; documented "production local-dev surface". | "Curated multi-service surface workflow-ready." Stabilization, not new features. (Major.) |
+
+**Deferred indefinitely:** TLS (still §17 open question; revisit if browser-driven presigned-URL workflows surface user demand), Windows (post-v1 per §2 non-goals), FIFO high-throughput mode, S3 Express / Object Lambda / Select, EventBridge, Kinesis, IAM, AWS Console emulation.
 
 ---
 
