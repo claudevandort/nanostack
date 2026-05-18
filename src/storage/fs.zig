@@ -7075,6 +7075,8 @@ const sns_vtable: storage.SnsBackend.VTable = .{
     .tagTopic = vtSnsTagTopic,
     .untagTopic = vtSnsUntagTopic,
     .listTopicTags = vtSnsListTopicTags,
+    .addPermission = vtSnsAddPermission,
+    .removePermission = vtSnsRemovePermission,
 };
 
 fn vtSnsCreateTopic(ctx: *anyopaque, in: storage.CreateTopicInput) storage.Error!*const storage.SnsTopicSlot {
@@ -7726,6 +7728,66 @@ pub fn snsListTopicTags(self: *Fs, allocator: Allocator, topic_name: []const u8)
         };
     }
     return .{ .tags = out };
+}
+
+// ---------------------------------------------------------------------------
+// SNS permissions (Phase B, v0.4.1)
+
+fn vtSnsAddPermission(ctx: *anyopaque, in: storage.SnsAddPermissionInput) storage.Error!void {
+    return snsAddPermission(@ptrCast(@alignCast(ctx)), in);
+}
+
+fn vtSnsRemovePermission(ctx: *anyopaque, in: storage.SnsRemovePermissionInput) storage.Error!void {
+    return snsRemovePermission(@ptrCast(@alignCast(ctx)), in);
+}
+
+pub fn snsAddPermission(self: *Fs, in: storage.SnsAddPermissionInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const slot = self.sns_topics.get(in.topic_name) orelse return storage.Error.TopicNotFound;
+
+    if (slot.attrs.policy) |existing| {
+        if (statementExists(existing, in.label)) return storage.Error.InvalidParameterValue;
+    }
+
+    // Adapt SQS AddPermissionInput → buildPolicyAdd. The helper only
+    // touches label/aws_account_ids/actions/queue_arn (resource), so
+    // we map topic_arn → queue_arn for the helper.
+    const sqs_shaped: storage.AddPermissionInput = .{
+        .queue_name = in.topic_name,
+        .label = in.label,
+        .aws_account_ids = in.aws_account_ids,
+        .actions = in.actions,
+        .queue_arn = in.topic_arn,
+    };
+    const new_policy = buildPolicyAdd(self.allocator, slot.attrs.policy, sqs_shaped) catch |err| switch (err) {
+        error.OutOfMemory => return storage.Error.OutOfMemory,
+        else => return storage.Error.InvalidParameterValue,
+    };
+    if (slot.attrs.policy) |old| self.allocator.free(old);
+    slot.attrs.policy = new_policy;
+    writeTopicAttrs(self, slot) catch return storage.Error.Io;
+}
+
+pub fn snsRemovePermission(self: *Fs, in: storage.SnsRemovePermissionInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const slot = self.sns_topics.get(in.topic_name) orelse return storage.Error.TopicNotFound;
+    const existing = slot.attrs.policy orelse return storage.Error.InvalidParameterValue;
+
+    const result = buildPolicyRemove(self.allocator, existing, in.label) catch |err| switch (err) {
+        error.OutOfMemory => return storage.Error.OutOfMemory,
+        error.LabelNotFound, error.MalformedExistingPolicy => return storage.Error.InvalidParameterValue,
+        else => return storage.Error.Io,
+    };
+    self.allocator.free(slot.attrs.policy.?);
+    if (result.kept == 0) {
+        if (result.body) |b| self.allocator.free(b);
+        slot.attrs.policy = null;
+    } else {
+        slot.attrs.policy = result.body.?;
+    }
+    writeTopicAttrs(self, slot) catch return storage.Error.Io;
 }
 
 fn loadSubscriptionsForTopic(self: *Fs, slot: *storage.SnsTopicSlot) !void {

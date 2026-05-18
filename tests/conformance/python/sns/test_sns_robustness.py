@@ -157,3 +157,88 @@ def test_retag_after_restart_works(restartable):
     out = sns_b.list_tags_for_resource(ResourceArn=arn)
     tags = {t["Key"]: t["Value"] for t in out["Tags"]}
     assert tags == {"env": "prod"}
+
+
+# ---------- Phase B — AddPermission / RemovePermission ----------
+
+
+def test_add_permission_creates_policy(sns):
+    arn = sns.create_topic(Name=f"t_{secrets.token_hex(4)}")["TopicArn"]
+    try:
+        sns.add_permission(
+            TopicArn=arn, Label="grant1",
+            AWSAccountId=["111122223333"], ActionName=["Publish"],
+        )
+        attrs = sns.get_topic_attributes(TopicArn=arn)["Attributes"]
+        policy = attrs.get("Policy")
+        assert policy is not None
+        assert "grant1" in policy
+        assert "111122223333" in policy
+        assert "sns:Publish" in policy
+    finally:
+        sns.delete_topic(TopicArn=arn)
+
+
+def test_add_permission_appends_to_existing(sns):
+    arn = sns.create_topic(Name=f"t_{secrets.token_hex(4)}")["TopicArn"]
+    try:
+        sns.add_permission(
+            TopicArn=arn, Label="grant1",
+            AWSAccountId=["111122223333"], ActionName=["Publish"],
+        )
+        sns.add_permission(
+            TopicArn=arn, Label="grant2",
+            AWSAccountId=["444455556666"], ActionName=["Subscribe"],
+        )
+        policy = sns.get_topic_attributes(TopicArn=arn)["Attributes"]["Policy"]
+        assert "grant1" in policy
+        assert "grant2" in policy
+        assert "sns:Publish" in policy
+        assert "sns:Subscribe" in policy
+    finally:
+        sns.delete_topic(TopicArn=arn)
+
+
+def test_add_permission_duplicate_label_rejected(sns):
+    arn = sns.create_topic(Name=f"t_{secrets.token_hex(4)}")["TopicArn"]
+    try:
+        sns.add_permission(
+            TopicArn=arn, Label="grant1",
+            AWSAccountId=["111122223333"], ActionName=["Publish"],
+        )
+        with pytest.raises(botocore.exceptions.ClientError) as exc:
+            sns.add_permission(
+                TopicArn=arn, Label="grant1",
+                AWSAccountId=["444455556666"], ActionName=["Subscribe"],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameter"
+    finally:
+        sns.delete_topic(TopicArn=arn)
+
+
+def test_remove_permission_drops_matching(sns):
+    arn = sns.create_topic(Name=f"t_{secrets.token_hex(4)}")["TopicArn"]
+    try:
+        sns.add_permission(TopicArn=arn, Label="g1",
+                           AWSAccountId=["111122223333"], ActionName=["Publish"])
+        sns.add_permission(TopicArn=arn, Label="g2",
+                           AWSAccountId=["444455556666"], ActionName=["Subscribe"])
+        sns.remove_permission(TopicArn=arn, Label="g1")
+        policy = sns.get_topic_attributes(TopicArn=arn)["Attributes"]["Policy"]
+        assert "g1" not in policy
+        assert "g2" in policy
+    finally:
+        sns.delete_topic(TopicArn=arn)
+
+
+def test_remove_permission_clears_policy_when_empty(sns):
+    arn = sns.create_topic(Name=f"t_{secrets.token_hex(4)}")["TopicArn"]
+    try:
+        sns.add_permission(TopicArn=arn, Label="g1",
+                           AWSAccountId=["111122223333"], ActionName=["Publish"])
+        sns.remove_permission(TopicArn=arn, Label="g1")
+        attrs = sns.get_topic_attributes(TopicArn=arn)["Attributes"]
+        # Policy attribute is gone after the last statement is removed.
+        assert "Policy" not in attrs or not attrs["Policy"]
+    finally:
+        sns.delete_topic(TopicArn=arn)

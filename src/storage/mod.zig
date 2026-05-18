@@ -2252,6 +2252,24 @@ pub const ListTopicTagsOutput = struct {
     tags: []const Tag,
 };
 
+/// SNS AddPermission (v0.4.1). Mirrors SqsBackend AddPermissionInput
+/// but with a topic ARN as the resource.
+pub const SnsAddPermissionInput = struct {
+    topic_name: []const u8,
+    label: []const u8,
+    aws_account_ids: []const []const u8,
+    /// `sns:Foo` action names (handler adds the prefix from the raw
+    /// wire action name).
+    actions: []const []const u8,
+    /// Topic ARN, built by the handler.
+    topic_arn: []const u8,
+};
+
+pub const SnsRemovePermissionInput = struct {
+    topic_name: []const u8,
+    label: []const u8,
+};
+
 pub const SnsBackend = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -2278,6 +2296,9 @@ pub const SnsBackend = struct {
         tagTopic: *const fn (ctx: *anyopaque, in: TagTopicInput) Error!void,
         untagTopic: *const fn (ctx: *anyopaque, in: UntagTopicInput) Error!void,
         listTopicTags: *const fn (ctx: *anyopaque, allocator: Allocator, topic_name: []const u8) Error!ListTopicTagsOutput,
+        // v0.4.1: Permissions (Policy-attribute mutation).
+        addPermission: *const fn (ctx: *anyopaque, in: SnsAddPermissionInput) Error!void,
+        removePermission: *const fn (ctx: *anyopaque, in: SnsRemovePermissionInput) Error!void,
     };
 
     pub fn createTopic(self: SnsBackend, in: CreateTopicInput) Error!*const SnsTopicSlot {
@@ -2330,6 +2351,12 @@ pub const SnsBackend = struct {
     }
     pub fn listTopicTags(self: SnsBackend, allocator: Allocator, topic_name: []const u8) Error!ListTopicTagsOutput {
         return self.vtable.listTopicTags(self.ctx, allocator, topic_name);
+    }
+    pub fn addPermission(self: SnsBackend, in: SnsAddPermissionInput) Error!void {
+        return self.vtable.addPermission(self.ctx, in);
+    }
+    pub fn removePermission(self: SnsBackend, in: SnsRemovePermissionInput) Error!void {
+        return self.vtable.removePermission(self.ctx, in);
     }
 };
 
