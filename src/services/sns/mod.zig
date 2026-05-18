@@ -13,6 +13,7 @@ const params_mod = @import("../../wire/sns/params.zig");
 const principal_mod = @import("../../auth/principal.zig");
 const topics_handler = @import("topics.zig");
 const subs_handler = @import("subscriptions.zig");
+const publish_handler = @import("publish.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -74,6 +75,10 @@ pub fn handle(ctx: Context) Result {
     if (std.mem.eql(u8, action, "GetSubscriptionAttributes")) return subs_handler.getSubscriptionAttributes(ctx);
     if (std.mem.eql(u8, action, "SetSubscriptionAttributes")) return subs_handler.setSubscriptionAttributes(ctx);
     if (std.mem.eql(u8, action, "ConfirmSubscription")) return subs_handler.confirmSubscription(ctx);
+
+    // Publish (Phase D).
+    if (std.mem.eql(u8, action, "Publish")) return publish_handler.publish(ctx);
+    if (std.mem.eql(u8, action, "PublishBatch")) return publish_handler.publishBatch(ctx);
 
     return .{ .err = .{
         .code = .invalid_action,

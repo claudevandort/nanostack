@@ -7113,16 +7113,10 @@ fn vtSnsConfirmSubscription(ctx: *anyopaque, allocator: Allocator, in: storage.C
     return snsConfirmSubscription(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 fn vtSnsPublish(ctx: *anyopaque, allocator: Allocator, in: storage.PublishInput) storage.Error!storage.PublishOutput {
-    _ = ctx;
-    _ = allocator;
-    _ = in;
-    return storage.Error.InvalidParameterValue;
+    return snsPublish(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 fn vtSnsPublishBatch(ctx: *anyopaque, allocator: Allocator, in: storage.PublishBatchInput) storage.Error!storage.PublishBatchOutput {
-    _ = ctx;
-    _ = allocator;
-    _ = in;
-    return storage.Error.InvalidParameterValue;
+    return snsPublishBatch(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 fn vtSnsTagTopic(ctx: *anyopaque, in: storage.TagTopicInput) storage.Error!void {
     _ = ctx;
@@ -7456,6 +7450,185 @@ pub fn snsConfirmSubscription(self: *Fs, allocator: Allocator, in: storage.Confi
     // No pending sub — return a synthetic ARN (matches nothing-to-do
     // semantics). This branch is rarely hit since SQS subs auto-confirm.
     return storage.Error.SubscriptionNotFound;
+}
+
+/// SNS Publish (Phase D). Fan-out to every SQS subscriber. Builds the
+/// SNS envelope JSON (or sends raw Message bytes for subs with
+/// RawMessageDelivery=true). Returns the SNS MessageId.
+pub fn snsPublish(self: *Fs, allocator: Allocator, in: storage.PublishInput) storage.Error!storage.PublishOutput {
+    self.mutex.lockUncancelable(self.io);
+    const slot = self.sns_topics.get(in.topic_name) orelse {
+        self.mutex.unlock(self.io);
+        return storage.Error.TopicNotFound;
+    };
+
+    const message_id = generateSubId(self.allocator, self.io) catch {
+        self.mutex.unlock(self.io);
+        return storage.Error.OutOfMemory;
+    };
+    errdefer self.allocator.free(message_id);
+
+    // Build the SNS envelope JSON once; we'll send it (or the raw
+    // Message) to each subscriber.
+    const envelope = buildSnsEnvelope(allocator, .{
+        .message_id = message_id,
+        .topic_arn = slot.arn,
+        .subject = in.subject,
+        .message = in.message,
+        .message_attributes_json = in.message_attributes_json,
+    }) catch {
+        self.mutex.unlock(self.io);
+        return storage.Error.OutOfMemory;
+    };
+
+    // Snapshot the subs (we drop the mutex before reaching into SQS).
+    var sub_refs: std.ArrayList(*const storage.Subscription) = .empty;
+    defer sub_refs.deinit(allocator);
+    for (slot.subscriptions.items) |s| {
+        sub_refs.append(allocator, s) catch {
+            self.mutex.unlock(self.io);
+            return storage.Error.OutOfMemory;
+        };
+    }
+    self.mutex.unlock(self.io);
+
+    // Deliver to each SQS subscriber. Non-SQS subs are skipped silently.
+    for (sub_refs.items) |s| {
+        if (s.protocol != .sqs) continue;
+        const queue_name = extractQueueNameFromArn(s.endpoint) orelse continue;
+        const body = if (s.raw_message_delivery) in.message else envelope;
+        const out = sqsSendMessage(self, allocator, .{
+            .queue_name = queue_name,
+            .body = body,
+        }) catch |err| {
+            std.log.warn("sns: failed to deliver to {s}: {s}", .{ queue_name, @errorName(err) });
+            continue;
+        };
+        allocator.free(out.message_id);
+        allocator.free(out.md5_of_body);
+    }
+
+    return .{ .message_id = allocator.dupe(u8, message_id) catch return storage.Error.OutOfMemory };
+}
+
+fn extractQueueNameFromArn(arn: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, arn, "arn:aws:sqs:")) return null;
+    const last = std.mem.lastIndexOfScalar(u8, arn, ':') orelse return null;
+    if (last + 1 >= arn.len) return null;
+    return arn[last + 1 ..];
+}
+
+const SnsEnvelopeArgs = struct {
+    message_id: []const u8,
+    topic_arn: []const u8,
+    subject: ?[]const u8,
+    message: []const u8,
+    message_attributes_json: ?[]const u8,
+};
+
+fn buildSnsEnvelope(allocator: Allocator, args: SnsEnvelopeArgs) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    try s.objectField("Type");
+    try s.write("Notification");
+    try s.objectField("MessageId");
+    try s.write(args.message_id);
+    try s.objectField("TopicArn");
+    try s.write(args.topic_arn);
+    if (args.subject) |subj| {
+        try s.objectField("Subject");
+        try s.write(subj);
+    }
+    try s.objectField("Message");
+    try s.write(args.message);
+    try s.objectField("Timestamp");
+    var ts_buf: [40]u8 = undefined;
+    try s.write(isoNowUtc(&ts_buf));
+    try s.objectField("SignatureVersion");
+    try s.write("1");
+    try s.objectField("Signature");
+    try s.write("nanostack-stub");
+    try s.objectField("SigningCertURL");
+    try s.write("https://nanostack.local/cert.pem");
+    if (args.message_attributes_json) |attrs| {
+        try s.objectField("MessageAttributes");
+        // Re-parse + re-emit so the parser tracks state correctly.
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, attrs, .{}) catch {
+            try s.beginObject();
+            try s.endObject();
+            try s.endObject();
+            return aw.toOwnedSlice();
+        };
+        defer parsed.deinit();
+        try s.write(parsed.value);
+    }
+    try s.endObject();
+    return aw.toOwnedSlice();
+}
+
+fn isoNowUtc(buf: *[40]u8) []const u8 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+    const secs = ts.sec;
+    const millis: u32 = @intCast(@divFloor(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms));
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
+    const day_secs = epoch.getDaySeconds();
+    const year_day = epoch.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+        @as(u32, year_day.year),
+        month_day.month.numeric(),
+        @as(u32, month_day.day_index) + 1,
+        day_secs.getHoursIntoDay(),
+        day_secs.getMinutesIntoHour(),
+        day_secs.getSecondsIntoMinute(),
+        millis,
+    }) catch buf[0..];
+}
+
+pub fn snsPublishBatch(self: *Fs, allocator: Allocator, in: storage.PublishBatchInput) storage.Error!storage.PublishBatchOutput {
+    var successful: std.ArrayList(storage.PublishBatchSuccess) = .empty;
+    var failed: std.ArrayList(storage.PublishBatchFailure) = .empty;
+    errdefer {
+        for (successful.items) |s| {
+            allocator.free(s.id);
+            allocator.free(s.message_id);
+        }
+        successful.deinit(allocator);
+        for (failed.items) |f| {
+            allocator.free(f.id);
+            allocator.free(f.code);
+            allocator.free(f.message);
+        }
+        failed.deinit(allocator);
+    }
+    for (in.entries) |entry| {
+        const out = snsPublish(self, allocator, .{
+            .topic_name = in.topic_name,
+            .message = entry.message,
+            .subject = entry.subject,
+            .message_attributes_json = entry.message_attributes_json,
+        }) catch |err| {
+            const code = if (err == storage.Error.TopicNotFound) "NotFound" else "InternalFailure";
+            failed.append(allocator, .{
+                .id = allocator.dupe(u8, entry.id) catch return storage.Error.OutOfMemory,
+                .code = allocator.dupe(u8, code) catch return storage.Error.OutOfMemory,
+                .message = allocator.dupe(u8, @errorName(err)) catch return storage.Error.OutOfMemory,
+                .sender_fault = true,
+            }) catch return storage.Error.OutOfMemory;
+            continue;
+        };
+        successful.append(allocator, .{
+            .id = allocator.dupe(u8, entry.id) catch return storage.Error.OutOfMemory,
+            .message_id = out.message_id,
+        }) catch return storage.Error.OutOfMemory;
+    }
+    return .{
+        .successful = successful.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory,
+        .failed = failed.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory,
+    };
 }
 
 fn loadSubscriptionsForTopic(self: *Fs, slot: *storage.SnsTopicSlot) !void {
