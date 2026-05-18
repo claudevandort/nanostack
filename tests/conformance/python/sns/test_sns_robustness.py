@@ -326,3 +326,130 @@ def test_publish_batch_entry_without_attrs(sns, sqs):
     finally:
         sns.delete_topic(TopicArn=topic_arn)
         sqs.delete_queue(QueueUrl=queue_url)
+
+
+# ---------- Phase D — Filter policy evaluation ----------
+
+
+def _setup_filter_topic(sns, sqs, filter_policy: dict | None = None):
+    """Create topic + queue + SQS sub. Optionally attach a FilterPolicy."""
+    tname = f"t_{secrets.token_hex(4)}"
+    qname = f"q_{secrets.token_hex(4)}"
+    topic_arn = sns.create_topic(Name=tname)["TopicArn"]
+    queue_url = sqs.create_queue(QueueName=qname)["QueueUrl"]
+    queue_arn = f"arn:aws:sqs:us-east-1:000000000000:{qname}"
+    sub_arn = sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)["SubscriptionArn"]
+    if filter_policy is not None:
+        sns.set_subscription_attributes(
+            SubscriptionArn=sub_arn,
+            AttributeName="FilterPolicy",
+            AttributeValue=json.dumps(filter_policy),
+        )
+    return topic_arn, queue_url, sub_arn
+
+
+def test_no_filter_policy_delivers_everything(sns, sqs):
+    topic_arn, queue_url, _ = _setup_filter_topic(sns, sqs)
+    try:
+        sns.publish(TopicArn=topic_arn, Message="hi")
+        msgs = _drain(sqs, queue_url)
+        assert len(msgs) == 1
+    finally:
+        sns.delete_topic(TopicArn=topic_arn)
+        sqs.delete_queue(QueueUrl=queue_url)
+
+
+def test_filter_policy_match_delivers(sns, sqs):
+    topic_arn, queue_url, _ = _setup_filter_topic(
+        sns, sqs, filter_policy={"category": ["news"]},
+    )
+    try:
+        sns.publish(
+            TopicArn=topic_arn, Message="hi",
+            MessageAttributes={"category": {"DataType": "String", "StringValue": "news"}},
+        )
+        msgs = _drain(sqs, queue_url)
+        assert len(msgs) == 1
+    finally:
+        sns.delete_topic(TopicArn=topic_arn)
+        sqs.delete_queue(QueueUrl=queue_url)
+
+
+def test_filter_policy_mismatch_filters_out(sns, sqs):
+    topic_arn, queue_url, _ = _setup_filter_topic(
+        sns, sqs, filter_policy={"category": ["news"]},
+    )
+    try:
+        sns.publish(
+            TopicArn=topic_arn, Message="hi",
+            MessageAttributes={"category": {"DataType": "String", "StringValue": "sports"}},
+        )
+        msgs = _drain(sqs, queue_url, max_wait_s=2.0)
+        assert len(msgs) == 0
+    finally:
+        sns.delete_topic(TopicArn=topic_arn)
+        sqs.delete_queue(QueueUrl=queue_url)
+
+
+def test_filter_policy_array_or_semantics(sns, sqs):
+    topic_arn, queue_url, _ = _setup_filter_topic(
+        sns, sqs, filter_policy={"category": ["news", "sports"]},
+    )
+    try:
+        sns.publish(
+            TopicArn=topic_arn, Message="hi",
+            MessageAttributes={"category": {"DataType": "String", "StringValue": "sports"}},
+        )
+        msgs = _drain(sqs, queue_url)
+        assert len(msgs) == 1
+    finally:
+        sns.delete_topic(TopicArn=topic_arn)
+        sqs.delete_queue(QueueUrl=queue_url)
+
+
+def test_filter_policy_multiple_keys_and_semantics(sns, sqs):
+    topic_arn, queue_url, _ = _setup_filter_topic(
+        sns, sqs, filter_policy={"category": ["news"], "region": ["us"]},
+    )
+    try:
+        # Both attrs present + match → deliver.
+        sns.publish(
+            TopicArn=topic_arn, Message="ok",
+            MessageAttributes={
+                "category": {"DataType": "String", "StringValue": "news"},
+                "region": {"DataType": "String", "StringValue": "us"},
+            },
+        )
+        # Only one match → filter out.
+        sns.publish(
+            TopicArn=topic_arn, Message="no",
+            MessageAttributes={
+                "category": {"DataType": "String", "StringValue": "news"},
+                "region": {"DataType": "String", "StringValue": "eu"},
+            },
+        )
+        msgs = _drain(sqs, queue_url)
+        assert len(msgs) == 1
+        env = json.loads(msgs[0]["Body"])
+        assert env["Message"] == "ok"
+    finally:
+        sns.delete_topic(TopicArn=topic_arn)
+        sqs.delete_queue(QueueUrl=queue_url)
+
+
+def test_filter_policy_operator_treated_as_no_match(sns, sqs):
+    """v0.4.1 doesn't implement operator rules — they fail the rule.
+    Documented divergence."""
+    topic_arn, queue_url, _ = _setup_filter_topic(
+        sns, sqs, filter_policy={"category": [{"prefix": "news-"}]},
+    )
+    try:
+        sns.publish(
+            TopicArn=topic_arn, Message="hi",
+            MessageAttributes={"category": {"DataType": "String", "StringValue": "news-summary"}},
+        )
+        msgs = _drain(sqs, queue_url, max_wait_s=2.0)
+        assert len(msgs) == 0
+    finally:
+        sns.delete_topic(TopicArn=topic_arn)
+        sqs.delete_queue(QueueUrl=queue_url)

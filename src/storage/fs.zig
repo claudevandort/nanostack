@@ -6950,6 +6950,7 @@ pub fn sqsChangeMessageVisibility(self: *Fs, in: storage.ChangeMessageVisibility
 // subscriptions/<sub_id>.json}.
 
 const sns_state_mod = @import("sns_state.zig");
+const sns_filter = @import("../services/sns/filter.zig");
 
 fn ensureSnsDir(self: *Fs) !void {
     var buf: [4096]u8 = undefined;
@@ -7491,6 +7492,11 @@ pub fn snsPublish(self: *Fs, allocator: Allocator, in: storage.PublishInput) sto
     // Deliver to each SQS subscriber. Non-SQS subs are skipped silently.
     for (sub_refs.items) |s| {
         if (s.protocol != .sqs) continue;
+        // v0.4.1: filter policy evaluation. Subs without a filter
+        // policy match everything (current behaviour).
+        if (s.filter_policy) |fp| {
+            if (!sns_filter.evaluatePolicy(fp, in.message_attributes_json, allocator)) continue;
+        }
         const queue_name = extractQueueNameFromArn(s.endpoint) orelse continue;
         const body = if (s.raw_message_delivery) in.message else envelope;
         const out = sqsSendMessage(self, allocator, .{
