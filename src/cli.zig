@@ -26,6 +26,10 @@ pub const Config = struct {
     /// expired items "best effort within 48h"; for local-dev tests we
     /// default to 5s so callers don't need to wait. Range: 1..=3600.
     ttl_sweep_interval_seconds: u32 = 5,
+    /// SQS MessageRetentionPeriod sweeper interval (seconds). Real AWS
+    /// best-effort within 60 seconds; for local-dev tests we default
+    /// to 60s. Range: 1..=3600.
+    sqs_retention_sweep_interval_seconds: u32 = 60,
     /// Account ID embedded in ARNs + SQS queue URLs. AWS accounts are
     /// 12 digits; nanostack uses 000000000000 by default to match the
     /// LocalStack-style placeholder.
@@ -73,6 +77,12 @@ pub fn parse(args: []const [:0]const u8) ParseError!Config {
             const n = std.fmt.parseInt(u32, args[i], 10) catch return ParseError.InvalidValue;
             if (n < 1 or n > 3600) return ParseError.InvalidValue;
             c.ttl_sweep_interval_seconds = n;
+        } else if (std.mem.eql(u8, arg, "--sqs-retention-sweep-interval-seconds")) {
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            const n = std.fmt.parseInt(u32, args[i], 10) catch return ParseError.InvalidValue;
+            if (n < 1 or n > 3600) return ParseError.InvalidValue;
+            c.sqs_retention_sweep_interval_seconds = n;
         } else if (std.mem.eql(u8, arg, "--port")) {
             i += 1;
             if (i >= args.len) return ParseError.MissingValue;
