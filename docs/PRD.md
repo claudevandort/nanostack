@@ -347,9 +347,13 @@ The original §15 ordering (S3 v1.1 → SQS → DDB → Lambda) anchored against
 
 **SQS — feature-complete + fully enforced.** 23 ops + FIFO + cold-start safety + retention sweeper + Queue Policy enforcement (v0.3.3). The authz cascade is `--no-auth` → allow / account-scoped → require non-anonymous / queue-scoped → owner-implicit-allow / policy evaluation (default-deny on no_match). Anonymous requests with a `Principal: "*"` policy work end-to-end. Cross-account principals are out of scope (SigV4 only verifies against the configured `--access-key`).
 
-### Cross-service wiring — NOT YET STARTED
+### Cross-service wiring — PROVEN (v0.3.4)
 
-Nothing fires across service boundaries. `PutBucketNotificationConfiguration` accepts S3 → SQS / Lambda / SNS targets but no events fire on PutObject / DeleteObject / Copy / CompleteMultipartUpload. DynamoDB Streams emits to its own `GetRecords` API but doesn't push to SQS or Lambda. This is the **v1.0 inflection point** — "multi-service workflow-ready" requires at minimum S3 → SQS notifications to work end-to-end, because that's the canonical local-dev serverless workflow (upload object → message in queue → worker picks up).
+**S3 → SQS event notifications** landed in v0.3.4. `PutBucketNotificationConfiguration` QueueConfiguration entries now fire on PutObject / CopyObject / CompleteMultipartUpload / DeleteObject / DeleteObjects, with filter rule (prefix + suffix) + wildcard event matcher support. The canonical local-dev serverless workflow (upload object → message in queue → worker picks up) works end-to-end.
+
+The dispatcher pattern (Context-threaded optional backend, single dispatch entry point per S3 op) is reusable for the next two wirings: SNS (target == .topic) and Lambda (target == .lambda) just need additional branches. DDB Streams → SQS would mirror the same shape.
+
+**Still not wired**: S3 → SNS, S3 → Lambda (services don't exist yet), DDB Streams → SQS.
 
 ### Recommended trajectory toward v1.0
 
@@ -357,7 +361,7 @@ Nothing fires across service boundaries. `PutBucketNotificationConfiguration` ac
 |---|---|---|
 | ~~**v0.3.2 — SQS robustness**~~ | ~~Cold-start message rehydration; MessageRetentionPeriod sweeper; 6 unrouted ops (`AddPermission`/`RemovePermission`/`ListDeadLetterSourceQueues`/MessageMoveTask trio).~~ | **Shipped 2026-05-18.** Closes SUPPORT.md ↔ behaviour drift; lands all unrouted ops. Queue Policy enforcement deferred to v0.3.3. |
 | ~~**v0.3.3 — Queue Policy enforcement**~~ | ~~Wire `policy_eval.zig` into a new `src/services/sqs/authz.zig` hook; SQS action map; thread Principal through the SQS service context.~~ | **Shipped 2026-05-18.** Last SQS gap closed. After this, SQS is feature-complete + fully enforced. |
-| **v0.3.4 — S3 → SQS event notifications** | Wire `PutBucketNotificationConfiguration` QueueConfiguration entries to actually fire on PutObject / DeleteObject / Copy / CompleteMultipartUpload, with prefix/suffix filter eval and AWS-format event envelope. | **The strategic unlock.** Most of the wire surface already exists. Unblocks the canonical local-dev serverless workflow. Architecturally the same pattern future DDB Streams → SQS and Lambda triggers will reuse. (Patch — no new service.) |
+| ~~**v0.3.4 — S3 → SQS event notifications**~~ | ~~Wire `PutBucketNotificationConfiguration` QueueConfiguration entries to actually fire on PutObject / DeleteObject / Copy / CompleteMultipartUpload, with prefix/suffix filter eval and AWS-format event envelope.~~ | **Shipped 2026-05-18.** The strategic unlock — first cross-service wiring proven. Canonical local-dev serverless workflow (upload → queue → worker) works end-to-end. |
 | **v0.4.0 — SNS** | ~10 ops (CreateTopic / Subscribe / Publish / etc.). Wire SNS → SQS subscriptions so fan-out works locally. Add S3 → SNS as a notification target. | First minor since v0.3.0 SQS. Small surface, natural fit with the event-notification work. (Minor.) |
 | **v0.5.0 — Lambda** | Function CRUD + Invoke + S3 / SQS / DDB-Streams event-source mappings. Likely a sidecar-process execution model (we don't host an in-Zig runtime). | The big multi-service hop. Highest payoff for the v1.0 claim. (Minor.) |
 | **v1.0.0 — Polish + multi-profile + bench** | Multi-profile state isolation (deferred from v1 per §17a); end-to-end performance pass against the broader surface; documented "production local-dev surface". | "Curated multi-service surface workflow-ready." Stabilization, not new features. (Major.) |

@@ -16,6 +16,44 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-05-18
+
+**Patch release: S3 → SQS event notifications. The strategic unlock.**
+
+The first cross-service wiring in nanostack. Until v0.3.4, three-services-on-one-port (S3 + DDB + SQS) was mostly a port-sharing trick — the canonical local-dev serverless workflow (upload object → message in queue → worker picks up) didn't actually work because S3 events never fired. v0.3.4 closes that.
+
+Architecturally, the dispatch pattern proven here is what future Lambda triggers + DDB Streams → SQS will reuse.
+
+### Added
+
+- **`src/services/s3/events.zig`** (new, ~350 lines): the dispatcher. Walks the bucket's NotificationConfiguration, filters by QueueConfiguration entries, evaluates event-name matchers (with `s3:ObjectCreated:*` / `s3:ObjectRemoved:*` / `s3:*` wildcards), evaluates filter rules (prefix + suffix on object key), constructs AWS-format event envelopes, calls `sqs_backend.sendMessage(...)`.
+- **5 handler insertion points**:
+  - `src/services/s3/mod.zig::putObject` → `s3:ObjectCreated:Put`.
+  - `src/services/s3/mod.zig::copyObject` → `s3:ObjectCreated:Copy`.
+  - `src/services/s3/mod.zig::deleteObject` → `s3:ObjectRemoved:Delete` (or `:DeleteMarkerCreated` on versioned buckets).
+  - `src/services/s3/mod.zig::deleteObjects` → per-entry events in the batch loop.
+  - `src/services/s3/multipart.zig::completeMultipartUpload` → `s3:ObjectCreated:CompleteMultipartUpload`.
+- **S3 Context** gains an optional `sqs_backend: ?storage.SqsBackend` field, threaded through `server.zig::handleS3` from `App.sqs_backend`.
+- **AWS-format event envelope** with `Records[].{eventVersion, eventSource, awsRegion, eventTime, eventName, userIdentity, requestParameters, responseElements, s3.{bucket, object}}`.
+
+### Tests
+
+- Python: 504 → 514 (+10 — Put/Copy/CMU/Delete/DeleteMarker/batch + filter rules + wildcards + negative cases).
+- JS: 106 → 109 (+3).
+- AWS CLI: 45 → 47 (+2).
+
+### Documented divergences (new in v0.3.4)
+
+- **Sender principal**: dispatch bypasses the SQS queue-policy authz hook entirely (matches LocalStack; AWS uses a service-principal model with explicit grants).
+- **`sourceIPAddress` is hardcoded `127.0.0.1`** — we don't surface the real client IP to the S3 handler.
+- **Request IDs in the event envelope are freshly minted** — they don't match the response's `x-amz-request-id`.
+- **Fire-and-forget** — S3 success doesn't depend on SQS reachability; errors are logged + dropped.
+- **SNS + Lambda targets still accept-store-roundtrip** — wait for v0.4.0 (SNS) + v0.5.0 (Lambda).
+
+### Strategic note
+
+After v0.3.4, **the cross-service pattern is proven**. v0.4.0 (SNS) reuses the dispatcher (add a second `target == .topic` branch). v0.5.0 (Lambda) reuses it again. v1.0.0's "multi-service workflow-ready" claim is now demonstrable — upload an object via S3 and a worker can pick it off SQS.
+
 ## [0.3.3] — 2026-05-18
 
 **Patch release: SQS Queue Policy enforcement.**
