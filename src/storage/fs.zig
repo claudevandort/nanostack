@@ -7050,6 +7050,7 @@ fn loadSingleTopic(self: *Fs, name: []const u8) !void {
     loadSubscriptionsForTopic(self, slot_ptr) catch |err| {
         std.log.warn("sns: failed to load subs for topic {s}: {s}", .{ slot_ptr.name, @errorName(err) });
     };
+    loadTopicTags(self, slot_ptr);
 }
 
 pub fn snsBackend(self: *Fs) storage.SnsBackend {
@@ -7625,7 +7626,58 @@ pub fn snsPublishBatch(self: *Fs, allocator: Allocator, in: storage.PublishBatch
 }
 
 // ---------------------------------------------------------------------------
-// SNS tags (Phase E)
+// SNS tags (Phase E, persistence added v0.4.1)
+
+fn topicTagsPath(self: *Fs, name: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/sns/topics/{s}/tags.json", .{ self.base_dir, name });
+}
+
+fn writeTopicTags(self: *Fs, slot: *const storage.SnsTopicSlot) !void {
+    var dir_buf: [4096]u8 = undefined;
+    const dir_path = try topicDirPath(self, slot.name, &dir_buf);
+    try Io.Dir.cwd().createDirPath(self.io, dir_path);
+
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    var it = slot.tags.iterator();
+    while (it.next()) |entry| {
+        try s.objectField(entry.key_ptr.*);
+        try s.write(entry.value_ptr.*);
+    }
+    try s.endObject();
+    const body = try aw.toOwnedSlice();
+    defer self.allocator.free(body);
+
+    var path_buf: [4096]u8 = undefined;
+    const path = try topicTagsPath(self, slot.name, &path_buf);
+    try writeAtomic(self.io, path, body);
+}
+
+fn loadTopicTags(self: *Fs, slot: *storage.SnsTopicSlot) void {
+    var path_buf: [4096]u8 = undefined;
+    const path = topicTagsPath(self, slot.name, &path_buf) catch return;
+    const body = Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(64 * 1024)) catch return;
+    defer self.allocator.free(body);
+    var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        const k = self.allocator.dupe(u8, entry.key_ptr.*) catch return;
+        const v = self.allocator.dupe(u8, entry.value_ptr.*.string) catch {
+            self.allocator.free(k);
+            return;
+        };
+        slot.tags.put(self.allocator, k, v) catch {
+            self.allocator.free(k);
+            self.allocator.free(v);
+            return;
+        };
+    }
+}
 
 pub fn snsTagTopic(self: *Fs, in: storage.TagTopicInput) storage.Error!void {
     self.mutex.lockUncancelable(self.io);
@@ -7644,6 +7696,7 @@ pub fn snsTagTopic(self: *Fs, in: storage.TagTopicInput) storage.Error!void {
         }
         slot.tags.put(self.allocator, k, v) catch return storage.Error.OutOfMemory;
     }
+    writeTopicTags(self, slot) catch return storage.Error.Io;
 }
 
 pub fn snsUntagTopic(self: *Fs, in: storage.UntagTopicInput) storage.Error!void {
@@ -7656,6 +7709,7 @@ pub fn snsUntagTopic(self: *Fs, in: storage.UntagTopicInput) storage.Error!void 
             self.allocator.free(old.value);
         }
     }
+    writeTopicTags(self, slot) catch return storage.Error.Io;
 }
 
 pub fn snsListTopicTags(self: *Fs, allocator: Allocator, topic_name: []const u8) storage.Error!storage.ListTopicTagsOutput {
