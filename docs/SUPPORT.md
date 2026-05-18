@@ -406,7 +406,7 @@ These will only be added if a real user hits a setup-script gap; not on any road
 
 ## SNS
 
-SNS is the fourth AWS service nanostack covers, opt-in via `--services sns` (or include it in a multi-service list like `--services s3,sqs,sns`). v0.4.0 ships **17 ops** — full topic CRUD, subscriptions, publish + fan-out to SQS subscribers, tags. Standard topics only; FIFO topics are deferred. Subscription protocols: `sqs` fires fan-out; `lambda` / `http` / `https` / `email` / `email-json` / `sms` are accept-store-roundtrip (subscriptions persist but never deliver — Lambda lands in v0.5.0, the rest are out of scope).
+SNS is the fourth AWS service nanostack covers, opt-in via `--services sns` (or include it in a multi-service list like `--services s3,sqs,sns`). v0.4.0 shipped 17 ops; **v0.4.1 lands 2 more (`AddPermission` / `RemovePermission`)**, **persists tags across restart**, **evaluates `FilterPolicy` at publish time** (exact string-array matches), and **carries per-entry MessageAttributes through `PublishBatch`**. Standard topics only; FIFO topics are deferred. Subscription protocols: `sqs` fires fan-out; `lambda` / `http` / `https` / `email` / `email-json` / `sms` are accept-store-roundtrip (subscriptions persist but never deliver — Lambda lands in v0.5.0, the rest are out of scope).
 
 **Wire protocol divergence**: unlike DDB / modern SQS, SNS uses the AWS query protocol — `application/x-www-form-urlencoded` request bodies + XML responses + an `Action=<Op>` body parameter (not `X-Amz-Target` header). nanostack detects SNS requests by sniffing `Action=` in the body before falling through to S3.
 
@@ -422,24 +422,26 @@ SNS is the fourth AWS service nanostack covers, opt-in via `--services sns` (or 
 | ListSubscriptions | supported (across all topics) | v0.4.0 |
 | ListSubscriptionsByTopic | supported | v0.4.0 |
 | GetSubscriptionAttributes | supported (SubscriptionArn / TopicArn / Protocol / Endpoint / Owner / ConfirmationWasAuthenticated / RawMessageDelivery / FilterPolicy? / DeliveryPolicy?) | v0.4.0 |
-| SetSubscriptionAttributes | supported (RawMessageDelivery enforced; FilterPolicy + DeliveryPolicy stored but **not evaluated**) | v0.4.0 |
+| SetSubscriptionAttributes | supported (RawMessageDelivery enforced; **FilterPolicy evaluated at publish time as of v0.4.1**; DeliveryPolicy stored but not evaluated) | v0.4.0, FilterPolicy eval v0.4.1 |
 | ConfirmSubscription | supported (accepts arbitrary token; auto-confirms the first unconfirmed sub on the topic) | v0.4.0 |
-| Publish | supported (delivers SNS envelope JSON to SQS subscribers; raw bytes when RawMessageDelivery=true; MessageAttributes round-trip into envelope) | v0.4.0 |
-| PublishBatch | supported (per-entry Successful / Failed split) | v0.4.0 |
-| TagResource | supported (in-memory tags; max 50 tags) | v0.4.0 |
-| UntagResource | supported | v0.4.0 |
+| Publish | supported (delivers SNS envelope JSON to SQS subscribers; raw bytes when RawMessageDelivery=true; MessageAttributes round-trip into envelope; **gated by subscription FilterPolicy as of v0.4.1**) | v0.4.0, filter eval v0.4.1 |
+| PublishBatch | supported (per-entry Successful / Failed split; **per-entry MessageAttributes as of v0.4.1**) | v0.4.0, attrs v0.4.1 |
+| AddPermission | supported (constructs an IAM-style Statement and merges it into the Policy attribute; duplicate Label → InvalidParameterValue; **resulting policy is accept-store-roundtrip — not enforced** — enforcement deferred to v0.4.2) | v0.4.1 |
+| RemovePermission | supported (drops the matching statement; clears the Policy attribute when the last statement is removed) | v0.4.1 |
+| TagResource | supported (**persisted across restart as of v0.4.1**; max 50 tags) | v0.4.0, persistence v0.4.1 |
+| UntagResource | supported (persisted) | v0.4.0, persistence v0.4.1 |
 | ListTagsForResource | supported | v0.4.0 |
 
 Documented divergences (intentional):
 - **Query wire protocol only.** No JSON migration to track; modern AWS SDKs (boto3, aws-sdk-js v3, AWS CLI v2) all use query.
 - **FIFO topics deferred.** `.fifo` suffix rejected. Future v0.4.x patch.
-- **Filter policies not enforced.** `FilterPolicy` subscription attribute round-trips through Set/GetSubscriptionAttributes but doesn't gate which messages reach the subscriber. Documented divergence; same complexity profile as S3 bucket-policy Conditions.
+- **Topic Policy attribute is accept-store-roundtrip.** `AddPermission` / `RemovePermission` / `SetTopicAttributes` all mutate the Policy correctly and `GetTopicAttributes` returns it, but the policy is **not evaluated at request time**. Enforcement deferred to v0.4.2 — mirrors the v0.3.2 → v0.3.3 SQS trajectory.
+- **Filter-policy operators deferred.** v0.4.1 evaluates exact string-array shapes (e.g. `{"category": ["news", "sports"]}`); operator objects (`prefix`, `anything-but`, `numeric`, `exists`, `cidr`, `suffix`) are treated as no-match (the subscription is filtered out). AND across top-level keys, OR within a rule array. Future v0.4.x patch will land the operator set.
 - **Only `sqs` protocol fires.** `lambda` / `http` / `https` / `email` / `email-json` / `sms` subscriptions are stored but never deliver.
 - **`ConfirmSubscription` auto-confirms** SQS subs at Subscribe time; for non-SQS protocols, the confirmation is a no-op that flips the persisted bit (since those subs never fire anyway).
 - **Signature fields are stubs.** `Signature` is the literal `"nanostack-stub"`; `SigningCertURL` is `https://nanostack.local/cert.pem`. nanostack doesn't do KMS-style signing. Matches LocalStack.
 - **MessageAttributes only on envelope path.** When `RawMessageDelivery=true`, MessageAttributes are not propagated to the SQS message's MessageAttributes field. AWS does this; we don't (yet).
 - **Cross-account principals out of scope.** Same SigV4 limitation as the rest of nanostack — only the configured `--access-key` validates.
-- **Tags are in-memory only.** Not persisted across restart. Same trade-off as the dedup window before v0.3.2.
 
 ## Cross-service wiring
 

@@ -335,7 +335,7 @@ Time estimate end-to-end: **~6 weeks** with focused effort, assuming the foundat
 
 ---
 
-## 15. Roadmap — state of the project (2026-05-18, post-v0.3.1)
+## 15. Roadmap — state of the project (2026-05-18, post-v0.4.1)
 
 The original §15 ordering (S3 v1.1 → SQS → DDB → Lambda) anchored against pre-v0.1 scope. As of v0.3.1, three services have shipped — most of the original v1.x roadmap is already done. This section is rewritten as a live state-of-the-world.
 
@@ -363,6 +363,8 @@ The dispatcher pattern (Context-threaded optional backend, single dispatch entry
 | ~~**v0.3.3 — Queue Policy enforcement**~~ | ~~Wire `policy_eval.zig` into a new `src/services/sqs/authz.zig` hook; SQS action map; thread Principal through the SQS service context.~~ | **Shipped 2026-05-18.** Last SQS gap closed. After this, SQS is feature-complete + fully enforced. |
 | ~~**v0.3.4 — S3 → SQS event notifications**~~ | ~~Wire `PutBucketNotificationConfiguration` QueueConfiguration entries to actually fire on PutObject / DeleteObject / Copy / CompleteMultipartUpload, with prefix/suffix filter eval and AWS-format event envelope.~~ | **Shipped 2026-05-18.** The strategic unlock — first cross-service wiring proven. Canonical local-dev serverless workflow (upload → queue → worker) works end-to-end. |
 | ~~**v0.4.0 — SNS**~~ | ~~17 ops (topic CRUD + subscriptions + Publish/PublishBatch + tags). SNS → SQS fan-out + S3 → SNS dispatch. Query+XML wire protocol layer added.~~ | **Shipped 2026-05-18.** First minor since v0.3.0 SQS. Multi-hop S3 → SNS → SQS works end-to-end. |
+| ~~**v0.4.1 — SNS robustness**~~ | ~~Tags persistence across restart; `AddPermission` / `RemovePermission` (Policy mutation, accept-store-roundtrip); per-entry `MessageAttributes` on `PublishBatch`; `FilterPolicy` evaluated at publish time (exact string-array shapes).~~ | **Shipped 2026-05-18.** Closes the four divergences flagged in v0.4.0's SUPPORT.md. Topic Policy enforcement deferred to v0.4.2 (same v0.3.2 → v0.3.3 SQS trajectory). |
+| **v0.4.2 — SNS Topic Policy enforcement** | Wire `policy_eval.zig` into a new `src/services/sns/authz.zig` hook; SNS action map; thread Principal through the SNS service context. | Mirrors the v0.3.2 → v0.3.3 SQS trajectory. After this, SNS is feature-complete + enforced modulo FIFO. (Patch.) |
 | **v0.5.0 — Lambda** | Function CRUD + Invoke + S3 / SQS / DDB-Streams event-source mappings. Likely a sidecar-process execution model (we don't host an in-Zig runtime). | The big multi-service hop. Highest payoff for the v1.0 claim. (Minor.) |
 | **v1.0.0 — Polish + multi-profile + bench** | Multi-profile state isolation (deferred from v1 per §17a); end-to-end performance pass against the broader surface; documented "production local-dev surface". | "Curated multi-service surface workflow-ready." Stabilization, not new features. (Major.) |
 
