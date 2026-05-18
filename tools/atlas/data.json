@@ -1,0 +1,1422 @@
+{
+  "version": "0.4.2",
+  "tagline": "four services on the same port: **S3** (68/107 Smithy ops, real bucket-policy / ACL / PAB enforcement), **DynamoDB** (18 ops, full UpdateExpression, queryable GSI/LSI, batch + atomic transactions, 573-word reserved-word enforcement), **SQS** (23 ops including FIFO + Queue Policy enforcement), **SNS** (19 ops including AddPermission/RemovePermission + FilterPolicy evaluation + Topic Policy enforcement). Cross-service wiring: S3 \u2192 SQS event notifications, S3 \u2192 SNS \u2192 SQS multi-hop fan-out. All services verified against Python + JS + AWS CLI v2 conformance suites. Opt-in via `--services s3,dynamodb,sqs,sns`. Pre-`v1.0.0`; minor breaking changes are expected",
+  "wedge": [
+    {
+      "n": "1",
+      "behaviour": "Presigned URL with a custom header \u2014 request sent *without* it \u2192 clean `403 SignatureDoesNotMatch`",
+      "localstack": "5xx panic / partial response ([#5269](https://github.com/localstack/localstack/issues/5269), [#4133](https://github.com/localstack/localstack/issues/4133), [#10844](https://github.com/localstack/localstack/issues/10844))",
+      "test": "[`test_sigv4.py::test_presigned_custom_header_missing`](../tests/conformance/python/test_sigv4.py)"
+    },
+    {
+      "n": "2",
+      "behaviour": "`Accept-Ranges: bytes` on every GetObject / HeadObject response",
+      "localstack": "Missing in many paths ([#1859](https://github.com/localstack/localstack/issues/1859))",
+      "test": "[`test_get_object.py`](../tests/conformance/python/test_get_object.py)"
+    },
+    {
+      "n": "3",
+      "behaviour": "Conditional-header split (GET/HEAD: all four; PUT: `If-Match`/`If-None-Match` only; CopyObject: `x-amz-copy-source-if-*`)",
+      "localstack": "Inconsistent \u2014 some headers accepted but not enforced",
+      "test": "[`test_conditional_get.py`](../tests/conformance/python/test_conditional_get.py), [`test_conditional_put.py`](../tests/conformance/python/test_conditional_put.py), [`test_copy_object.py`](../tests/conformance/python/test_copy_object.py)"
+    },
+    {
+      "n": "4",
+      "behaviour": "Multipart ETag = `md5(concat(binary-MD5-of-each-part)) + \"-\" + N`; `EntityTooSmall` when any non-final part < 5 MiB",
+      "localstack": "Format matches but `EntityTooSmall` enforcement inconsistent",
+      "test": "[`test_multipart_upload.py`](../tests/conformance/python/test_multipart_upload.py), [`test_multipart_errors.py`](../tests/conformance/python/test_multipart_errors.py)"
+    }
+  ],
+  "services": [
+    {
+      "name": "S3",
+      "ops": [
+        {
+          "name": "CreateBucket",
+          "status_text": "supported",
+          "status": "supported",
+          "milestone": "M1",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateBucket.html"
+        },
+        {
+          "name": "DeleteBucket",
+          "status_text": "supported",
+          "status": "supported",
+          "milestone": "M1",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteBucket.html"
+        },
+        {
+          "name": "HeadBucket",
+          "status_text": "supported",
+          "status": "supported",
+          "milestone": "M1",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadBucket.html"
+        },
+        {
+          "name": "ListBuckets",
+          "status_text": "supported",
+          "status": "supported",
+          "milestone": "M1",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListBuckets.html"
+        },
+        {
+          "name": "PutObject",
+          "status_text": "supported",
+          "status": "supported",
+          "milestone": "M3",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html"
+        },
+        {
+          "name": "GetObject",
+          "status_text": "supported (incl. range requests)",
+          "status": "supported",
+          "milestone": "M3",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html"
+        },
+        {
+          "name": "HeadObject",
+          "status_text": "supported",
+          "status": "supported",
+          "milestone": "M3",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html"
+        },
+        {
+          "name": "DeleteObject",
+          "status_text": "supported (idempotent)",
+          "status": "supported",
+          "milestone": "M3",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html"
+        },
+        {
+          "name": "DeleteObjects",
+          "status_text": "supported (incl. Quiet mode)",
+          "status": "supported",
+          "milestone": "M3",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html"
+        },
+        {
+          "name": "CopyObject",
+          "status_text": "supported (incl. `x-amz-metadata-directive=COPY\\",
+          "status": "supported",
+          "milestone": "REPLACE`, `x-amz-copy-source-if-*`)",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html"
+        },
+        {
+          "name": "ListObjects (v1)",
+          "status_text": "supported (prefix, delimiter, marker, max-keys, encoding-type=url)",
+          "status": "supported",
+          "milestone": "M4",
+          "aws_doc_url": null
+        },
+        {
+          "name": "ListObjectsV2",
+          "status_text": "supported (prefix, delimiter, start-after, continuation-token, max-keys, fetch-owner, encoding-type=url)",
+          "status": "supported",
+          "milestone": "M4",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html"
+        },
+        {
+          "name": "CreateMultipartUpload",
+          "status_text": "supported (content-type + user-metadata captured at init)",
+          "status": "supported",
+          "milestone": "M6",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateMultipartUpload.html"
+        },
+        {
+          "name": "UploadPart",
+          "status_text": "supported (1\u201310000 part numbers, per-part MD5 ETag)",
+          "status": "supported",
+          "milestone": "M6",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPart.html"
+        },
+        {
+          "name": "UploadPartCopy",
+          "status_text": "supported (whole-part copy + `x-amz-copy-source-if-*`)",
+          "status": "supported",
+          "milestone": "M6",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPartCopy.html"
+        },
+        {
+          "name": "CompleteMultipartUpload",
+          "status_text": "supported (incl. 5 MiB min on non-final parts, conditional `If-Match`/`If-None-Match`)",
+          "status": "supported",
+          "milestone": "M6",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html"
+        },
+        {
+          "name": "AbortMultipartUpload",
+          "status_text": "supported (204)",
+          "status": "supported",
+          "milestone": "M6",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_AbortMultipartUpload.html"
+        },
+        {
+          "name": "ListMultipartUploads",
+          "status_text": "supported (prefix, delimiter, key-marker, upload-id-marker, max-uploads, encoding-type=url)",
+          "status": "supported",
+          "milestone": "M6",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListMultipartUploads.html"
+        },
+        {
+          "name": "ListParts",
+          "status_text": "supported (part-number-marker, max-parts)",
+          "status": "supported",
+          "milestone": "M6",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListParts.html"
+        },
+        {
+          "name": "PutBucketVersioning",
+          "status_text": "supported (Enabled, Suspended)",
+          "status": "supported",
+          "milestone": "M8",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketVersioning.html"
+        },
+        {
+          "name": "GetBucketVersioning",
+          "status_text": "supported",
+          "status": "supported",
+          "milestone": "M8",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketVersioning.html"
+        },
+        {
+          "name": "ListObjectVersions",
+          "status_text": "supported (prefix, delimiter, key-marker, version-id-marker, max-keys, encoding-type=url)",
+          "status": "supported",
+          "milestone": "M8",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectVersions.html"
+        },
+        {
+          "name": "PutBucketTagging",
+          "status_text": "supported (replaces existing tag set; max 10 tags)",
+          "status": "supported",
+          "milestone": "M9",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketTagging.html"
+        },
+        {
+          "name": "GetBucketTagging",
+          "status_text": "supported (404 NoSuchTagSet on untagged bucket, AWS-exact)",
+          "status": "supported",
+          "milestone": "M9",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketTagging.html"
+        },
+        {
+          "name": "DeleteBucketTagging",
+          "status_text": "supported (204; idempotent)",
+          "status": "supported",
+          "milestone": "M9",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteBucketTagging.html"
+        },
+        {
+          "name": "PutObjectTagging",
+          "status_text": "supported (per-version with `?versionId=X`)",
+          "status": "supported",
+          "milestone": "M9",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectTagging.html"
+        },
+        {
+          "name": "GetObjectTagging",
+          "status_text": "supported (200 + empty TagSet on untagged object, AWS-exact)",
+          "status": "supported",
+          "milestone": "M9",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectTagging.html"
+        },
+        {
+          "name": "DeleteObjectTagging",
+          "status_text": "supported (204; idempotent)",
+          "status": "supported",
+          "milestone": "M9",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjectTagging.html"
+        },
+        {
+          "name": "PutBucketAcl",
+          "status_text": "supported (accept-store-roundtrip; XML body OR `x-amz-acl` canned OR `x-amz-grant-*` headers)",
+          "status": "supported",
+          "milestone": "M10",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketAcl.html"
+        },
+        {
+          "name": "GetBucketAcl",
+          "status_text": "supported (synthesizes default Owner FULL_CONTROL when none set)",
+          "status": "supported",
+          "milestone": "M10",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketAcl.html"
+        },
+        {
+          "name": "PutObjectAcl",
+          "status_text": "supported (per-version with `?versionId=X`)",
+          "status": "supported",
+          "milestone": "M10",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectAcl.html"
+        },
+        {
+          "name": "GetObjectAcl",
+          "status_text": "supported",
+          "status": "supported",
+          "milestone": "M10",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectAcl.html"
+        },
+        {
+          "name": "PutBucketPolicy",
+          "status_text": "supported (well-formed JSON only; no condition-key validation)",
+          "status": "supported",
+          "milestone": "M10",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketPolicy.html"
+        },
+        {
+          "name": "GetBucketPolicy",
+          "status_text": "supported (404 `NoSuchBucketPolicy` on unset bucket, AWS-exact)",
+          "status": "supported",
+          "milestone": "M10",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketPolicy.html"
+        },
+        {
+          "name": "DeleteBucketPolicy",
+          "status_text": "supported (204; idempotent)",
+          "status": "supported",
+          "milestone": "M10",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteBucketPolicy.html"
+        },
+        {
+          "name": "PutBucketOwnershipControls",
+          "status_text": "supported (BucketOwnerEnforced / BucketOwnerPreferred / ObjectWriter)",
+          "status": "supported",
+          "milestone": "M10",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketOwnershipControls.html"
+        },
+        {
+          "name": "GetBucketOwnershipControls",
+          "status_text": "supported (404 `OwnershipControlsNotFoundError` on unset, AWS-exact)",
+          "status": "supported",
+          "milestone": "M10",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketOwnershipControls.html"
+        },
+        {
+          "name": "DeleteBucketOwnershipControls",
+          "status_text": "supported (204; idempotent)",
+          "status": "supported",
+          "milestone": "M10",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteBucketOwnershipControls.html"
+        },
+        {
+          "name": "PutPublicAccessBlock",
+          "status_text": "supported (all 4 bool fields)",
+          "status": "supported",
+          "milestone": "M10",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutPublicAccessBlock.html"
+        },
+        {
+          "name": "GetPublicAccessBlock",
+          "status_text": "supported (404 `NoSuchPublicAccessBlockConfiguration` on unset, AWS-exact)",
+          "status": "supported",
+          "milestone": "M10",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetPublicAccessBlock.html"
+        },
+        {
+          "name": "DeletePublicAccessBlock",
+          "status_text": "supported (204; idempotent)",
+          "status": "supported",
+          "milestone": "M10",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeletePublicAccessBlock.html"
+        },
+        {
+          "name": "PutBucketCors / GetBucketCors / DeleteBucketCors",
+          "status_text": "supported (404 `NoSuchCORSConfiguration` on untouched; AWS-exact)",
+          "status": "supported",
+          "milestone": "M11",
+          "aws_doc_url": null
+        },
+        {
+          "name": "PutBucketEncryption / GetBucketEncryption / DeleteBucketEncryption",
+          "status_text": "supported (AES256, aws:kms, aws:kms:dsse; 404 `ServerSideEncryptionConfigurationNotFoundError`)",
+          "status": "supported",
+          "milestone": "M11",
+          "aws_doc_url": null
+        },
+        {
+          "name": "PutBucketLifecycleConfiguration / GetBucketLifecycleConfiguration / DeleteBucketLifecycle",
+          "status_text": "supported (Filter, Transition, Expiration, Noncurrent*, AbortIncompleteMultipartUpload; 404 `NoSuchLifecycleConfiguration`)",
+          "status": "supported",
+          "milestone": "M11",
+          "aws_doc_url": null
+        },
+        {
+          "name": "PutBucketNotificationConfiguration / GetBucketNotificationConfiguration",
+          "status_text": "supported (Topic / Queue / CloudFunction targets + Filter; empty Get returns 200 empty body, AWS-exact)",
+          "status": "supported",
+          "milestone": "M11",
+          "aws_doc_url": null
+        },
+        {
+          "name": "PutBucketWebsite / GetBucketWebsite / DeleteBucketWebsite",
+          "status_text": "supported (IndexDocument, ErrorDocument, RedirectAllRequestsTo, RoutingRules; 404 `NoSuchWebsiteConfiguration`)",
+          "status": "supported",
+          "milestone": "M11",
+          "aws_doc_url": null
+        },
+        {
+          "name": "GetObjectAttributes",
+          "status_text": "supported (ETag, ObjectSize, StorageClass, ObjectParts.PartsCount, Checksum-empty; per-version; precondition headers honoured)",
+          "status": "supported",
+          "milestone": "M11",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectAttributes.html"
+        },
+        {
+          "name": "PutObjectLockConfiguration / GetObjectLockConfiguration",
+          "status_text": "supported (XML body + default-retention rule; 409 InvalidBucketState on non-locked bucket; 404 ObjectLockConfigurationNotFoundError)",
+          "status": "supported",
+          "milestone": "M12",
+          "aws_doc_url": null
+        },
+        {
+          "name": "PutObjectRetention / GetObjectRetention",
+          "status_text": "supported (per-version; GOVERNANCE/COMPLIANCE mode-transition rules enforced)",
+          "status": "supported",
+          "milestone": "M12",
+          "aws_doc_url": null
+        },
+        {
+          "name": "PutObjectLegalHold / GetObjectLegalHold",
+          "status_text": "supported (per-version; legal hold supersedes retention)",
+          "status": "supported",
+          "milestone": "M12",
+          "aws_doc_url": null
+        },
+        {
+          "name": "GetBucketPolicyStatus",
+          "status_text": "supported (lightweight IsPublic heuristic; 404 NoSuchBucketPolicy on untouched)",
+          "status": "supported",
+          "milestone": "M13",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketPolicyStatus.html"
+        },
+        {
+          "name": "RestoreObject",
+          "status_text": "supported (accept-store-roundtrip; 202 Accepted; surfaces `x-amz-restore` on HEAD/GET; no actual data movement)",
+          "status": "supported",
+          "milestone": "M13",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_RestoreObject.html"
+        },
+        {
+          "name": "UpdateObjectEncryption",
+          "status_text": "supported (per-version; persists algorithm + KMS key id; surfaces `x-amz-server-side-encryption[-aws-kms-key-id]` on HEAD/GET; no actual cipher)",
+          "status": "supported",
+          "milestone": "M13",
+          "aws_doc_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_UpdateObjectEncryption.html"
+        },
+        {
+          "name": "PutBucketReplication / GetBucketReplication / DeleteBucketReplication",
+          "status_text": "supported (accept-store-roundtrip; no actual replication; 404 ReplicationConfigurationNotFoundError on untouched)",
+          "status": "supported",
+          "milestone": "M13",
+          "aws_doc_url": null
+        }
+      ],
+      "divergences": [],
+      "code_paths": [
+        {
+          "label": "Service handlers",
+          "path": "src/services/s3/"
+        },
+        {
+          "label": "Wire layer (parsers + renderers)",
+          "path": "src/wire/s3/"
+        },
+        {
+          "label": "Python conformance tests",
+          "path": "tests/conformance/python/s3/"
+        },
+        {
+          "label": "JS conformance tests",
+          "path": "tests/conformance/js/s3/"
+        },
+        {
+          "label": "AWS CLI conformance tests",
+          "path": "tests/conformance/awscli/s3/"
+        }
+      ]
+    },
+    {
+      "name": "DynamoDB",
+      "ops": [
+        {
+          "name": "ListTables",
+          "status_text": "supported (paginated; Limit + ExclusiveStartTableName cursor; lex-ascending)",
+          "status": "supported",
+          "milestone": "M15-tables",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_ListTables.html"
+        },
+        {
+          "name": "CreateTable",
+          "status_text": "supported (KeySchema, AttributeDefinitions, GSI/LSI defs, BillingMode, Tags; index queryability lands in M15-gsi)",
+          "status": "supported",
+          "milestone": "M15-tables",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_CreateTable.html"
+        },
+        {
+          "name": "DescribeTable",
+          "status_text": "supported (returns TableStatus=ACTIVE, KeySchema, AttributeDefinitions, GSI/LSI defs, BillingModeSummary, synthetic ItemCount + TableSizeBytes)",
+          "status": "supported",
+          "milestone": "M15-tables",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_DescribeTable.html"
+        },
+        {
+          "name": "DeleteTable",
+          "status_text": "supported (immediate; no `DELETING` state; returns TableDescription of the deleted table)",
+          "status": "supported",
+          "milestone": "M15-tables",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_DeleteTable.html"
+        },
+        {
+          "name": "UpdateTable",
+          "status_text": "supported (BillingMode mutation only; online GSI add/remove deferred to v0.3)",
+          "status": "supported",
+          "milestone": "M15-tables",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_UpdateTable.html"
+        },
+        {
+          "name": "GetItem",
+          "status_text": "supported (Item lookup by primary key; full AttributeValue coverage)",
+          "status": "supported",
+          "milestone": "M15-items",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_GetItem.html"
+        },
+        {
+          "name": "PutItem",
+          "status_text": "supported (auto-overwrite; ReturnValues NONE/ALL_OLD; ConditionExpression)",
+          "status": "supported",
+          "milestone": "M15-items, M15-expressions",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_PutItem.html"
+        },
+        {
+          "name": "DeleteItem",
+          "status_text": "supported (idempotent; ReturnValues NONE/ALL_OLD; ConditionExpression)",
+          "status": "supported",
+          "milestone": "M15-items, M15-expressions",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_DeleteItem.html"
+        },
+        {
+          "name": "UpdateItem",
+          "status_text": "supported (SET / REMOVE / ADD / DELETE; if_not_exists, list_append, atomic counters; full ReturnValues; ConditionExpression)",
+          "status": "supported",
+          "milestone": "M15-expressions",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_UpdateItem.html"
+        },
+        {
+          "name": "ConditionExpression",
+          "status_text": "supported (=, <>, <, <=, >, >=, AND, OR, NOT, BETWEEN, IN, attribute_exists, attribute_not_exists, attribute_type, begins_with, contains, parentheses)",
+          "status": "supported",
+          "milestone": "M15-expressions",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_ConditionExpression.html"
+        },
+        {
+          "name": "Expression reserved-word enforcement (~573 words)",
+          "status_text": "supported \u2014 bare reserved words in any expression rejected with `ValidationException`; clients alias via `ExpressionAttributeNames` (`#x`)",
+          "status": "supported",
+          "milestone": "v0.2.1",
+          "aws_doc_url": null
+        },
+        {
+          "name": "UpdateExpression",
+          "status_text": "supported (SET / REMOVE / ADD / DELETE actions; arithmetic on N; if_not_exists; list_append; set union / subtraction)",
+          "status": "supported",
+          "milestone": "M15-expressions",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_UpdateExpression.html"
+        },
+        {
+          "name": "Query",
+          "status_text": "supported (KeyConditionExpression + FilterExpression; Limit; ScanIndexForward; ExclusiveStartKey/LastEvaluatedKey cursor)",
+          "status": "supported",
+          "milestone": "M15-query",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Query.html"
+        },
+        {
+          "name": "KeyConditionExpression",
+          "status_text": "supported (pk = X [AND sk pred]; sk pred = `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `begins_with`)",
+          "status": "supported",
+          "milestone": "M15-query",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_KeyConditionExpression.html"
+        },
+        {
+          "name": "FilterExpression",
+          "status_text": "supported (reuses ConditionExpression grammar; runs after key match)",
+          "status": "supported",
+          "milestone": "M15-query",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_FilterExpression.html"
+        },
+        {
+          "name": "Scan",
+          "status_text": "supported (FilterExpression, Limit, ExclusiveStartKey cursor; `TotalSegments > 1` \u2192 ValidationException)",
+          "status": "supported",
+          "milestone": "M15-scan",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Scan.html"
+        },
+        {
+          "name": "BatchGetItem",
+          "status_text": "supported (up to 100 keys; cross-table; `UnprocessedKeys` always empty \u2014 succeed-or-fail)",
+          "status": "supported",
+          "milestone": "M15-batch",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchGetItem.html"
+        },
+        {
+          "name": "BatchWriteItem",
+          "status_text": "supported (up to 25 Put/Delete ops; cross-table; `UnprocessedItems` always empty)",
+          "status": "supported",
+          "milestone": "M15-batch",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html"
+        },
+        {
+          "name": "Query on GSI / LSI (via `IndexName`)",
+          "status_text": "supported (ALL / KEYS_ONLY / INCLUDE projection types; ScanIndexForward; FilterExpression after projection; ExclusiveStartKey/LastEvaluatedKey cursor)",
+          "status": "supported",
+          "milestone": "M15-gsi",
+          "aws_doc_url": null
+        },
+        {
+          "name": "TransactGetItems",
+          "status_text": "supported (up to 100 ops; atomic snapshot under the Fs mutex)",
+          "status": "supported",
+          "milestone": "M15-tx",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactGetItems.html"
+        },
+        {
+          "name": "TransactWriteItems",
+          "status_text": "supported (Put / Update / Delete / ConditionCheck; up to 100 ops; all-or-nothing atomicity; per-op CancellationReasons on failure)",
+          "status": "supported",
+          "milestone": "M15-tx",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html"
+        },
+        {
+          "name": "DescribeLimits",
+          "status_text": "supported (returns synthetic AWS-default account limits)",
+          "status": "supported",
+          "milestone": "M15-polish",
+          "aws_doc_url": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_DescribeLimits.html"
+        },
+        {
+          "name": "TagResource / UntagResource / ListTagsOfResource",
+          "status_text": "supported (metadata-only; not persisted across nanostack restart)",
+          "status": "supported",
+          "milestone": "M15-polish",
+          "aws_doc_url": null
+        },
+        {
+          "name": "**StreamSpecification on CreateTable / UpdateTable**",
+          "status_text": "supported (all four view types \u2014 NEW_IMAGE / OLD_IMAGE / NEW_AND_OLD_IMAGES / KEYS_ONLY; spec persists across restart; LatestStreamLabel + LatestStreamArn echoed on DescribeTable)",
+          "status": "supported",
+          "milestone": "v0.2.2",
+          "aws_doc_url": null
+        },
+        {
+          "name": "**UpdateTimeToLive / DescribeTimeToLive**",
+          "status_text": "supported (background sweeper evicts items where the TTL attribute is a Number \u2264 now(); spec persists across restart; sweeper-driven REMOVE records on the stream carry `userIdentity = {Type: \"Service\", PrincipalId: \"dynamodb.amazonaws.com\"}`)",
+          "status": "supported",
+          "milestone": "v0.2.3",
+          "aws_doc_url": null
+        },
+        {
+          "name": "**ExecuteStatement**",
+          "status_text": "supported (SELECT / INSERT / UPDATE / DELETE; positional `?` parameters; RETURNING ALL_OLD/ALL_NEW/MODIFIED_OLD/MODIFIED_NEW on UPDATE/DELETE; quoted + unquoted identifiers; index access via `\"table\".\"index\"`)",
+          "status": "supported",
+          "milestone": "v0.2.4",
+          "aws_doc_url": null
+        },
+        {
+          "name": "**ExecuteTransaction**",
+          "status_text": "supported (up to 100 statements; atomic all-or-nothing; SELECT rejected per AWS; cancellation surfaces TransactionCanceledException with CancellationReasons)",
+          "status": "supported",
+          "milestone": "v0.2.4",
+          "aws_doc_url": null
+        },
+        {
+          "name": "**BatchExecuteStatement**",
+          "status_text": "supported (up to 25 statements; per-statement Responses array; SELECT/INSERT/UPDATE/DELETE all allowed; per-statement errors don't abort the batch)",
+          "status": "supported",
+          "milestone": "v0.2.4",
+          "aws_doc_url": null
+        },
+        {
+          "name": "**CreateBackup**",
+          "status_text": "supported (real on-disk snapshot of schema + items at time T; backups outlive their source table, matching AWS)",
+          "status": "supported",
+          "milestone": "v0.2.5",
+          "aws_doc_url": null
+        },
+        {
+          "name": "**ListBackups**",
+          "status_text": "supported (TableName filter; Limit + ExclusiveStartBackupArn cursor; lex-ascending)",
+          "status": "supported",
+          "milestone": "v0.2.5",
+          "aws_doc_url": null
+        },
+        {
+          "name": "**DescribeBackup**",
+          "status_text": "supported (returns BackupDescription with snapshotted KeySchema + ItemCount + SourceTableDetails)",
+          "status": "supported",
+          "milestone": "v0.2.5",
+          "aws_doc_url": null
+        },
+        {
+          "name": "**DeleteBackup**",
+          "status_text": "supported (returns BackupDescription with BackupStatus=DELETED; idempotent on missing \u2192 BackupNotFoundException)",
+          "status": "supported",
+          "milestone": "v0.2.5",
+          "aws_doc_url": null
+        },
+        {
+          "name": "**RestoreTableFromBackup**",
+          "status_text": "supported (creates new table from snapshotted schema; replays every snapshotted item; rejects on target-name conflict with ResourceInUseException)",
+          "status": "supported",
+          "milestone": "v0.2.5",
+          "aws_doc_url": null
+        },
+        {
+          "name": "**UpdateContinuousBackups**",
+          "status_text": "supported (ENABLED / DISABLED; spec persists across restart; no transient ENABLING/DISABLING)",
+          "status": "supported",
+          "milestone": "v0.2.5",
+          "aws_doc_url": null
+        },
+        {
+          "name": "**DescribeContinuousBackups**",
+          "status_text": "supported (returns PITR status + EarliestRestorableDateTime = max(table_created, now-35d), LatestRestorableDateTime = now)",
+          "status": "supported",
+          "milestone": "v0.2.5",
+          "aws_doc_url": null
+        },
+        {
+          "name": "**RestoreTableToPointInTime**",
+          "status_text": "supported (accepts RestoreDateTime / UseLatestRestorableTime but ignores them \u2014 always snapshots current source state; LocalStack-compatible divergence)",
+          "status": "supported",
+          "milestone": "v0.2.5",
+          "aws_doc_url": null
+        }
+      ],
+      "divergences": [
+        {
+          "title": "Bucket-policy-style `Condition` blocks are skipped",
+          "body": "in IAM policies (same caveat as S3 M14). Not applicable to DynamoDB resource policies since we don't model IAM at all."
+        },
+        {
+          "title": "Imports/Exports",
+          "body": "\u2014 out of scope for v0.2.x. Returned as `ValidationException` (unknown target) for now. Candidate for a future patch if there's demand."
+        },
+        {
+          "title": "Global Tables, DAX",
+          "body": "\u2014 out of scope indefinitely. Global Tables is meaningless on a single-region emulator; DAX is a separate cache service with its own binary protocol, wrong shape for an emulator."
+        },
+        {
+          "title": "Parallel scan (`TotalSegments > 1`)",
+          "body": "will return `ValidationException`."
+        },
+        {
+          "title": "GSI auto-fetch-from-base-table",
+          "body": "for non-projected attrs is a client-SDK behavior; nanostack returns only the projected attrs."
+        },
+        {
+          "title": "Streams: single open shard per stream",
+          "body": "(no shard splitting / closed-shard semantics). Sequence numbers are a monotonic per-stream counter rendered as 21-digit zero-padded decimals. Re-enabling a stream rotates the shard ID (matches AWS's \"label changes on re-enable\")."
+        },
+        {
+          "title": "Streams: 24h retention is approximate",
+          "body": "\u2014 records older than 24h are dropped on next consult, but a write-heavy stream may evict records younger than 24h once the 1000-record bound is hit."
+        },
+        {
+          "title": "TTL: sweep interval defaults to 5 seconds",
+          "body": "(vs AWS \"best-effort within 48h\"). Tunable via `--ttl-sweep-interval-seconds N` (range 1..=3600). 5s is right for local-dev tests; production-faithful retry-after-eviction-delay simulations would set this higher."
+        },
+        {
+          "title": "TTL: status transitions snap immediately",
+          "body": "AWS shows ENABLING / DISABLING transients for ~1h after each call; we move straight to ENABLED / DISABLED. Tests asserting on transient states won't match."
+        },
+        {
+          "title": "PartiQL grammar",
+          "body": ": Phase 1 covers what AWS supports \u2014 SELECT / INSERT / UPDATE / DELETE with WHERE constrained to PK eq + optional SK predicate (eq / lt / le / gt / ge / BETWEEN / begins_with). FilterExpression-style scan filters (OR / NOT / IN / AND-of-non-key-attrs) and richer SET (list_append, if_not_exists) land in future patches. Quoted identifiers are case-sensitive; unquoted identifiers case-fold to lowercase, matching AWS."
+        },
+        {
+          "title": "PartiQL `LIMIT` in statement",
+          "body": ": rejected \u2014 AWS doesn't support it either. Use the request-level `Limit` parameter instead."
+        },
+        {
+          "title": "PITR target time is ignored",
+          "body": "`RestoreTableToPointInTime` accepts `RestoreDateTime` / `UseLatestRestorableTime` but always snapshots the current source state. Documented divergence \u2014 same as LocalStack. Real time-travel would require a write-ahead log we don't keep."
+        },
+        {
+          "title": "`EarliestRestorableDateTime` is synthetic",
+          "body": "= `max(table_created, now - 35d)` even when PITR is disabled. boto3 reads the field unconditionally so we return a plausible value."
+        },
+        {
+          "title": "Backup snapshots aren't encrypted",
+          "body": "AWS uses KMS; we don't model KMS at all."
+        },
+        {
+          "title": "`BackupSizeBytes` is an estimate",
+          "body": "= sum of item-file sizes after JSON serialization."
+        }
+      ],
+      "code_paths": [
+        {
+          "label": "Service handlers",
+          "path": "src/services/dynamodb/"
+        },
+        {
+          "label": "Wire layer (parsers + renderers)",
+          "path": "src/wire/dynamodb/"
+        },
+        {
+          "label": "Python conformance tests",
+          "path": "tests/conformance/python/dynamodb/"
+        },
+        {
+          "label": "JS conformance tests",
+          "path": "tests/conformance/js/dynamodb/"
+        },
+        {
+          "label": "AWS CLI conformance tests",
+          "path": "tests/conformance/awscli/dynamodb/"
+        }
+      ]
+    },
+    {
+      "name": "SQS",
+      "ops": [
+        {
+          "name": "CreateQueue",
+          "status_text": "supported (Attributes parsed for VisibilityTimeout / DelaySeconds / ReceiveMessageWaitTimeSeconds / MessageRetentionPeriod / MaximumMessageSize / RedrivePolicy / Policy / **FifoQueue** / **ContentBasedDeduplication**; duplicate-name calls are idempotent; FIFO names must end in `.fifo`)",
+          "status": "supported",
+          "milestone": "v0.3.0, FIFO attrs v0.3.1",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_CreateQueue.html"
+        },
+        {
+          "name": "DeleteQueue",
+          "status_text": "supported (immediate; removes disk + in-memory state)",
+          "status": "supported",
+          "milestone": "v0.3.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteQueue.html"
+        },
+        {
+          "name": "ListQueues",
+          "status_text": "supported (QueueNamePrefix filter; MaxResults + NextToken cursor; lex-ascending)",
+          "status": "supported",
+          "milestone": "v0.3.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ListQueues.html"
+        },
+        {
+          "name": "GetQueueUrl",
+          "status_text": "supported",
+          "status": "supported",
+          "milestone": "v0.3.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_GetQueueUrl.html"
+        },
+        {
+          "name": "GetQueueAttributes",
+          "status_text": "supported (All / per-attribute selection; QueueArn synthesised; CreatedTimestamp from cold-start time; **FifoQueue** + **ContentBasedDeduplication** emitted on FIFO queues only)",
+          "status": "supported",
+          "milestone": "v0.3.0, FIFO attrs v0.3.1",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_GetQueueAttributes.html"
+        },
+        {
+          "name": "SetQueueAttributes",
+          "status_text": "supported (mutates VisibilityTimeout / DelaySeconds / ReceiveMessageWaitTimeSeconds / MessageRetentionPeriod / MaximumMessageSize / RedrivePolicy / Policy / **ContentBasedDeduplication**; FifoQueue is immutable post-creation)",
+          "status": "supported",
+          "milestone": "v0.3.0, FIFO attrs v0.3.1",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SetQueueAttributes.html"
+        },
+        {
+          "name": "PurgeQueue",
+          "status_text": "supported (clears in-memory + on-disk messages)",
+          "status": "supported",
+          "milestone": "v0.3.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_PurgeQueue.html"
+        },
+        {
+          "name": "SendMessage",
+          "status_text": "supported (real MD5 of body; per-message DelaySeconds override on Standard; MessageAttributes round-trip verbatim; FIFO **MessageGroupId** required, **MessageDeduplicationId** + dedup-window enforcement, per-queue monotonic **SequenceNumber** returned)",
+          "status": "supported",
+          "milestone": "v0.3.0, FIFO v0.3.1",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html"
+        },
+        {
+          "name": "ReceiveMessage",
+          "status_text": "supported (MaxNumberOfMessages 1..10; per-call VisibilityTimeout override; WaitTimeSeconds 0..20 long polling; visibility-timeout enforced via on-read promotion of expired in-flight messages; **FIFO per-group head-of-line blocking** \u2014 only one in-flight message per MessageGroupId at a time)",
+          "status": "supported",
+          "milestone": "v0.3.0, FIFO ordering v0.3.1",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html"
+        },
+        {
+          "name": "DeleteMessage",
+          "status_text": "supported (receipt-handle decoded + validated; idempotent on already-deleted, matches AWS)",
+          "status": "supported",
+          "milestone": "v0.3.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteMessage.html"
+        },
+        {
+          "name": "ChangeMessageVisibility",
+          "status_text": "supported (0..43200 seconds; 0 immediately re-releases)",
+          "status": "supported",
+          "milestone": "v0.3.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ChangeMessageVisibility.html"
+        },
+        {
+          "name": "SendMessageBatch",
+          "status_text": "supported (up to 10 entries; per-entry Successful / Failed split; per-entry SequenceNumber on FIFO; in-batch dedup collapses to one delivered message)",
+          "status": "supported",
+          "milestone": "v0.3.0, FIFO v0.3.1",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html"
+        },
+        {
+          "name": "DeleteMessageBatch",
+          "status_text": "supported (up to 10 entries; per-entry Successful / Failed split)",
+          "status": "supported",
+          "milestone": "v0.3.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteMessageBatch.html"
+        },
+        {
+          "name": "ChangeMessageVisibilityBatch",
+          "status_text": "supported (up to 10 entries; per-entry Successful / Failed split)",
+          "status": "supported",
+          "milestone": "v0.3.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ChangeMessageVisibilityBatch.html"
+        },
+        {
+          "name": "TagQueue",
+          "status_text": "supported (max 50 tags per queue; overwrites existing keys; persisted to tags.json)",
+          "status": "supported",
+          "milestone": "v0.3.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_TagQueue.html"
+        },
+        {
+          "name": "UntagQueue",
+          "status_text": "supported",
+          "status": "supported",
+          "milestone": "v0.3.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_UntagQueue.html"
+        },
+        {
+          "name": "ListQueueTags",
+          "status_text": "supported",
+          "status": "supported",
+          "milestone": "v0.3.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ListQueueTags.html"
+        },
+        {
+          "name": "ListDeadLetterSourceQueues",
+          "status_text": "supported (walks queues whose RedrivePolicy targets the given DLQ; sorted lex-ascending)",
+          "status": "supported",
+          "milestone": "v0.3.2",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ListDeadLetterSourceQueues.html"
+        },
+        {
+          "name": "AddPermission",
+          "status_text": "supported (constructs an IAM-style Statement and merges it into the Policy attribute; duplicate Label \u2192 InvalidParameterValue; **resulting policy is enforced at request time**)",
+          "status": "enforced",
+          "milestone": "v0.3.2, eval v0.3.3",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_AddPermission.html"
+        },
+        {
+          "name": "RemovePermission",
+          "status_text": "supported (drops the matching Sid; clears the Policy attribute when no statements remain; unknown Label \u2192 InvalidParameterValue)",
+          "status": "supported",
+          "milestone": "v0.3.2",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_RemovePermission.html"
+        },
+        {
+          "name": "StartMessageMoveTask",
+          "status_text": "supported (synchronous drain DLQ \u2192 destination at call time; auto-derives DestinationArn from the DLQ's redrive-source when omitted; **MaxNumberOfMessagesPerSecond accepted but ignored**)",
+          "status": "supported",
+          "milestone": "v0.3.2",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_StartMessageMoveTask.html"
+        },
+        {
+          "name": "CancelMessageMoveTask",
+          "status_text": "supported (returns the moved count; tasks are always immediately COMPLETED under our sync model, so cancellation is effectively a count read)",
+          "status": "supported",
+          "milestone": "v0.3.2",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_CancelMessageMoveTask.html"
+        },
+        {
+          "name": "ListMessageMoveTasks",
+          "status_text": "supported (filters by SourceArn; MaxResults 1..=10, newest-first)",
+          "status": "supported",
+          "milestone": "v0.3.2",
+          "aws_doc_url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ListMessageMoveTasks.html"
+        }
+      ],
+      "divergences": [
+        {
+          "title": "JSON wire only",
+          "body": "boto3 v1.34+, JS SDK v3, and CLI v2 all use the JSON wire by default. The legacy query-string / XML form is **out of scope** \u2014 users on older SDKs should upgrade."
+        },
+        {
+          "title": "FIFO high-throughput mode deferred",
+          "body": "`DeduplicationScope=messageGroup` and `FifoThroughputLimit=perMessageGroupId` (the per-group-throughput accounting mode AWS added for high-volume FIFO workloads) are not modelled \u2014 attributes accepted & round-tripped but the accounting isn't built. v0.3.x patch if a user asks."
+        },
+        {
+          "title": "FIFO SequenceNumber width",
+          "body": ": 20-digit zero-padded decimal (u128). AWS docs say \"up to 39 digits\". Strict-width parsers may need to relax."
+        },
+        {
+          "title": "Long polling = in-handler sleep loop",
+          "body": "ReceiveMessage with `WaitTimeSeconds > 0` blocks the handler thread, polling the queue every 100ms until a message arrives or the deadline expires. AWS-real uses a server-side event loop; we don't. Wastes one handler thread per long-poll; acceptable for local dev."
+        },
+        {
+          "title": "No connection-cancellation detection on long polling",
+          "body": "A client that drops mid-poll keeps the handler sleeping until the deadline. AWS-real would notice and return immediately."
+        },
+        {
+          "title": "No rate limits",
+          "body": "AWS enforces per-account caps on queues + sends/sec. We accept everything."
+        },
+        {
+          "title": "No encryption at rest",
+          "body": "(no SSE-SQS, no SSE-KMS). Same divergence as DDB backups."
+        },
+        {
+          "title": "Cross-account principals not supported",
+          "body": "SigV4 in nanostack verifies only against the configured `--access-key`; a request signed with a different account's key fails verification before reaching policy evaluation. Anonymous (`Principal: \"*\"`) grants work end-to-end via raw unsigned requests; explicit cross-account `Principal: { AWS: \"arn:aws:iam::<other-account>:root\" }` grants don't have a way to be exercised in nanostack."
+        },
+        {
+          "title": "`AddPermission` only constructs Allow statements",
+          "body": "(AWS-real shares this constraint). Users who need Deny statements must install a hand-built Policy via `SetQueueAttributes`."
+        },
+        {
+          "title": "Policy `Condition` blocks are skipped",
+          "body": "(statement evaluates as `no_match`, same caveat as the S3 evaluator). Inherited from `auth/policy_eval.zig`."
+        },
+        {
+          "title": "`MessageMoveTask` runs synchronously",
+          "body": "Real AWS executes tasks asynchronously with `MaxNumberOfMessagesPerSecond` throttling and exposes intermediate `RUNNING` status. We drain on Start, never expose `RUNNING`. `MaxNumberOfMessagesPerSecond` accepted but ignored. Move tasks are in-memory only \u2014 not persisted across restart."
+        },
+        {
+          "title": "MessageMoveTask cancellation is a count read",
+          "body": "Because tasks complete synchronously on Start, `CancelMessageMoveTask` always returns the final moved count rather than cutting a running task short."
+        }
+      ],
+      "code_paths": [
+        {
+          "label": "Service handlers",
+          "path": "src/services/sqs/"
+        },
+        {
+          "label": "Wire layer (parsers + renderers)",
+          "path": "src/wire/sqs/"
+        },
+        {
+          "label": "Python conformance tests",
+          "path": "tests/conformance/python/sqs/"
+        },
+        {
+          "label": "JS conformance tests",
+          "path": "tests/conformance/js/sqs/"
+        },
+        {
+          "label": "AWS CLI conformance tests",
+          "path": "tests/conformance/awscli/sqs/"
+        }
+      ]
+    },
+    {
+      "name": "SNS",
+      "ops": [
+        {
+          "name": "CreateTopic",
+          "status_text": "supported (DisplayName / Policy / DeliveryPolicy / KmsMasterKeyId attrs; duplicate-name idempotent; .fifo suffix rejected)",
+          "status": "supported",
+          "milestone": "v0.4.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_CreateTopic.html"
+        },
+        {
+          "name": "DeleteTopic",
+          "status_text": "supported (immediate; idempotent)",
+          "status": "supported",
+          "milestone": "v0.4.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_DeleteTopic.html"
+        },
+        {
+          "name": "ListTopics",
+          "status_text": "supported (lex-sorted ARNs)",
+          "status": "supported",
+          "milestone": "v0.4.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_ListTopics.html"
+        },
+        {
+          "name": "GetTopicAttributes",
+          "status_text": "supported (TopicArn / Owner / DisplayName / Policy / DeliveryPolicy / KmsMasterKeyId / SubscriptionsConfirmed/Pending/Deleted)",
+          "status": "supported",
+          "milestone": "v0.4.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_GetTopicAttributes.html"
+        },
+        {
+          "name": "SetTopicAttributes",
+          "status_text": "supported (mutates DisplayName / Policy / DeliveryPolicy / KmsMasterKeyId; unknown attribute names silently accepted)",
+          "status": "supported",
+          "milestone": "v0.4.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_SetTopicAttributes.html"
+        },
+        {
+          "name": "Subscribe",
+          "status_text": "supported (sqs protocol auto-confirms; others accept-store-roundtrip)",
+          "status": "supported",
+          "milestone": "v0.4.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_Subscribe.html"
+        },
+        {
+          "name": "Unsubscribe",
+          "status_text": "supported (idempotent)",
+          "status": "supported",
+          "milestone": "v0.4.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_Unsubscribe.html"
+        },
+        {
+          "name": "ListSubscriptions",
+          "status_text": "supported (across all topics)",
+          "status": "supported",
+          "milestone": "v0.4.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_ListSubscriptions.html"
+        },
+        {
+          "name": "ListSubscriptionsByTopic",
+          "status_text": "supported",
+          "status": "supported",
+          "milestone": "v0.4.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_ListSubscriptionsByTopic.html"
+        },
+        {
+          "name": "GetSubscriptionAttributes",
+          "status_text": "supported (SubscriptionArn / TopicArn / Protocol / Endpoint / Owner / ConfirmationWasAuthenticated / RawMessageDelivery / FilterPolicy? / DeliveryPolicy?)",
+          "status": "supported",
+          "milestone": "v0.4.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_GetSubscriptionAttributes.html"
+        },
+        {
+          "name": "SetSubscriptionAttributes",
+          "status_text": "supported (RawMessageDelivery enforced; **FilterPolicy evaluated at publish time as of v0.4.1**; DeliveryPolicy stored but not evaluated)",
+          "status": "enforced",
+          "milestone": "v0.4.0, FilterPolicy eval v0.4.1",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_SetSubscriptionAttributes.html"
+        },
+        {
+          "name": "ConfirmSubscription",
+          "status_text": "supported (accepts arbitrary token; auto-confirms the first unconfirmed sub on the topic)",
+          "status": "supported",
+          "milestone": "v0.4.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_ConfirmSubscription.html"
+        },
+        {
+          "name": "Publish",
+          "status_text": "supported (delivers SNS envelope JSON to SQS subscribers; raw bytes when RawMessageDelivery=true; MessageAttributes round-trip into envelope; **gated by subscription FilterPolicy as of v0.4.1**)",
+          "status": "enforced",
+          "milestone": "v0.4.0, filter eval v0.4.1",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_Publish.html"
+        },
+        {
+          "name": "PublishBatch",
+          "status_text": "supported (per-entry Successful / Failed split; **per-entry MessageAttributes as of v0.4.1**)",
+          "status": "supported",
+          "milestone": "v0.4.0, attrs v0.4.1",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_PublishBatch.html"
+        },
+        {
+          "name": "AddPermission",
+          "status_text": "supported (constructs an IAM-style Statement and merges it into the Policy attribute; duplicate Label \u2192 InvalidParameterValue; **resulting policy is enforced at request time as of v0.4.2**)",
+          "status": "enforced",
+          "milestone": "v0.4.1, eval v0.4.2",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_AddPermission.html"
+        },
+        {
+          "name": "RemovePermission",
+          "status_text": "supported (drops the matching statement; clears the Policy attribute when the last statement is removed)",
+          "status": "supported",
+          "milestone": "v0.4.1",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_RemovePermission.html"
+        },
+        {
+          "name": "TagResource",
+          "status_text": "supported (**persisted across restart as of v0.4.1**; max 50 tags)",
+          "status": "supported",
+          "milestone": "v0.4.0, persistence v0.4.1",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_TagResource.html"
+        },
+        {
+          "name": "UntagResource",
+          "status_text": "supported (persisted)",
+          "status": "supported",
+          "milestone": "v0.4.0, persistence v0.4.1",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_UntagResource.html"
+        },
+        {
+          "name": "ListTagsForResource",
+          "status_text": "supported",
+          "status": "supported",
+          "milestone": "v0.4.0",
+          "aws_doc_url": "https://docs.aws.amazon.com/sns/latest/api/API_ListTagsForResource.html"
+        }
+      ],
+      "divergences": [
+        {
+          "title": "Query wire protocol only",
+          "body": "No JSON migration to track; modern AWS SDKs (boto3, aws-sdk-js v3, AWS CLI v2) all use query."
+        },
+        {
+          "title": "FIFO topics deferred",
+          "body": "`.fifo` suffix rejected. Future v0.4.x patch."
+        },
+        {
+          "title": "Internal cross-service dispatch bypasses the authz hook",
+          "body": "`s3/events.zig` calls `snsPublish` at the storage layer (S3 \u2192 SNS notifications), and the SNS handler dispatches `sqsSendMessage` directly for fan-out \u2014 neither path reaches the SNS authz hook. Same documented divergence as v0.3.4 S3 \u2192 SQS dispatch. AWS uses a service-principal model we don't surface."
+        },
+        {
+          "title": "Topic-policy Condition blocks unsupported",
+          "body": "`auth/policy_eval.zig` skips Condition blocks (treats them as no-match), the same constraint that applies to S3 bucket policies and SQS queue policies. A statement with a Condition block evaluates as `no_match` and contributes nothing to the decision."
+        },
+        {
+          "title": "Filter-policy operators deferred",
+          "body": "v0.4.1 evaluates exact string-array shapes (e.g. `{\"category\": [\"news\", \"sports\"]}`); operator objects (`prefix`, `anything-but`, `numeric`, `exists`, `cidr`, `suffix`) are treated as no-match (the subscription is filtered out). AND across top-level keys, OR within a rule array. Future v0.4.x patch will land the operator set."
+        },
+        {
+          "title": "Only `sqs` protocol fires",
+          "body": "`lambda` / `http` / `https` / `email` / `email-json` / `sms` subscriptions are stored but never deliver."
+        },
+        {
+          "title": "`ConfirmSubscription` auto-confirms",
+          "body": "SQS subs at Subscribe time; for non-SQS protocols, the confirmation is a no-op that flips the persisted bit (since those subs never fire anyway)."
+        },
+        {
+          "title": "Signature fields are stubs",
+          "body": "`Signature` is the literal `\"nanostack-stub\"`; `SigningCertURL` is `https://nanostack.local/cert.pem`. nanostack doesn't do KMS-style signing. Matches LocalStack."
+        },
+        {
+          "title": "MessageAttributes only on envelope path",
+          "body": "When `RawMessageDelivery=true`, MessageAttributes are not propagated to the SQS message's MessageAttributes field. AWS does this; we don't (yet)."
+        },
+        {
+          "title": "Cross-account principals out of scope",
+          "body": "Same SigV4 limitation as the rest of nanostack \u2014 only the configured `--access-key` validates."
+        }
+      ],
+      "code_paths": [
+        {
+          "label": "Service handlers",
+          "path": "src/services/sns/"
+        },
+        {
+          "label": "Wire layer (parsers + renderers)",
+          "path": "src/wire/sns/"
+        },
+        {
+          "label": "Python conformance tests",
+          "path": "tests/conformance/python/sns/"
+        },
+        {
+          "label": "JS conformance tests",
+          "path": "tests/conformance/js/sns/"
+        },
+        {
+          "label": "AWS CLI conformance tests",
+          "path": "tests/conformance/awscli/sns/"
+        }
+      ]
+    }
+  ],
+  "cross_service": {
+    "flows": [
+      {
+        "flow": "S3 \u2192 SQS event notifications",
+        "status_text": "supported (v0.3.4)",
+        "status": "supported",
+        "notes": "PutObject / CopyObject / CompleteMultipartUpload \u2192 `s3:ObjectCreated:*`; DeleteObject / DeleteObjects \u2192 `s3:ObjectRemoved:Delete` or `:DeleteMarkerCreated`. Filter rules (prefix + suffix). Wildcard event matchers (`s3:ObjectCreated:*`, `s3:*`)."
+      },
+      {
+        "flow": "S3 \u2192 SNS notifications",
+        "status_text": "supported (v0.4.0)",
+        "status": "supported",
+        "notes": "TopicConfiguration entries now fire to SNS topics. The Message field of the SNS publish carries the S3 event envelope verbatim."
+      },
+      {
+        "flow": "SNS \u2192 SQS fan-out",
+        "status_text": "supported (v0.4.0)",
+        "status": "supported",
+        "notes": "One Publish \u2192 every SQS subscriber receives the SNS envelope (or raw Message bytes with RawMessageDelivery=true)."
+      },
+      {
+        "flow": "S3 \u2192 SNS \u2192 SQS multi-hop",
+        "status_text": "supported (v0.4.0)",
+        "status": "supported",
+        "notes": "Combines the above. The SQS subscriber sees an SNS envelope whose `Message` field is the S3 event envelope."
+      },
+      {
+        "flow": "S3 \u2192 Lambda notifications",
+        "status_text": "not supported",
+        "status": "not_supported",
+        "notes": "CloudFunctionConfiguration is parsed + stored, never fires. Lambda service not implemented (planned v0.5.0)."
+      },
+      {
+        "flow": "DynamoDB Streams \u2192 SQS",
+        "status_text": "not supported",
+        "status": "not_supported",
+        "notes": "DDB Streams emit to their own `GetRecords` API (v0.2.2). Cross-service piping deferred."
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "version": "0.3.2",
+      "name": "SQS robustness",
+      "shipped": true,
+      "scope": "Cold-start message rehydration; MessageRetentionPeriod sweeper; 6 unrouted ops (AddPermission/RemovePermission/ListDeadLetterSourceQueues/MessageMoveTask trio).",
+      "rationale": "Shipped 2026-05-18. Closes SUPPORT.md \u2194 behaviour drift; lands all unrouted ops. Queue Policy enforcement deferred to v0.3.3.",
+      "date": "2026-05-18",
+      "headline": "Patch release: SQS robustness",
+      "tests": {
+        "python": 495,
+        "js": 103,
+        "awscli": 43
+      }
+    },
+    {
+      "version": "0.3.3",
+      "name": "Queue Policy enforcement",
+      "shipped": true,
+      "scope": "Wire policy_eval.zig into a new src/services/sqs/authz.zig hook; SQS action map; thread Principal through the SQS service context.",
+      "rationale": "Shipped 2026-05-18. Last SQS gap closed. After this, SQS is feature-complete + fully enforced.",
+      "date": "2026-05-18",
+      "headline": "Patch release: SQS Queue Policy enforcement",
+      "tests": {
+        "python": 504,
+        "js": 106,
+        "awscli": 45
+      }
+    },
+    {
+      "version": "0.3.4",
+      "name": "S3 \u2192 SQS event notifications",
+      "shipped": true,
+      "scope": "Wire PutBucketNotificationConfiguration QueueConfiguration entries to actually fire on PutObject / DeleteObject / Copy / CompleteMultipartUpload, with prefix/suffix filter eval and AWS-format event envelope.",
+      "rationale": "Shipped 2026-05-18. The strategic unlock \u2014 first cross-service wiring proven. Canonical local-dev serverless workflow (upload \u2192 queue \u2192 worker) works end-to-end.",
+      "date": "2026-05-18",
+      "headline": "Patch release: S3 \u2192 SQS event notifications. The strategic unlock",
+      "tests": {
+        "python": 514,
+        "js": 109,
+        "awscli": 47
+      }
+    },
+    {
+      "version": "0.4.0",
+      "name": "SNS",
+      "shipped": true,
+      "scope": "17 ops (topic CRUD + subscriptions + Publish/PublishBatch + tags). SNS \u2192 SQS fan-out + S3 \u2192 SNS dispatch. Query+XML wire protocol layer added.",
+      "rationale": "Shipped 2026-05-18. First minor since v0.3.0 SQS. Multi-hop S3 \u2192 SNS \u2192 SQS works end-to-end.",
+      "date": "2026-05-18",
+      "headline": "Minor release: SNS joins S3 + DynamoDB + SQS",
+      "tests": {
+        "python": 542,
+        "js": 115,
+        "awscli": 51
+      }
+    },
+    {
+      "version": "0.4.1",
+      "name": "SNS robustness",
+      "shipped": true,
+      "scope": "Tags persistence across restart; AddPermission / RemovePermission (Policy mutation, accept-store-roundtrip); per-entry MessageAttributes on PublishBatch; FilterPolicy evaluated at publish time (exact string-array shapes).",
+      "rationale": "Shipped 2026-05-18. Closes the four divergences flagged in v0.4.0's SUPPORT.md. Topic Policy enforcement deferred to v0.4.2 (same v0.3.2 \u2192 v0.3.3 SQS trajectory).",
+      "date": "2026-05-18",
+      "headline": "Patch release: SNS robustness",
+      "tests": {
+        "python": 558,
+        "js": 118,
+        "awscli": 53
+      }
+    },
+    {
+      "version": "0.4.2",
+      "name": "SNS Topic Policy enforcement",
+      "shipped": true,
+      "scope": "Wire policy_eval.zig into a new src/services/sns/authz.zig hook; SNS action map; thread Principal through the SNS service context.",
+      "rationale": "Shipped 2026-05-18. Mirrors v0.3.3 SQS verbatim. After this, SNS is feature-complete + enforced modulo FIFO.",
+      "date": "2026-05-18",
+      "headline": "Patch release: SNS Topic Policy enforcement",
+      "tests": {
+        "python": 568,
+        "js": 121,
+        "awscli": 55
+      }
+    },
+    {
+      "version": "0.5.0",
+      "name": "Lambda",
+      "shipped": false,
+      "scope": "Function CRUD + Invoke + S3 / SQS / DDB-Streams event-source mappings. Likely a sidecar-process execution model (we don't host an in-Zig runtime).",
+      "rationale": "The big multi-service hop. Highest payoff for the v1.0 claim. (Minor.)"
+    },
+    {
+      "version": "1.0.0",
+      "name": "Polish + multi-profile + bench",
+      "shipped": false,
+      "scope": "Multi-profile state isolation (deferred from v1 per \u00a717a); end-to-end performance pass against the broader surface; documented \"production local-dev surface\".",
+      "rationale": "\"Curated multi-service surface workflow-ready.\" Stabilization, not new features. (Major.)"
+    }
+  ],
+  "coverage": {
+    "s3": [
+      68,
+      107
+    ]
+  },
+  "bench": [
+    {
+      "metric": "Cold start",
+      "measured": "2.5 ms",
+      "budget": "500 ms"
+    },
+    {
+      "metric": "Idle RSS",
+      "measured": "11.7 MB",
+      "budget": "30 MB"
+    },
+    {
+      "metric": "Binary size",
+      "measured": "1.34 MB",
+      "budget": "20 MB"
+    },
+    {
+      "metric": "Wipe-restart",
+      "measured": "145 ms",
+      "budget": "500 ms"
+    },
+    {
+      "metric": "Put p50 (1 KB)",
+      "measured": "2.85 ms",
+      "budget": "3 ms"
+    },
+    {
+      "metric": "Put p99 (1 KB)",
+      "measured": "4.95 ms",
+      "budget": "10 ms"
+    },
+    {
+      "metric": "Get p99 (1 KB)",
+      "measured": "2.46 ms",
+      "budget": "5 ms"
+    },
+    {
+      "metric": "Put throughput (32 workers)",
+      "measured": "267 req/s",
+      "budget": "150 req/s"
+    },
+    {
+      "metric": "Multipart p99 (5 \u00d7 5 MiB)",
+      "measured": "228 ms",
+      "budget": "500 ms"
+    },
+    {
+      "metric": "HeadBucket p99 (info)",
+      "measured": "2.4 ms",
+      "budget": "\u2014"
+    }
+  ],
+  "tests": {
+    "python": 568,
+    "js": 121,
+    "awscli": 55
+  }
+}

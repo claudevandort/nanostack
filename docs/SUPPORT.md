@@ -140,7 +140,7 @@ Documented divergences (intentional):
 
 ## SQS
 
-SQS is the third AWS service nanostack covers, opt-in via `--services sqs` (or `--services s3,dynamodb,sqs` to enable all three). v0.3.0 shipped 17 ops; v0.3.1 added FIFO queues; v0.3.2 added the remaining 6 ops + cold-start safety + the MessageRetentionPeriod sweeper. **v0.3.3 lands Queue Policy enforcement** — the Policy attribute (mutated by `AddPermission` / `RemovePermission` / `SetQueueAttributes`) is now evaluated on every request via the existing `auth/policy_eval.zig`. After v0.3.3, SQS is feature-complete + fully enforced.
+SQS is the third AWS service nanostack covers, opt-in via `--services sqs` (or `--services s3,dynamodb,sqs` to enable all three). v0.3.0 shipped 17 ops; v0.3.1 added FIFO queues; v0.3.2 added the remaining 6 ops + cold-start safety + the MessageRetentionPeriod sweeper. **v0.3.3 lands Queue Policy enforcement** — the Policy attribute (mutated by `AddPermission` / `RemovePermission` / `SetQueueAttributes`) is now evaluated on every request via the existing `auth/policy_eval.zig`. After v0.3.3, SQS is feature-complete + fully enforced. **v0.3.4 wires S3 → SQS** event notifications (see the [Cross-service wiring](#cross-service-wiring) section); v0.4.0 adds SNS → SQS fan-out plus end-to-end S3 → SNS → SQS multi-hop.
 
 The authz cascade (in `src/services/sqs/authz.zig`):
 
@@ -371,7 +371,7 @@ These will only be added if a real user hits a setup-script gap; not on any road
 | CORS XML round-trip (rules: AllowedMethod/AllowedOrigin/AllowedHeader/ExposeHeader/MaxAgeSeconds) | supported (accept-store-roundtrip; no actual cross-origin enforcement) | M11 |
 | Server-side encryption config (AES256 / aws:kms / aws:kms:dsse; KMSMasterKeyID; BucketKeyEnabled) | supported (accept-store-roundtrip; **no actual cipher applied to object data**) | M11 |
 | Lifecycle rules (Filter, Prefix, Transition, Expiration, NoncurrentVersionTransition, NoncurrentVersionExpiration, AbortIncompleteMultipartUpload) | supported (accept-store-roundtrip; **rules never expire / transition objects**) | M11 |
-| Notification targets (TopicConfiguration → SNS, QueueConfiguration → SQS, CloudFunctionConfiguration → Lambda; events + filter rules) | supported (**QueueConfiguration entries fire to SQS as of v0.3.4**; TopicConfiguration / CloudFunctionConfiguration still accept-store-roundtrip — SNS / Lambda not implemented) | M11, dispatch v0.3.4 |
+| Notification targets (TopicConfiguration → SNS, QueueConfiguration → SQS, CloudFunctionConfiguration → Lambda; events + filter rules) | supported (**QueueConfiguration entries fire to SQS as of v0.3.4**; **TopicConfiguration entries fire to SNS as of v0.4.0** — composes with SNS→SQS for end-to-end S3→SNS→SQS multi-hop; CloudFunctionConfiguration still accept-store-roundtrip — Lambda not implemented) | M11, dispatch v0.3.4 / v0.4.0 |
 | Website config (IndexDocument / ErrorDocument / RedirectAllRequestsTo / RoutingRules) | supported (accept-store-roundtrip; **website-mode requests not honoured**) | M11 |
 | `GetObjectAttributes` ObjectParts detail | partial (`PartsCount` only; per-part rows out of scope) | M11 |
 | **Enforcement of any M11 config** | **not enforced** (accept-store-roundtrip only; documented divergence) | M11 |
@@ -459,8 +459,8 @@ Two cross-service flows landed:
 | S3 → Lambda notifications | not supported | CloudFunctionConfiguration is parsed + stored, never fires. Lambda service not implemented (planned v0.5.0). |
 | DynamoDB Streams → SQS | not supported | DDB Streams emit to their own `GetRecords` API (v0.2.2). Cross-service piping deferred. |
 
-Documented divergences (S3 → SQS):
-- **Sender principal**: AWS uses a service-principal model (`Principal: { Service: "s3.amazonaws.com" }` grants in queue policies). nanostack dispatches from the storage layer, bypassing the SQS authz hook entirely. Matches LocalStack.
+Documented divergences (S3 → SQS / S3 → SNS):
+- **Sender principal**: AWS uses a service-principal model (`Principal: { Service: "s3.amazonaws.com" }` grants in queue / topic policies). nanostack dispatches from the storage layer, bypassing both the SQS and SNS authz hooks entirely. Matches LocalStack.
 - **`sourceIPAddress` is hardcoded `127.0.0.1`** — we don't surface the real client IP through to the S3 handler.
 - **Request IDs in the event envelope are freshly minted** — they don't match the `x-amz-request-id` of the original S3 response.
 - **Fire-and-forget dispatch** — S3 op success doesn't depend on SQS reachability. Errors are logged + dropped (AWS retries internally; we don't).
