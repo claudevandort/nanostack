@@ -39,6 +39,7 @@ const policy_status_service = @import("policy_status.zig");
 const restore_service = @import("restore.zig");
 const object_encryption_service = @import("object_encryption.zig");
 const replication_service = @import("replication.zig");
+const events = @import("events.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -678,6 +679,14 @@ fn putObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
         .legal_hold = lock_info.legal_hold,
     }) catch |err| return .{ .err = mapStorageErr(err) };
 
+    events.dispatchObjectCreated(ctx, bucket, .{
+        .key = key,
+        .size = ctx.request.body.len,
+        .etag = out.etag,
+        .version_id = if (out.version_id.len > 0) out.version_id else null,
+        .event_name = "s3:ObjectCreated:Put",
+    });
+
     var hs: std.ArrayList(Header) = .empty;
     defer hs.deinit(ctx.allocator);
     hs.append(ctx.allocator, .{ .name = "ETag", .value = out.etag }) catch return .{ .err = .internal_error };
@@ -800,6 +809,14 @@ fn copyObject(ctx: Context, dest_bucket: []const u8, dest_key: []const u8) Resul
         .retain_until_unix = lock_info.retain_until_unix,
         .legal_hold = lock_info.legal_hold,
     }) catch |err| return .{ .err = mapStorageErr(err) };
+
+    events.dispatchObjectCreated(ctx, dest_bucket, .{
+        .key = dest_key,
+        .size = source_obj.body.len,
+        .etag = put_out.etag,
+        .version_id = if (put_out.version_id.len > 0) put_out.version_id else null,
+        .event_name = "s3:ObjectCreated:Copy",
+    });
 
     // ---------- Render response ----------
     // Fetch the destination's stored last_modified_unix for the response.
@@ -932,6 +949,12 @@ fn deleteObject(ctx: Context, bucket: []const u8, key: []const u8) Result {
     const out = ctx.backend.deleteObject(.{ .bucket = bucket, .key = key, .version_id = version_id, .bypass_governance = bypass_governance }) catch |err|
         return .{ .err = mapStorageErr(err) };
 
+    events.dispatchObjectRemoved(ctx, bucket, .{
+        .key = key,
+        .version_id = if (out.version_id.len > 0) out.version_id else null,
+        .delete_marker = out.delete_marker,
+    });
+
     // On a versioned bucket the response carries `x-amz-version-id` and
     // (when applicable) `x-amz-delete-marker: true`.
     var hs: std.ArrayList(Header) = .empty;
@@ -988,6 +1011,12 @@ fn deleteObjects(ctx: Context, bucket: []const u8) Result {
             if (out.version_id.len > 0) entry_result.delete_marker_version_id = out.version_id;
         }
         deleted.append(ctx.allocator, entry_result) catch return .{ .err = .internal_error };
+
+        events.dispatchObjectRemoved(ctx, bucket, .{
+            .key = entry.key,
+            .version_id = if (out.version_id.len > 0) out.version_id else null,
+            .delete_marker = out.delete_marker,
+        });
     }
 
     const result: storage.DeleteResult = .{

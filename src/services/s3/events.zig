@@ -247,10 +247,10 @@ pub fn buildEnvelope(allocator: Allocator, args: EnvelopeArgs) ![]u8 {
     try s.beginObject();
     try s.objectField("x-amz-request-id");
     var rid_buf: [32]u8 = undefined;
-    try s.write(mintHexId(&rid_buf, 16));
+    try s.write(mintHexId16(&rid_buf));
     try s.objectField("x-amz-id-2");
     var id2_buf: [64]u8 = undefined;
-    try s.write(mintHexId(&id2_buf, 32));
+    try s.write(mintHexId32(&id2_buf));
     try s.endObject();
 
     try s.objectField("s3");
@@ -289,7 +289,7 @@ pub fn buildEnvelope(allocator: Allocator, args: EnvelopeArgs) ![]u8 {
     }
     try s.objectField("sequencer");
     var seq_buf: [32]u8 = undefined;
-    try s.write(mintHexId(&seq_buf, 16));
+    try s.write(mintHexId16(&seq_buf));
     try s.endObject();
 
     try s.endObject(); // s3
@@ -301,14 +301,21 @@ pub fn buildEnvelope(allocator: Allocator, args: EnvelopeArgs) ![]u8 {
     return aw.toOwnedSlice();
 }
 
-/// Render the current UTC time as `YYYY-MM-DDTHH:MM:SS.mmmZ`. Uses the
-/// nanostack clock so tests run deterministically when the clock is
-/// mocked (currently it isn't).
+/// Wall-clock now: (seconds, nanos-into-second). Uses
+/// `std.os.linux.clock_gettime` directly — service layer doesn't have
+/// access to nanostack's Io abstraction. nanostack is Linux-only (per
+/// PRD §2 Non-Goals), so the platform-specific call is fine.
+fn nowParts() struct { secs: i64, nanos: i64 } {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+    return .{ .secs = ts.sec, .nanos = @intCast(ts.nsec) };
+}
+
+/// Render the current UTC time as `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 fn isoNowUtc(buf: *[40]u8) []const u8 {
-    const now_ns = std.time.nanoTimestamp();
-    const total_secs: i64 = @intCast(@divFloor(now_ns, std.time.ns_per_s));
-    const millis: u32 = @intCast(@divFloor(@mod(now_ns, std.time.ns_per_s), std.time.ns_per_ms));
-    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(total_secs) };
+    const now = nowParts();
+    const millis: u32 = @intCast(@divFloor(now.nanos, std.time.ns_per_ms));
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(now.secs) };
     const day_secs = epoch.getDaySeconds();
     const epoch_day = epoch.getEpochDay();
     const year_day = epoch_day.calculateYearDay();
@@ -324,25 +331,45 @@ fn isoNowUtc(buf: *[40]u8) []const u8 {
     }) catch buf[0..];
 }
 
-/// Mint a fresh hex id of length `width` bytes (2*width hex chars).
-/// Uses nanosecond timestamp + a small counter so consecutive calls
-/// within the same nanosecond don't collide.
+/// Mint a fresh 16-byte hex id (32 hex chars). Suitable for
+/// x-amz-request-id / sequencer.
 var id_counter: std.atomic.Value(u64) = .init(0);
 
-fn mintHexId(buf: []u8, width: usize) []const u8 {
-    std.debug.assert(buf.len >= width * 2);
-    const ns: u128 = @intCast(std.time.nanoTimestamp());
+fn mintHexId16(buf: *[32]u8) []const u8 {
+    const now = nowParts();
+    const secs_u: u64 = @intCast(@max(now.secs, 0));
+    const nanos_u: u64 = @intCast(@max(now.nanos, 0));
+    const n: u64 = id_counter.fetchAdd(1, .monotonic);
+    var raw: [16]u8 = undefined;
+    std.mem.writeInt(u64, raw[0..8], secs_u, .big);
+    std.mem.writeInt(u32, raw[8..12], @truncate(nanos_u), .big);
+    std.mem.writeInt(u32, raw[12..16], @truncate(n), .big);
+    const hex = "0123456789abcdef";
+    for (raw, 0..) |b, i| {
+        buf[i * 2] = hex[(b >> 4) & 0xf];
+        buf[i * 2 + 1] = hex[b & 0xf];
+    }
+    return buf[0..32];
+}
+
+/// Mint a fresh 32-byte hex id (64 hex chars). Suitable for
+/// x-amz-id-2 which AWS renders longer than x-amz-request-id.
+fn mintHexId32(buf: *[64]u8) []const u8 {
+    const now = nowParts();
+    const secs_u: u64 = @intCast(@max(now.secs, 0));
+    const nanos_u: u64 = @intCast(@max(now.nanos, 0));
     const n: u64 = id_counter.fetchAdd(1, .monotonic);
     var raw: [32]u8 = undefined;
-    // First 16 bytes from the nanosecond timestamp.
-    std.mem.writeInt(u128, raw[0..16], ns, .big);
-    // Next 8 bytes from the per-process counter (helps disambiguate
-    // within the same nanosecond).
+    std.mem.writeInt(u64, raw[0..8], secs_u, .big);
+    std.mem.writeInt(u64, raw[8..16], nanos_u, .big);
     std.mem.writeInt(u64, raw[16..24], n, .big);
-    // Remaining 8 bytes: zero (kept for any future extension).
     @memset(raw[24..32], 0);
-    const w = @min(width, raw.len);
-    return std.fmt.bytesToHex(raw[0..w], .lower)[0 .. w * 2] catch unreachable;
+    const hex = "0123456789abcdef";
+    for (raw, 0..) |b, i| {
+        buf[i * 2] = hex[(b >> 4) & 0xf];
+        buf[i * 2 + 1] = hex[b & 0xf];
+    }
+    return buf[0..64];
 }
 
 // ---------------------------------------------------------------------------
