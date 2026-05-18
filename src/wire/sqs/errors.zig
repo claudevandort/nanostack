@@ -21,6 +21,7 @@ pub const Code = enum {
     batch_entry_ids_not_distinct,
     empty_batch_request,
     invalid_attribute_value,
+    access_denied,
     not_implemented,
     internal_server_error,
 
@@ -37,6 +38,7 @@ pub const Code = enum {
             .batch_entry_ids_not_distinct => "AWS.SimpleQueueService.BatchEntryIdsNotDistinct",
             .empty_batch_request => "AWS.SimpleQueueService.EmptyBatchRequest",
             .invalid_attribute_value => "InvalidAttributeValue",
+            .access_denied => "AccessDenied",
             .not_implemented => "InternalFailure",
             .internal_server_error => "InternalFailure",
         };
@@ -55,6 +57,7 @@ pub const Code = enum {
             .batch_entry_ids_not_distinct => "Two or more batch entries have the same Id.",
             .empty_batch_request => "The batch request doesn't contain any entries.",
             .invalid_attribute_value => "The specified attribute value is invalid.",
+            .access_denied => "Access to the resource is denied.",
             .not_implemented => "This operation is not implemented in nanostack.",
             .internal_server_error => "An error occurred on the server side.",
         };
@@ -63,6 +66,7 @@ pub const Code = enum {
     pub fn httpStatus(self: Code) u16 {
         return switch (self) {
             .internal_server_error, .not_implemented => 500,
+            .access_denied => 403,
             else => 400,
         };
     }

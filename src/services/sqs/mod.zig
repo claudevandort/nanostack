@@ -9,6 +9,8 @@ const Allocator = std.mem.Allocator;
 const storage = @import("../../storage/mod.zig");
 const errors = @import("../../wire/sqs/errors.zig");
 const principal_mod = @import("../../auth/principal.zig");
+const sqs_action_map = @import("../../auth/sqs_action_map.zig");
+const authz = @import("authz.zig");
 const queues_handler = @import("queues.zig");
 const messages_handler = @import("messages.zig");
 const tags_handler = @import("tags.zig");
@@ -65,6 +67,18 @@ pub const target_prefix = "AmazonSQS.";
 pub fn handle(ctx: Context) Result {
     const target = ctx.request.target;
 
+    // Queue Policy authz hook (v0.3.3). Runs after target match, before
+    // op dispatch. Only known targets get this far (unknown targets
+    // fall through to the bottom of the dispatch table). `--no-auth`
+    // bypasses inside `authz.check`. Owner-implicit-allow short-circuits
+    // for requests signed with the configured access_key.
+    if (sqs_action_map.actionFor(target).len > 0) {
+        const queue_name = extractQueueName(ctx.allocator, ctx.request.body);
+        if (authz.check(ctx, target, queue_name) == .deny) {
+            return .{ .err = .{ .code = .access_denied } };
+        }
+    }
+
     // Queue management (Phase 1).
     if (std.mem.eql(u8, target, "CreateQueue")) return queues_handler.createQueue(ctx);
     if (std.mem.eql(u8, target, "DeleteQueue")) return queues_handler.deleteQueue(ctx);
@@ -106,4 +120,38 @@ pub fn handle(ctx: Context) Result {
     const owned = ctx.allocator.dupe(u8, msg) catch
         return .{ .err = .{ .code = .internal_server_error } };
     return .{ .err = .{ .code = .invalid_parameter_value, .message = owned } };
+}
+
+/// Peek the JSON body for a `QueueUrl` field and return just the queue
+/// name (last URL segment). Used by the authz hook before handler
+/// dispatch — handlers parse the body again with full validation.
+/// Returns null when the body is missing/malformed/has no QueueUrl
+/// (account-scoped ops + parse failures).
+fn extractQueueName(allocator: Allocator, body: []const u8) ?[]const u8 {
+    if (body.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    if (parsed.value.object.get("QueueUrl")) |v| {
+        if (v != .string) return null;
+        const url = v.string;
+        const last_slash = std.mem.lastIndexOfScalar(u8, url, '/') orelse return null;
+        const name = url[last_slash + 1 ..];
+        return allocator.dupe(u8, name) catch null;
+    }
+    // CreateQueue / GetQueueUrl: also accept top-level QueueName.
+    if (parsed.value.object.get("QueueName")) |v| {
+        if (v != .string) return null;
+        return allocator.dupe(u8, v.string) catch null;
+    }
+    // ListMessageMoveTasks / StartMessageMoveTask: SourceArn (queue
+    // ARN; extract trailing segment).
+    if (parsed.value.object.get("SourceArn")) |v| {
+        if (v != .string) return null;
+        const arn = v.string;
+        const last_colon = std.mem.lastIndexOfScalar(u8, arn, ':') orelse return null;
+        const name = arn[last_colon + 1 ..];
+        return allocator.dupe(u8, name) catch null;
+    }
+    return null;
 }
