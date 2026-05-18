@@ -16,6 +16,32 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-05-18
+
+**Patch release: SQS Queue Policy enforcement.**
+
+Closes the last SUPPORT.md divergence row for SQS. The Policy attribute (mutated by `AddPermission` / `RemovePermission` / `SetQueueAttributes`) is now evaluated on every request via the existing `auth/policy_eval.zig` evaluator. After v0.3.3, SQS is **feature-complete + fully enforced** — lining up cleanly for v0.3.4's strategic S3 → SQS event-notification unlock.
+
+### Added
+
+- **`src/services/sqs/authz.zig`** (new, ~80 lines): the queue-policy authz hook. Cascade: `--no-auth` → allow; account-scoped op → require non-anonymous; queue-scoped op + owner principal → allow (implicit); queue has no policy → deny; queue has policy → `policy_eval.evaluate(...)` (`allow` / `deny` short-circuit, `no_match` → default-deny).
+- **`src/auth/sqs_action_map.zig`** (new): string-keyed switch mapping `X-Amz-Target` op strings ("SendMessage", etc.) to IAM action strings ("sqs:SendMessage", etc.). Batch ops map to their per-message action (AWS-exact).
+- **Principal threading** in `src/server.zig::handleSqs`: the SigV4-returned `Principal` is no longer discarded — it's now captured and threaded into `services/sqs/mod.zig::Context` for the authz hook.
+- **`access_denied` error code** in `src/wire/sqs/errors.zig` (HTTP 403, AWS error code `AccessDenied`).
+
+### Tests
+
+- Python: 495 → 504 (+9 enforcement tests covering owner-implicit-allow, anonymous-denied-by-default, public-send policy, action-mismatch denial, explicit-Deny-overrides-Allow, owner-bypasses-Deny, `--no-auth`-bypasses-policy, account-scoped ops).
+- JS: 103 → 106 (+3 — anonymous fetch + owner-signed SDK).
+- AWS CLI: 43 → 45 (+2 — signed-owner sanity + owner-bypasses-Deny).
+
+### Documented divergences (new / changed in v0.3.3)
+
+- **Removed**: "Queue Policy attribute is accepted, not evaluated" — it now is.
+- **New**: "Cross-account principals not supported." SigV4 verifies only against the configured `--access-key`; cross-account `Principal: { AWS: ... }` grants can't be exercised in nanostack. Anonymous (`Principal: "*"`) works end-to-end.
+- **New**: "`AddPermission` only constructs Allow statements" — same constraint as AWS-real. Hand-built policies via `SetQueueAttributes` are the path for Deny statements.
+- **New**: "Policy `Condition` blocks are skipped" — inherited from `auth/policy_eval.zig`.
+
 ## [0.3.2] — 2026-05-18
 
 **Patch release: SQS robustness.**
