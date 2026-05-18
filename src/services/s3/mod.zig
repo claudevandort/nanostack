@@ -489,6 +489,11 @@ pub fn mapStorageErr(e: storage.Error) errors.Code {
         storage.Error.TooManyEntries,
         storage.Error.InvalidParameterValue,
         storage.Error.MissingParameter,
+        storage.Error.TopicNotFound,
+        storage.Error.TopicAlreadyExists,
+        storage.Error.InvalidTopicName,
+        storage.Error.InvalidProtocol,
+        storage.Error.SubscriptionNotFound,
         => .internal_error,
         storage.Error.Io, storage.Error.OutOfMemory => .internal_error,
     };
