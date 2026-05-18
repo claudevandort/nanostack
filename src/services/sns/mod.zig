@@ -12,6 +12,7 @@ const errors = @import("../../wire/sns/errors.zig");
 const params_mod = @import("../../wire/sns/params.zig");
 const principal_mod = @import("../../auth/principal.zig");
 const topics_handler = @import("topics.zig");
+const subs_handler = @import("subscriptions.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -64,6 +65,15 @@ pub fn handle(ctx: Context) Result {
     if (std.mem.eql(u8, action, "ListTopics")) return topics_handler.listTopics(ctx);
     if (std.mem.eql(u8, action, "GetTopicAttributes")) return topics_handler.getTopicAttributes(ctx);
     if (std.mem.eql(u8, action, "SetTopicAttributes")) return topics_handler.setTopicAttributes(ctx);
+
+    // Subscriptions (Phase C).
+    if (std.mem.eql(u8, action, "Subscribe")) return subs_handler.subscribe(ctx);
+    if (std.mem.eql(u8, action, "Unsubscribe")) return subs_handler.unsubscribe(ctx);
+    if (std.mem.eql(u8, action, "ListSubscriptions")) return subs_handler.listSubscriptions(ctx);
+    if (std.mem.eql(u8, action, "ListSubscriptionsByTopic")) return subs_handler.listSubscriptionsByTopic(ctx);
+    if (std.mem.eql(u8, action, "GetSubscriptionAttributes")) return subs_handler.getSubscriptionAttributes(ctx);
+    if (std.mem.eql(u8, action, "SetSubscriptionAttributes")) return subs_handler.setSubscriptionAttributes(ctx);
+    if (std.mem.eql(u8, action, "ConfirmSubscription")) return subs_handler.confirmSubscription(ctx);
 
     return .{ .err = .{
         .code = .invalid_action,
