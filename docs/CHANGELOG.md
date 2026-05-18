@@ -16,6 +16,36 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-05-18
+
+**Patch release: SNS Topic Policy enforcement.**
+
+v0.4.1 shipped `AddPermission` / `RemovePermission` / `SetTopicAttributes` with the Policy attribute as accept-store-roundtrip — mutated correctly, but never evaluated at request time. v0.4.2 closes that last divergence: the Topic Policy attribute is now evaluated on every SNS request, gating the operation when no statement allows it. After v0.4.2, SNS is feature-complete + enforced modulo FIFO topics.
+
+This mirrors the v0.3.2 → v0.3.3 SQS trajectory (Queue Policy enforcement) verbatim.
+
+### Added
+
+- `src/auth/sns_action_map.zig` — `actionFor(action) "sns:<Action>"` + `isAccountScoped` predicate (`CreateTopic`, `ListTopics`, `ListSubscriptions`). `PublishBatch` maps to `sns:Publish` per AWS-real (per-message action).
+- `src/services/sns/authz.zig` — `check(ctx, action) Decision`. Cascade: `--no-auth` short-circuit → account-scoped non-anonymous → owner-implicit-allow → resolve topic name → load Policy → `policy_eval.evaluate` → default-deny on `no_match`.
+- Topic-name resolution lives in the authz module via string parse — `TopicArn` / `ResourceArn` → last segment; `SubscriptionArn` → second-to-last segment (SNS sub ARNs already embed the topic name as `<topic-arn>:<sub_id>`, so no new vtable entry was needed).
+
+### Changed
+
+- `src/services/sns/mod.zig::handle` — 8-line hook insertion between action match and op dispatch. Unknown actions skip the hook (fall through to the existing "InvalidAction" error).
+- SUPPORT.md SNS section: removed the "Topic Policy is accept-store-roundtrip" divergence; added "Internal cross-service dispatch bypasses the authz hook" (same wording as the v0.3.4 S3 → SQS divergence) and "Topic-policy Condition blocks unsupported" (same constraint as SQS + S3).
+
+### Tests
+
+- Python: 558 → 568 (+10 in new `tests/conformance/python/sns/test_topic_policy_enforcement.py`).
+- JS: 118 → 121 (+3 in `tests/conformance/js/sns/policy_enforcement.test.ts`).
+- AWS CLI: 53 → 55 (+2 in `tests/conformance/awscli/sns/test_sns_topic_policy.py` — unique basename to dodge the awscli module-name collision documented after v0.4.1).
+
+### Deferred to follow-up patches
+
+- **v0.4.x**: FilterPolicy operator set (`prefix`, `anything-but`, etc.); FIFO topics.
+- **v0.5.0**: Lambda (the big multi-service hop).
+
 ## [0.4.1] — 2026-05-18
 
 **Patch release: SNS robustness.**
