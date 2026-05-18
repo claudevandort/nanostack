@@ -728,6 +728,8 @@ dynamo_tables: std.StringHashMapUnmanaged(*storage.TableSlot),
 /// the slot itself). Persistence layout:
 /// `<base>/sqs/queues/<name>/{attributes,tags}.json` + messages dir.
 sqs_queues: std.StringHashMapUnmanaged(*storage.SqsQueueSlot),
+/// SNS topics (v0.4.0). Persisted under `sns/topics/<name>/`.
+sns_topics: std.StringHashMapUnmanaged(*storage.SnsTopicSlot),
 /// MessageMoveTask records (v0.3.2). In-memory only; not persisted
 /// across restart (matches DDB Streams ring-buffer precedent).
 /// Newest-first ordering is established at append time.
@@ -789,6 +791,7 @@ pub fn initWithOptions(allocator: Allocator, io: Io, base_dir: []const u8, opts:
         .restored_objects = .empty,
         .dynamo_tables = .empty,
         .sqs_queues = .empty,
+        .sns_topics = .empty,
         .sqs_message_move_tasks = .empty,
         .ttl_sweep_interval_secs = opts.ttl_sweep_interval_seconds,
         .sweeper_thread = null,
@@ -804,6 +807,8 @@ pub fn initWithOptions(allocator: Allocator, io: Io, base_dir: []const u8, opts:
     loadDynamoTables(self) catch return InitError.Io;
     ensureSqsDir(self) catch return InitError.Io;
     loadSqsQueues(self) catch return InitError.Io;
+    ensureSnsDir(self) catch return InitError.Io;
+    loadSnsTopics(self) catch return InitError.Io;
 
     if (opts.spawn_ttl_sweeper) {
         self.sweeper_thread = std.Thread.spawn(.{}, ttlSweepLoop, .{self}) catch return InitError.ThreadSpawn;
@@ -844,6 +849,14 @@ pub fn deinit(self: *Fs) void {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.sqs_queues.deinit(self.allocator);
+    }
+    {
+        var it = self.sns_topics.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinit(self.allocator);
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.sns_topics.deinit(self.allocator);
     }
     for (self.sqs_message_move_tasks.items) |t| {
         t.deinit(self.allocator);
@@ -6928,6 +6941,324 @@ pub fn sqsChangeMessageVisibility(self: *Fs, in: storage.ChangeMessageVisibility
         }
     }
     return storage.Error.MessageNotFound;
+}
+
+// ---------------------------------------------------------------------------
+// SNS (v0.4.0)
+//
+// Disk layout: <base>/sns/topics/<name>/{attributes.json, tags.json,
+// subscriptions/<sub_id>.json}.
+
+const sns_state_mod = @import("sns_state.zig");
+
+fn ensureSnsDir(self: *Fs) !void {
+    var buf: [4096]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/sns/topics", .{self.base_dir});
+    try Io.Dir.cwd().createDirPath(self.io, path);
+}
+
+fn topicDirPath(self: *Fs, name: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/sns/topics/{s}", .{ self.base_dir, name });
+}
+
+fn topicAttrsPath(self: *Fs, name: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}/sns/topics/{s}/attributes.json", .{ self.base_dir, name });
+}
+
+const TopicAttrsDoc = struct {
+    display_name: ?[]const u8 = null,
+    policy: ?[]const u8 = null,
+    delivery_policy: ?[]const u8 = null,
+    kms_key_id: ?[]const u8 = null,
+    created_unix: i64,
+    arn: []const u8,
+};
+
+fn buildTopicArn(allocator: Allocator, region: []const u8, account: []const u8, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "arn:aws:sns:{s}:{s}:{s}", .{ region, account, name });
+}
+
+fn writeTopicAttrs(self: *Fs, slot: *const storage.SnsTopicSlot) !void {
+    var dir_buf: [4096]u8 = undefined;
+    const dir_path = try topicDirPath(self, slot.name, &dir_buf);
+    try Io.Dir.cwd().createDirPath(self.io, dir_path);
+
+    const doc: TopicAttrsDoc = .{
+        .display_name = slot.attrs.display_name,
+        .policy = slot.attrs.policy,
+        .delivery_policy = slot.attrs.delivery_policy,
+        .kms_key_id = slot.attrs.kms_key_id,
+        .created_unix = slot.created_unix,
+        .arn = slot.arn,
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(doc, .{}, &aw.writer);
+    const body = try aw.toOwnedSlice();
+    defer self.allocator.free(body);
+
+    var path_buf: [4096]u8 = undefined;
+    const path = try topicAttrsPath(self, slot.name, &path_buf);
+    try writeAtomic(self.io, path, body);
+}
+
+fn loadSnsTopics(self: *Fs) !void {
+    var buf: [4096]u8 = undefined;
+    const topics_path = try std.fmt.bufPrint(&buf, "{s}/sns/topics", .{self.base_dir});
+    var dir = Io.Dir.cwd().openDir(self.io, topics_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(self.io);
+    var it = dir.iterate();
+    while (try it.next(self.io)) |entry| {
+        if (entry.kind != .directory) continue;
+        loadSingleTopic(self, entry.name) catch |err| {
+            std.log.warn("sns: skipping corrupted topic dir {s}: {s}", .{ entry.name, @errorName(err) });
+        };
+    }
+}
+
+fn loadSingleTopic(self: *Fs, name: []const u8) !void {
+    var path_buf: [4096]u8 = undefined;
+    const attrs_path = try topicAttrsPath(self, name, &path_buf);
+    const body = Io.Dir.cwd().readFileAlloc(self.io, attrs_path, self.allocator, .limited(64 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer self.allocator.free(body);
+
+    var parsed = std.json.parseFromSlice(TopicAttrsDoc, self.allocator, body, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    const doc = parsed.value;
+
+    const slot_ptr = try self.allocator.create(storage.SnsTopicSlot);
+    errdefer self.allocator.destroy(slot_ptr);
+    slot_ptr.* = .{
+        .name = try self.allocator.dupe(u8, name),
+        .arn = try self.allocator.dupe(u8, doc.arn),
+        .created_unix = doc.created_unix,
+        .attrs = .{
+            .display_name = if (doc.display_name) |s| try self.allocator.dupe(u8, s) else null,
+            .policy = if (doc.policy) |s| try self.allocator.dupe(u8, s) else null,
+            .delivery_policy = if (doc.delivery_policy) |s| try self.allocator.dupe(u8, s) else null,
+            .kms_key_id = if (doc.kms_key_id) |s| try self.allocator.dupe(u8, s) else null,
+        },
+    };
+    try self.sns_topics.put(self.allocator, slot_ptr.name, slot_ptr);
+    // Subscriptions are loaded by Phase C.
+}
+
+pub fn snsBackend(self: *Fs) storage.SnsBackend {
+    return .{ .ctx = self, .vtable = &sns_vtable };
+}
+
+const sns_vtable: storage.SnsBackend.VTable = .{
+    .createTopic = vtSnsCreateTopic,
+    .deleteTopic = vtSnsDeleteTopic,
+    .listTopics = vtSnsListTopics,
+    .getTopicAttributes = vtSnsGetTopicAttributes,
+    .setTopicAttributes = vtSnsSetTopicAttributes,
+    .subscribe = vtSnsSubscribe,
+    .unsubscribe = vtSnsUnsubscribe,
+    .listSubscriptions = vtSnsListSubscriptions,
+    .listSubscriptionsByTopic = vtSnsListSubscriptionsByTopic,
+    .getSubscriptionAttributes = vtSnsGetSubscriptionAttributes,
+    .setSubscriptionAttributes = vtSnsSetSubscriptionAttributes,
+    .confirmSubscription = vtSnsConfirmSubscription,
+    .publish = vtSnsPublish,
+    .publishBatch = vtSnsPublishBatch,
+    .tagTopic = vtSnsTagTopic,
+    .untagTopic = vtSnsUntagTopic,
+    .listTopicTags = vtSnsListTopicTags,
+};
+
+fn vtSnsCreateTopic(ctx: *anyopaque, in: storage.CreateTopicInput) storage.Error!*const storage.SnsTopicSlot {
+    return snsCreateTopic(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtSnsDeleteTopic(ctx: *anyopaque, name: []const u8) storage.Error!void {
+    return snsDeleteTopic(@ptrCast(@alignCast(ctx)), name);
+}
+fn vtSnsListTopics(ctx: *anyopaque, allocator: Allocator, in: storage.ListTopicsInput) storage.Error!storage.ListTopicsOutput {
+    return snsListTopics(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtSnsGetTopicAttributes(ctx: *anyopaque, name: []const u8) storage.Error!*const storage.SnsTopicSlot {
+    return snsGetTopicAttributes(@ptrCast(@alignCast(ctx)), name);
+}
+fn vtSnsSetTopicAttributes(ctx: *anyopaque, in: storage.SetTopicAttributesInput) storage.Error!void {
+    return snsSetTopicAttributes(@ptrCast(@alignCast(ctx)), in);
+}
+// Subscriptions / publish / tags: Phase C+D+E stubs that return InvalidParameterValue
+// until those phases land.
+fn vtSnsSubscribe(ctx: *anyopaque, allocator: Allocator, in: storage.SubscribeInput) storage.Error!storage.SubscribeOutput {
+    _ = ctx;
+    _ = allocator;
+    _ = in;
+    return storage.Error.InvalidParameterValue;
+}
+fn vtSnsUnsubscribe(ctx: *anyopaque, in: storage.UnsubscribeInput) storage.Error!void {
+    _ = ctx;
+    _ = in;
+    return storage.Error.InvalidParameterValue;
+}
+fn vtSnsListSubscriptions(ctx: *anyopaque, allocator: Allocator, in: storage.ListSubscriptionsInput) storage.Error!storage.ListSubscriptionsOutput {
+    _ = ctx;
+    _ = allocator;
+    _ = in;
+    return storage.Error.InvalidParameterValue;
+}
+fn vtSnsListSubscriptionsByTopic(ctx: *anyopaque, allocator: Allocator, in: storage.ListSubscriptionsByTopicInput) storage.Error!storage.ListSubscriptionsOutput {
+    _ = ctx;
+    _ = allocator;
+    _ = in;
+    return storage.Error.InvalidParameterValue;
+}
+fn vtSnsGetSubscriptionAttributes(ctx: *anyopaque, arn: []const u8) storage.Error!*const storage.Subscription {
+    _ = ctx;
+    _ = arn;
+    return storage.Error.SubscriptionNotFound;
+}
+fn vtSnsSetSubscriptionAttributes(ctx: *anyopaque, in: storage.SetSubscriptionAttributesInput) storage.Error!void {
+    _ = ctx;
+    _ = in;
+    return storage.Error.SubscriptionNotFound;
+}
+fn vtSnsConfirmSubscription(ctx: *anyopaque, allocator: Allocator, in: storage.ConfirmSubscriptionInput) storage.Error!storage.SubscribeOutput {
+    _ = ctx;
+    _ = allocator;
+    _ = in;
+    return storage.Error.InvalidParameterValue;
+}
+fn vtSnsPublish(ctx: *anyopaque, allocator: Allocator, in: storage.PublishInput) storage.Error!storage.PublishOutput {
+    _ = ctx;
+    _ = allocator;
+    _ = in;
+    return storage.Error.InvalidParameterValue;
+}
+fn vtSnsPublishBatch(ctx: *anyopaque, allocator: Allocator, in: storage.PublishBatchInput) storage.Error!storage.PublishBatchOutput {
+    _ = ctx;
+    _ = allocator;
+    _ = in;
+    return storage.Error.InvalidParameterValue;
+}
+fn vtSnsTagTopic(ctx: *anyopaque, in: storage.TagTopicInput) storage.Error!void {
+    _ = ctx;
+    _ = in;
+    return storage.Error.InvalidParameterValue;
+}
+fn vtSnsUntagTopic(ctx: *anyopaque, in: storage.UntagTopicInput) storage.Error!void {
+    _ = ctx;
+    _ = in;
+    return storage.Error.InvalidParameterValue;
+}
+fn vtSnsListTopicTags(ctx: *anyopaque, allocator: Allocator, topic_name: []const u8) storage.Error!storage.ListTopicTagsOutput {
+    _ = ctx;
+    _ = allocator;
+    _ = topic_name;
+    return .{ .tags = &.{} };
+}
+
+pub fn snsCreateTopic(self: *Fs, in: storage.CreateTopicInput) storage.Error!*const storage.SnsTopicSlot {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    sns_state_mod.validateTopicName(in.name) catch |err| switch (err) {
+        error.InvalidTopicName => return storage.Error.InvalidTopicName,
+        error.FifoNotSupported => return storage.Error.InvalidTopicName,
+    };
+
+    // Idempotent: duplicate-name create returns the existing topic (matches AWS).
+    if (self.sns_topics.get(in.name)) |existing| return existing;
+
+    const region = "us-east-1";
+    const account = "000000000000";
+    const arn = buildTopicArn(self.allocator, region, account, in.name) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(arn);
+    const name_owned = self.allocator.dupe(u8, in.name) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.free(name_owned);
+
+    const slot_ptr = self.allocator.create(storage.SnsTopicSlot) catch return storage.Error.OutOfMemory;
+    errdefer self.allocator.destroy(slot_ptr);
+    slot_ptr.* = .{
+        .name = name_owned,
+        .arn = arn,
+        .created_unix = nowUnixSeconds(self.io),
+        .attrs = .{
+            .display_name = if (in.attrs.display_name) |s| (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory) else null,
+            .policy = if (in.attrs.policy) |s| (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory) else null,
+            .delivery_policy = if (in.attrs.delivery_policy) |s| (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory) else null,
+            .kms_key_id = if (in.attrs.kms_key_id) |s| (self.allocator.dupe(u8, s) catch return storage.Error.OutOfMemory) else null,
+        },
+    };
+    writeTopicAttrs(self, slot_ptr) catch return storage.Error.Io;
+    self.sns_topics.put(self.allocator, slot_ptr.name, slot_ptr) catch return storage.Error.OutOfMemory;
+    return slot_ptr;
+}
+
+pub fn snsDeleteTopic(self: *Fs, name: []const u8) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const slot = self.sns_topics.get(name) orelse return; // idempotent
+    var dir_buf: [4096]u8 = undefined;
+    const dir_path = topicDirPath(self, name, &dir_buf) catch return storage.Error.Io;
+    Io.Dir.cwd().deleteTree(self.io, dir_path) catch return storage.Error.Io;
+    _ = self.sns_topics.remove(name);
+    slot.deinit(self.allocator);
+    self.allocator.destroy(slot);
+}
+
+pub fn snsListTopics(self: *Fs, allocator: Allocator, in: storage.ListTopicsInput) storage.Error!storage.ListTopicsOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    _ = in;
+    var arns: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (arns.items) |a| allocator.free(a);
+        arns.deinit(allocator);
+    }
+    var it = self.sns_topics.iterator();
+    while (it.next()) |entry| {
+        const arn = allocator.dupe(u8, entry.value_ptr.*.arn) catch return storage.Error.OutOfMemory;
+        arns.append(allocator, arn) catch return storage.Error.OutOfMemory;
+    }
+    std.mem.sort([]const u8, arns.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return .{ .topic_arns = arns.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory };
+}
+
+pub fn snsGetTopicAttributes(self: *Fs, name: []const u8) storage.Error!*const storage.SnsTopicSlot {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    return self.sns_topics.get(name) orelse storage.Error.TopicNotFound;
+}
+
+pub fn snsSetTopicAttributes(self: *Fs, in: storage.SetTopicAttributesInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const slot = self.sns_topics.get(in.topic_name) orelse return storage.Error.TopicNotFound;
+
+    // Mutate the field named by `attribute_name`.
+    if (std.mem.eql(u8, in.attribute_name, "DisplayName")) {
+        if (slot.attrs.display_name) |old| self.allocator.free(old);
+        slot.attrs.display_name = self.allocator.dupe(u8, in.attribute_value) catch return storage.Error.OutOfMemory;
+    } else if (std.mem.eql(u8, in.attribute_name, "Policy")) {
+        if (slot.attrs.policy) |old| self.allocator.free(old);
+        slot.attrs.policy = self.allocator.dupe(u8, in.attribute_value) catch return storage.Error.OutOfMemory;
+    } else if (std.mem.eql(u8, in.attribute_name, "DeliveryPolicy")) {
+        if (slot.attrs.delivery_policy) |old| self.allocator.free(old);
+        slot.attrs.delivery_policy = self.allocator.dupe(u8, in.attribute_value) catch return storage.Error.OutOfMemory;
+    } else if (std.mem.eql(u8, in.attribute_name, "KmsMasterKeyId")) {
+        if (slot.attrs.kms_key_id) |old| self.allocator.free(old);
+        slot.attrs.kms_key_id = self.allocator.dupe(u8, in.attribute_value) catch return storage.Error.OutOfMemory;
+    } else {
+        // Unknown attribute names accepted silently (matches accept-store-roundtrip).
+        return;
+    }
+    writeTopicAttrs(self, slot) catch return storage.Error.Io;
 }
 
 // ---------------------------------------------------------------------------

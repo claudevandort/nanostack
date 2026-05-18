@@ -11,6 +11,7 @@ const storage = @import("../../storage/mod.zig");
 const errors = @import("../../wire/sns/errors.zig");
 const params_mod = @import("../../wire/sns/params.zig");
 const principal_mod = @import("../../auth/principal.zig");
+const topics_handler = @import("topics.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -57,9 +58,13 @@ pub const Context = struct {
 pub fn handle(ctx: Context) Result {
     const action = ctx.request.action;
 
-    // Phase A: dispatch table skeleton — every op returns a stub
-    // error until Phase B fills them in.
-    _ = action;
+    // Topics (Phase B).
+    if (std.mem.eql(u8, action, "CreateTopic")) return topics_handler.createTopic(ctx);
+    if (std.mem.eql(u8, action, "DeleteTopic")) return topics_handler.deleteTopic(ctx);
+    if (std.mem.eql(u8, action, "ListTopics")) return topics_handler.listTopics(ctx);
+    if (std.mem.eql(u8, action, "GetTopicAttributes")) return topics_handler.getTopicAttributes(ctx);
+    if (std.mem.eql(u8, action, "SetTopicAttributes")) return topics_handler.setTopicAttributes(ctx);
+
     return .{ .err = .{
         .code = .invalid_action,
         .message = "SNS operation not yet implemented in this build.",

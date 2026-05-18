@@ -703,6 +703,7 @@ pub fn run(
     backend: storage.Backend,
     dynamo_backend: ?storage.DynamoBackend,
     sqs_backend: ?storage.SqsBackend,
+    sns_backend: ?storage.SnsBackend,
 ) !void {
     const address = try std.Io.net.IpAddress.parse(config.bind, config.port);
 
@@ -721,7 +722,7 @@ pub fn run(
         return;
     }
 
-    var app: App = .{ .config = config, .io = init.io, .backend = backend, .dynamo_backend = dynamo_backend, .sqs_backend = sqs_backend };
+    var app: App = .{ .config = config, .io = init.io, .backend = backend, .dynamo_backend = dynamo_backend, .sqs_backend = sqs_backend, .sns_backend = sns_backend };
     // Allow up to 64 MiB request bodies. AWS S3 caps single-PUT and
     // per-part uploads at 5 GiB, but httpz preallocates a per-worker pool
     // sized by `max_body_size` — anything close to AWS's ceiling OOMs the
