@@ -734,6 +734,11 @@ sqs_queues: std.StringHashMapUnmanaged(*storage.SqsQueueSlot),
 ttl_sweep_interval_secs: u32,
 sweeper_thread: ?std.Thread,
 sweeper_stop: std.atomic.Value(bool),
+/// SQS MessageRetentionPeriod sweeper (v0.3.2). Second background
+/// thread; same stop-signal pattern. On each tick drops messages
+/// where now > sent_unix + slot.attrs.message_retention_period.
+sqs_retention_sweep_interval_secs: u32,
+sqs_retention_thread: ?std.Thread,
 
 pub const InitError = error{
     OutOfMemory,
@@ -748,12 +753,20 @@ pub const Options = struct {
     /// use the 3-arg `init` shim which disables the sweeper because the
     /// Zig test runner doesn't tolerate dangling threads at teardown.
     spawn_ttl_sweeper: bool = true,
+    /// SQS MessageRetentionPeriod sweep interval (seconds). Default 60s.
+    sqs_retention_sweep_interval_seconds: u32 = 60,
+    /// Spawn the SQS retention sweeper thread? Same opt-out shape as
+    /// `spawn_ttl_sweeper`.
+    spawn_sqs_retention_sweeper: bool = true,
 };
 
 /// Test-friendly init: no background sweeper. Use `initWithOptions` in
 /// production / `main.zig`.
 pub fn init(allocator: Allocator, io: Io, base_dir: []const u8) InitError!*Fs {
-    return initWithOptions(allocator, io, base_dir, .{ .spawn_ttl_sweeper = false });
+    return initWithOptions(allocator, io, base_dir, .{
+        .spawn_ttl_sweeper = false,
+        .spawn_sqs_retention_sweeper = false,
+    });
 }
 
 pub fn initWithOptions(allocator: Allocator, io: Io, base_dir: []const u8, opts: Options) InitError!*Fs {
@@ -775,6 +788,8 @@ pub fn initWithOptions(allocator: Allocator, io: Io, base_dir: []const u8, opts:
         .ttl_sweep_interval_secs = opts.ttl_sweep_interval_seconds,
         .sweeper_thread = null,
         .sweeper_stop = .init(false),
+        .sqs_retention_sweep_interval_secs = opts.sqs_retention_sweep_interval_seconds,
+        .sqs_retention_thread = null,
     };
 
     ensureS3Dir(self) catch return InitError.Io;
@@ -788,14 +803,20 @@ pub fn initWithOptions(allocator: Allocator, io: Io, base_dir: []const u8, opts:
     if (opts.spawn_ttl_sweeper) {
         self.sweeper_thread = std.Thread.spawn(.{}, ttlSweepLoop, .{self}) catch return InitError.ThreadSpawn;
     }
+    if (opts.spawn_sqs_retention_sweeper) {
+        self.sqs_retention_thread = std.Thread.spawn(.{}, sqsRetentionSweepLoop, .{self}) catch return InitError.ThreadSpawn;
+    }
     return self;
 }
 
 pub fn deinit(self: *Fs) void {
-    if (self.sweeper_thread) |t| {
+    // Both sweeper threads observe the shared `sweeper_stop` flag so
+    // we set it once before joining either.
+    if (self.sweeper_thread != null or self.sqs_retention_thread != null) {
         self.sweeper_stop.store(true, .release);
-        t.join();
     }
+    if (self.sweeper_thread) |t| t.join();
+    if (self.sqs_retention_thread) |t| t.join();
     for (self.buckets.items) |*b| b.deinit(self.allocator);
     self.buckets.deinit(self.allocator);
     {
@@ -4815,6 +4836,67 @@ fn sweepTableLocked(self: *Fs, slot: *storage.TableSlot, attr_name: []const u8, 
 }
 
 // ---------------------------------------------------------------------------
+// SQS MessageRetentionPeriod sweeper (v0.3.2)
+
+/// Background loop. Same shape as `ttlSweepLoop`: sleep in 250ms ticks
+/// so shutdown observes `sweeper_stop` promptly even at long intervals.
+fn sqsRetentionSweepLoop(self: *Fs) void {
+    const tick_ms: u32 = 250;
+    while (true) {
+        const interval_ms: u32 = self.sqs_retention_sweep_interval_secs * 1000;
+        var slept: u32 = 0;
+        while (slept < interval_ms) {
+            if (self.sweeper_stop.load(.acquire)) return;
+            const chunk: u32 = @min(tick_ms, interval_ms - slept);
+            const req: std.os.linux.timespec = .{
+                .sec = @intCast(@divTrunc(chunk, 1000)),
+                .nsec = @intCast(@as(i64, @mod(chunk, 1000)) * std.time.ns_per_ms),
+            };
+            _ = std.os.linux.nanosleep(&req, null);
+            slept += chunk;
+        }
+        if (self.sweeper_stop.load(.acquire)) return;
+        sqsRetentionSweepOnce(self);
+    }
+}
+
+/// One pass: lock the queue mutex, iterate every queue, drop messages
+/// whose age exceeds the queue's MessageRetentionPeriod. Both
+/// in-memory list + on-disk file get pruned.
+pub fn sqsRetentionSweepOnce(self: *Fs) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const now = nowUnixSeconds(self.io);
+    var qit = self.sqs_queues.iterator();
+    while (qit.next()) |entry| {
+        const slot = entry.value_ptr.*;
+        const retention: i64 = @intCast(slot.attrs.message_retention_period);
+        // Walk backwards so orderedRemove indices stay valid for prior
+        // elements.
+        var i: usize = slot.messages.items.len;
+        while (i > 0) {
+            i -= 1;
+            const m = slot.messages.items[i];
+            if (now - m.sent_unix <= retention) continue;
+            // Expired — drop disk file + in-memory entry.
+            var path_buf: [4096]u8 = undefined;
+            const p = messagePath(self, slot.name, m.id, &path_buf) catch continue;
+            Io.Dir.cwd().deleteFile(self.io, p) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => {
+                    // Best-effort; log + continue.
+                    std.log.warn("sqs: retention sweep failed to delete {s}: {s}", .{ p, @errorName(err) });
+                },
+            };
+            _ = slot.messages.orderedRemove(i);
+            m.deinit(self.allocator);
+            self.allocator.destroy(m);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DynamoDB Backups (v0.2.5)
 //
 // Disk layout: `<base>/dynamodb/backups/<backup_id>/` holds:
@@ -7508,4 +7590,39 @@ test "fs: deleteBucket with object → BucketNotEmpty" {
     const out = try fs.putObject(.{ .bucket = "bkt", .key = "k", .body = "v", .content_type = "text/plain" });
     testing.allocator.free(out.etag);
     try testing.expectError(storage.Error.BucketNotEmpty, fs.deleteBucket("bkt"));
+}
+
+test "fs: sqsRetentionSweepOnce drops expired messages, keeps fresh ones" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs = try newTestFs(&tmp);
+    defer fs.deinit();
+
+    // Create a queue with a 60s retention.
+    _ = try fs.sqsCreateQueue(.{
+        .name = "q1",
+        .attrs = .{ .message_retention_period = 60 },
+    });
+    // Send 3 messages.
+    for ([_][]const u8{ "a", "b", "c" }) |body| {
+        const out = try fs.sqsSendMessage(testing.allocator, .{
+            .queue_name = "q1",
+            .body = body,
+        });
+        testing.allocator.free(out.message_id);
+        testing.allocator.free(out.md5_of_body);
+    }
+    // Mutate sent_unix on the first two messages to be older than the
+    // retention window.
+    const slot = fs.sqs_queues.get("q1").?;
+    try testing.expectEqual(@as(usize, 3), slot.messages.items.len);
+    slot.messages.items[0].sent_unix -= 120;
+    slot.messages.items[1].sent_unix -= 90;
+
+    // Run the sweep.
+    sqsRetentionSweepOnce(fs);
+
+    // Only the third (fresh) message remains.
+    try testing.expectEqual(@as(usize, 1), slot.messages.items.len);
+    try testing.expectEqualStrings("c", slot.messages.items[0].body);
 }

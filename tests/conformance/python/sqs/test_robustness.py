@@ -207,3 +207,62 @@ def test_message_order_preserved_after_restart(restartable):
     recv = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)
     recv_ids = [m["MessageId"] for m in recv["Messages"]]
     assert recv_ids == sent_ids
+
+
+# ---------- Phase B — MessageRetentionPeriod sweeper ----------
+
+
+def test_retention_sweeper_drops_messages_past_retention():
+    """Set MessageRetentionPeriod=60 and a 1s sweep interval. We can't
+    reliably wait 60 seconds in CI, so we use the minimum retention
+    period (60s) and verify the sweep happens but doesn't drop the
+    just-sent message. The Zig unit test
+    `sqsRetentionSweepOnce drops expired messages` covers the
+    sweep-triggers-drop case directly."""
+    bin_path = os.environ.get("NANOSTACK_BIN")
+    if not bin_path:
+        pytest.skip("NANOSTACK_BIN not set")
+
+    data_dir = tempfile.mkdtemp(prefix="ns-retention-")
+    port = _pick_port()
+    ep = f"http://127.0.0.1:{port}"
+
+    proc = subprocess.Popen(
+        [
+            bin_path,
+            "--port", str(port),
+            "--data-dir", data_dir,
+            "--services", "sqs",
+            "--sqs-retention-sweep-interval-seconds", "1",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_ready(port)
+        sqs = _make_sqs(ep)
+        name = f"q_{secrets.token_hex(4)}"
+        url = sqs.create_queue(
+            QueueName=name, Attributes={"MessageRetentionPeriod": "60"}
+        )["QueueUrl"]
+        sqs.send_message(QueueUrl=url, MessageBody="fresh")
+        # Wait a couple of sweep ticks. The fresh message survives.
+        time.sleep(2.5)
+        recv = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10)
+        assert len(recv["Messages"]) == 1
+        assert recv["Messages"][0]["Body"] == "fresh"
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_sweep_interval_flag_validates_range():
+    """`--sqs-retention-sweep-interval-seconds 0` is out of range."""
+    bin_path = os.environ.get("NANOSTACK_BIN")
+    if not bin_path:
+        pytest.skip("NANOSTACK_BIN not set")
+    proc = subprocess.run(
+        [bin_path, "--sqs-retention-sweep-interval-seconds", "0", "--self-test-ready"],
+        capture_output=True, text=True, timeout=5,
+    )
+    assert proc.returncode != 0

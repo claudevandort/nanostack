@@ -31,6 +31,7 @@ pub fn main(init: std.process.Init) !void {
     const profile_root = try std.fmt.allocPrint(arena, "{s}/profiles/{s}", .{ data_dir, config.profile });
     const fs = try FsBackend.initWithOptions(arena, init.io, profile_root, .{
         .ttl_sweep_interval_seconds = config.ttl_sweep_interval_seconds,
+        .sqs_retention_sweep_interval_seconds = config.sqs_retention_sweep_interval_seconds,
     });
     defer fs.deinit();
 
