@@ -95,6 +95,16 @@ pub fn purgeQueue(ctx: Context) Result {
     return .{ .ok = .{ .body = "{}" } };
 }
 
+pub fn listDeadLetterSourceQueues(ctx: Context) Result {
+    const dlq_name = wire.parseListDeadLetterSourceQueues(ctx.allocator, ctx.request.body) catch |err|
+        return .{ .err = mapParseErr(err) };
+    const out = ctx.backend.listDeadLetterSourceQueues(ctx.allocator, .{ .dlq_name = dlq_name }) catch |err|
+        return .{ .err = mapStorageErr(err) };
+    const body = wire.renderListDeadLetterSourceQueues(ctx.allocator, ctx.base_url, ctx.account_id, out) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    return .{ .ok = .{ .body = body } };
+}
+
 // ---------------------------------------------------------------------------
 // Error mapping
 

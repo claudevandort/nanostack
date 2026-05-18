@@ -81,6 +81,9 @@ pub fn handle(ctx: Context) Result {
     if (std.mem.eql(u8, target, "UntagQueue")) return tags_handler.untagQueue(ctx);
     if (std.mem.eql(u8, target, "ListQueueTags")) return tags_handler.listQueueTags(ctx);
 
+    // Robustness ops (v0.3.2).
+    if (std.mem.eql(u8, target, "ListDeadLetterSourceQueues")) return queues_handler.listDeadLetterSourceQueues(ctx);
+
     // Anything else: 400 with operation name in the message. Phase 2+
     // adds messages / batches / long polling.
     var msg_buf: [256]u8 = undefined;

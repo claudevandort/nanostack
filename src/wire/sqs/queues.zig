@@ -325,6 +325,39 @@ fn requestedHas(requested: []const []const u8, name: []const u8) bool {
 }
 
 // ---------------------------------------------------------------------------
+// ListDeadLetterSourceQueues (v0.3.2)
+
+/// Returns the DLQ's queue name. Both input shapes (`QueueUrl` —
+/// what the modern SDKs send — and `QueueName`) are accepted.
+pub fn parseListDeadLetterSourceQueues(allocator: Allocator, body: []const u8) ParseError![]const u8 {
+    return parseQueueUrlOrName(allocator, body);
+}
+
+pub fn renderListDeadLetterSourceQueues(
+    allocator: Allocator,
+    base_url: []const u8,
+    account_id: []const u8,
+    out: storage.ListDeadLetterSourceQueuesOutput,
+) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    // AWS uses uppercase `QueueUrls` here, matching ListQueues. (Some
+    // older docs render it lowercase; modern SDKs accept both.)
+    try s.objectField("queueUrls");
+    try s.beginArray();
+    for (out.queue_names) |n| {
+        var buf: [512]u8 = undefined;
+        const url = try std.fmt.bufPrint(&buf, "{s}/{s}/{s}", .{ base_url, account_id, n });
+        try s.write(url);
+    }
+    try s.endArray();
+    try s.endObject();
+    return aw.toOwnedSlice();
+}
+
+// ---------------------------------------------------------------------------
 // SetQueueAttributes
 
 pub const SetQueueAttributesRequest = struct {

@@ -1919,6 +1919,18 @@ pub const ListQueueTagsOutput = struct {
     tags: []const Tag,
 };
 
+/// Input for ListDeadLetterSourceQueues (v0.3.2). The caller supplies
+/// the DLQ's name (extracted from QueueUrl). Storage walks all queues
+/// and returns those whose RedrivePolicy targets this DLQ.
+pub const ListDeadLetterSourceQueuesInput = struct {
+    dlq_name: []const u8,
+};
+
+pub const ListDeadLetterSourceQueuesOutput = struct {
+    /// Source queue names. Caller-owned allocations.
+    queue_names: []const []const u8,
+};
+
 pub const SqsBackend = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -1940,6 +1952,8 @@ pub const SqsBackend = struct {
         tagQueue: *const fn (ctx: *anyopaque, in: TagQueueInput) Error!void,
         untagQueue: *const fn (ctx: *anyopaque, in: UntagQueueInput) Error!void,
         listQueueTags: *const fn (ctx: *anyopaque, allocator: Allocator, queue_name: []const u8) Error!ListQueueTagsOutput,
+        // v0.3.2 robustness.
+        listDeadLetterSourceQueues: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListDeadLetterSourceQueuesInput) Error!ListDeadLetterSourceQueuesOutput,
     };
 
     pub fn createQueue(self: SqsBackend, in: CreateQueueInput) Error!*const SqsQueueSlot {
@@ -1983,6 +1997,9 @@ pub const SqsBackend = struct {
     }
     pub fn listQueueTags(self: SqsBackend, allocator: Allocator, queue_name: []const u8) Error!ListQueueTagsOutput {
         return self.vtable.listQueueTags(self.ctx, allocator, queue_name);
+    }
+    pub fn listDeadLetterSourceQueues(self: SqsBackend, allocator: Allocator, in: ListDeadLetterSourceQueuesInput) Error!ListDeadLetterSourceQueuesOutput {
+        return self.vtable.listDeadLetterSourceQueues(self.ctx, allocator, in);
     }
 };
 

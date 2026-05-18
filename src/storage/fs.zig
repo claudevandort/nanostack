@@ -877,6 +877,7 @@ const sqs_vtable: storage.SqsBackend.VTable = .{
     .tagQueue = vtSqsTagQueue,
     .untagQueue = vtSqsUntagQueue,
     .listQueueTags = vtSqsListQueueTags,
+    .listDeadLetterSourceQueues = vtSqsListDeadLetterSourceQueues,
 };
 
 fn vtSqsCreateQueue(ctx: *anyopaque, in: storage.CreateQueueInput) storage.Error!*const storage.SqsQueueSlot {
@@ -920,6 +921,9 @@ fn vtSqsUntagQueue(ctx: *anyopaque, in: storage.UntagQueueInput) storage.Error!v
 }
 fn vtSqsListQueueTags(ctx: *anyopaque, allocator: Allocator, queue_name: []const u8) storage.Error!storage.ListQueueTagsOutput {
     return sqsListQueueTags(@ptrCast(@alignCast(ctx)), allocator, queue_name);
+}
+fn vtSqsListDeadLetterSourceQueues(ctx: *anyopaque, allocator: Allocator, in: storage.ListDeadLetterSourceQueuesInput) storage.Error!storage.ListDeadLetterSourceQueuesOutput {
+    return sqsListDeadLetterSourceQueues(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 
 const dynamo_vtable: storage.DynamoBackend.VTable = .{
@@ -6535,6 +6539,37 @@ pub fn sqsListQueueTags(self: *Fs, allocator: Allocator, queue_name: []const u8)
         };
     }
     return .{ .tags = out };
+}
+
+/// Reverse-walk: find every queue whose `RedrivePolicy.deadLetterTargetArn`
+/// names the given DLQ. AWS-exact: missing DLQ → empty list (not 404).
+pub fn sqsListDeadLetterSourceQueues(self: *Fs, allocator: Allocator, in: storage.ListDeadLetterSourceQueuesInput) storage.Error!storage.ListDeadLetterSourceQueuesOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+
+    var it = self.sqs_queues.iterator();
+    while (it.next()) |entry| {
+        const slot = entry.value_ptr.*;
+        const rd = parseRedrivePolicy(slot.attrs.redrive_policy) orelse continue;
+        if (!std.mem.eql(u8, rd.dlq_name, in.dlq_name)) continue;
+        const owned = allocator.dupe(u8, slot.name) catch return storage.Error.OutOfMemory;
+        names.append(allocator, owned) catch {
+            allocator.free(owned);
+            return storage.Error.OutOfMemory;
+        };
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return .{ .queue_names = names.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory };
 }
 
 pub fn sqsChangeMessageVisibility(self: *Fs, in: storage.ChangeMessageVisibilityInput) storage.Error!void {

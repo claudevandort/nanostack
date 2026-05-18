@@ -256,6 +256,67 @@ def test_retention_sweeper_drops_messages_past_retention():
         proc.wait(timeout=5)
 
 
+# ---------- Phase C — ListDeadLetterSourceQueues ----------
+
+
+@pytest.fixture
+def fresh_sqs():
+    ep = os.environ.get("NANOSTACK_ENDPOINT", "http://127.0.0.1:14566")
+    return _make_sqs(ep)
+
+
+def test_list_dlq_sources_returns_empty_when_no_sources(fresh_sqs):
+    dlq_name = f"dlq_{secrets.token_hex(4)}"
+    dlq_url = fresh_sqs.create_queue(QueueName=dlq_name)["QueueUrl"]
+    try:
+        out = fresh_sqs.list_dead_letter_source_queues(QueueUrl=dlq_url)
+        assert out["queueUrls"] == []
+    finally:
+        fresh_sqs.delete_queue(QueueUrl=dlq_url)
+
+
+def test_list_dlq_sources_finds_all_sources(fresh_sqs):
+    dlq_name = f"dlq_{secrets.token_hex(4)}"
+    dlq_url = fresh_sqs.create_queue(QueueName=dlq_name)["QueueUrl"]
+    src1 = fresh_sqs.create_queue(QueueName=f"src1_{secrets.token_hex(4)}")["QueueUrl"]
+    src2 = fresh_sqs.create_queue(QueueName=f"src2_{secrets.token_hex(4)}")["QueueUrl"]
+    try:
+        rd = (
+            '{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:'
+            + dlq_name
+            + '","maxReceiveCount":3}'
+        )
+        fresh_sqs.set_queue_attributes(QueueUrl=src1, Attributes={"RedrivePolicy": rd})
+        fresh_sqs.set_queue_attributes(QueueUrl=src2, Attributes={"RedrivePolicy": rd})
+        out = fresh_sqs.list_dead_letter_source_queues(QueueUrl=dlq_url)
+        # Both source queues are returned.
+        urls = sorted(out["queueUrls"])
+        assert urls == sorted([src1, src2])
+    finally:
+        for u in (src1, src2, dlq_url):
+            fresh_sqs.delete_queue(QueueUrl=u)
+
+
+def test_list_dlq_sources_only_returns_matching_dlq(fresh_sqs):
+    """Source queue pointing at *another* DLQ doesn't show up for our DLQ."""
+    dlq_a = fresh_sqs.create_queue(QueueName=f"dlq_a_{secrets.token_hex(4)}")["QueueUrl"]
+    dlq_b_name = f"dlq_b_{secrets.token_hex(4)}"
+    dlq_b = fresh_sqs.create_queue(QueueName=dlq_b_name)["QueueUrl"]
+    src = fresh_sqs.create_queue(QueueName=f"src_{secrets.token_hex(4)}")["QueueUrl"]
+    try:
+        rd = (
+            '{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:'
+            + dlq_b_name
+            + '","maxReceiveCount":3}'
+        )
+        fresh_sqs.set_queue_attributes(QueueUrl=src, Attributes={"RedrivePolicy": rd})
+        out = fresh_sqs.list_dead_letter_source_queues(QueueUrl=dlq_a)
+        assert out["queueUrls"] == []
+    finally:
+        for u in (src, dlq_a, dlq_b):
+            fresh_sqs.delete_queue(QueueUrl=u)
+
+
 def test_sweep_interval_flag_validates_range():
     """`--sqs-retention-sweep-interval-seconds 0` is out of range."""
     bin_path = os.environ.get("NANOSTACK_BIN")
