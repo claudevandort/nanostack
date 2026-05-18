@@ -16,6 +16,38 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-05-18
+
+**Patch release: SQS robustness.**
+
+Closes the SUPPORT.md ↔ behaviour drift accumulated through v0.3.0 + v0.3.1, lands the remaining 6 ops, and adds the MessageRetentionPeriod sweeper. After this patch SQS is feature-complete except for Queue Policy enforcement (deferred to v0.3.3) and FIFO high-throughput mode (deferred indefinitely).
+
+### Fixed — drift closures
+
+- **Cold-start message rehydration.** `loadSingleQueue` now walks `<queue>/messages/*.json` and rebuilds `slot.messages` (sorted by `sent_unix` then by message-id for stable sub-second ordering). SUPPORT.md had claimed this worked since v0.3.0; v0.3.2 makes it real.
+- **FIFO dedup history persistence.** `<queue>/dedup_history.json` is written through after every send and loaded on cold start. A re-send within the 5-minute window now correctly dedupes even after a restart.
+- **MessageRetentionPeriod is enforced.** New background sweeper thread (mirroring v0.2.3 TTL pattern) drops messages where `now > sent_unix + retention`. Tunable via `--sqs-retention-sweep-interval-seconds N` (default 60s, range 1..=3600).
+
+### Added — surface completion (6 ops)
+
+- **`ListDeadLetterSourceQueues`** — reverse-lookup from a DLQ to its source queues; reuses `parseRedrivePolicy`.
+- **`AddPermission` / `RemovePermission`** — AWS-real syntactic sugar over the Policy attribute. AddPermission constructs an IAM-style Statement and merges it; RemovePermission drops by Sid + clears the Policy when empty. Duplicate Sid → `InvalidParameterValue`; unknown Label → `InvalidParameterValue`. (Policy enforcement itself is still accept-store-roundtrip; deferred to v0.3.3.)
+- **`StartMessageMoveTask` / `CancelMessageMoveTask` / `ListMessageMoveTasks`** — the DLQ redrive task API. Synchronous execution model: Start drains the entire DLQ into the destination immediately and the task is recorded as `COMPLETED`. `MaxNumberOfMessagesPerSecond` accepted but ignored. Tasks are in-memory only.
+
+### Tests
+
+- Python: 474 → 495 (+21 robustness tests).
+- JS: 98 → 103 (+5).
+- AWS CLI: 40 → 43 (+3).
+
+### Documented divergences (new / changed in v0.3.2)
+
+- Removed "MessageRetentionPeriod not enforced" — it now is.
+- Removed "FIFO dedup history is in-memory only" — persisted to disk as of v0.3.2.
+- Removed "In-flight messages tracked in-memory" — full rehydration ships.
+- Reworded "Queue Policy attribute is accepted, not evaluated" — points at v0.3.3 as the planned enforcement landing.
+- New: "MessageMoveTask runs synchronously" — drains on Start, no intermediate `RUNNING` status, `MaxNumberOfMessagesPerSecond` accepted but ignored. In-memory state.
+
 ## [0.3.1] — 2026-05-18
 
 **Patch release: SQS FIFO queues.**

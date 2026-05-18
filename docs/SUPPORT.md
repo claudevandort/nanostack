@@ -140,7 +140,13 @@ Documented divergences (intentional):
 
 ## SQS
 
-SQS is the third AWS service nanostack covers, opt-in via `--services sqs` (or `--services s3,dynamodb,sqs` to enable all three). v0.3.0 shipped 17 ops: queue CRUD, message send/receive/delete with visibility timeout enforcement, batch ops (send / delete / change-visibility), long-polling on ReceiveMessage, dead-letter queues, and tags. v0.3.1 adds **FIFO queues**: per-group strict ordering, MessageGroupId / MessageDeduplicationId / ContentBasedDeduplication 5-minute dedup window, monotonic per-queue SequenceNumber, per-message DelaySeconds rejection.
+SQS is the third AWS service nanostack covers, opt-in via `--services sqs` (or `--services s3,dynamodb,sqs` to enable all three). v0.3.0 shipped 17 ops; v0.3.1 added FIFO queues. **v0.3.2 closes all SUPPORT.md ↔ behaviour drift and lands the remaining 6 ops:**
+
+- **Cold-start safety**: messages + FIFO dedup history are rehydrated from disk on startup (the v0.3.0 documentation claimed this; v0.3.2 makes it real).
+- **MessageRetentionPeriod is now enforced** by a second background sweeper thread (configurable via `--sqs-retention-sweep-interval-seconds N`, default 60s).
+- **`ListDeadLetterSourceQueues`** wires the reverse-lookup from a DLQ to its source queues.
+- **`AddPermission` / `RemovePermission`** mutate the Policy attribute as AWS-real syntactic sugar. The Policy attribute remains accept-store-roundtrip at evaluation time (queue-policy enforcement deferred to v0.3.3).
+- **`StartMessageMoveTask` / `CancelMessageMoveTask` / `ListMessageMoveTasks`** ship the DLQ redrive API. Synchronous execution model: the task drains the DLQ on Start and immediately completes.
 
 | Operation | Status | Milestone |
 |---|---|---|
@@ -161,32 +167,24 @@ SQS is the third AWS service nanostack covers, opt-in via `--services sqs` (or `
 | TagQueue | supported (max 50 tags per queue; overwrites existing keys; persisted to tags.json) | v0.3.0 |
 | UntagQueue | supported | v0.3.0 |
 | ListQueueTags | supported | v0.3.0 |
-
-### Operations not yet supported
-
-These AWS SQS operations are part of the full surface but currently unrouted — a client call returns the generic "unknown target" error. Tracked here so users know whether to expect them in a future patch or treat them as out-of-scope.
-
-| Operation | Status | Planned |
-|---|---|---|
-| AddPermission | unrouted | v0.3.x patch alongside Queue Policy evaluation (today the Policy attribute is accept-store-roundtrip only — see divergences below) |
-| RemovePermission | unrouted | same as AddPermission |
-| ListDeadLetterSourceQueues | unrouted | v0.3.x patch (cheap; walks queues whose RedrivePolicy targets a given DLQ ARN) |
-| StartMessageMoveTask | unrouted | v0.3.x patch (DLQ redrive API — replays messages from a DLQ back to the configured source) |
-| CancelMessageMoveTask | unrouted | same as StartMessageMoveTask |
-| ListMessageMoveTasks | unrouted | same as StartMessageMoveTask |
+| ListDeadLetterSourceQueues | supported (walks queues whose RedrivePolicy targets the given DLQ; sorted lex-ascending) | v0.3.2 |
+| AddPermission | supported (constructs an IAM-style Statement and merges it into the Policy attribute; duplicate Label → InvalidParameterValue) | v0.3.2 |
+| RemovePermission | supported (drops the matching Sid; clears the Policy attribute when no statements remain; unknown Label → InvalidParameterValue) | v0.3.2 |
+| StartMessageMoveTask | supported (synchronous drain DLQ → destination at call time; auto-derives DestinationArn from the DLQ's redrive-source when omitted; **MaxNumberOfMessagesPerSecond accepted but ignored**) | v0.3.2 |
+| CancelMessageMoveTask | supported (returns the moved count; tasks are always immediately COMPLETED under our sync model, so cancellation is effectively a count read) | v0.3.2 |
+| ListMessageMoveTasks | supported (filters by SourceArn; MaxResults 1..=10, newest-first) | v0.3.2 |
 
 Documented divergences (intentional):
 - **JSON wire only.** boto3 v1.34+, JS SDK v3, and CLI v2 all use the JSON wire by default. The legacy query-string / XML form is **out of scope** — users on older SDKs should upgrade.
 - **FIFO high-throughput mode deferred.** `DeduplicationScope=messageGroup` and `FifoThroughputLimit=perMessageGroupId` (the per-group-throughput accounting mode AWS added for high-volume FIFO workloads) are not modelled — attributes accepted & round-tripped but the accounting isn't built. v0.3.x patch if a user asks.
-- **FIFO dedup history is in-memory only.** The 5-minute dedup window (MessageDeduplicationId → original send) survives within a process but not across restart. Same trade-off as DDB Streams ring buffers.
 - **FIFO SequenceNumber width**: 20-digit zero-padded decimal (u128). AWS docs say "up to 39 digits". Strict-width parsers may need to relax.
 - **Long polling = in-handler sleep loop.** ReceiveMessage with `WaitTimeSeconds > 0` blocks the handler thread, polling the queue every 100ms until a message arrives or the deadline expires. AWS-real uses a server-side event loop; we don't. Wastes one handler thread per long-poll; acceptable for local dev.
 - **No connection-cancellation detection on long polling.** A client that drops mid-poll keeps the handler sleeping until the deadline. AWS-real would notice and return immediately.
 - **No rate limits.** AWS enforces per-account caps on queues + sends/sec. We accept everything.
-- **MessageRetentionPeriod is configured but not enforced.** Messages persist until deleted or DLQ-routed. A future patch may add a sweeper similar to v0.2.3 TTL.
 - **No encryption at rest** (no SSE-SQS, no SSE-KMS). Same divergence as DDB backups.
-- **Queue Policy attribute is accepted, not evaluated.** Round-trips verbatim through Set/GetQueueAttributes.
-- **In-flight messages tracked in-memory** with the visible_unix timestamp persisted per message. Crash-safe: on cold start, messages with visible_unix in the past are immediately visible again.
+- **Queue Policy attribute is accepted, not evaluated** (deferred to v0.3.3). `AddPermission` / `RemovePermission` mutate the attribute correctly but the resulting policy isn't enforced at request time. To gate access today, use SigV4 + `--no-auth`/`--access-key`.
+- **`MessageMoveTask` runs synchronously.** Real AWS executes tasks asynchronously with `MaxNumberOfMessagesPerSecond` throttling and exposes intermediate `RUNNING` status. We drain on Start, never expose `RUNNING`. `MaxNumberOfMessagesPerSecond` accepted but ignored. Move tasks are in-memory only — not persisted across restart.
+- **MessageMoveTask cancellation is a count read.** Because tasks complete synchronously on Start, `CancelMessageMoveTask` always returns the final moved count rather than cutting a running task short.
 
 ## S3
 
