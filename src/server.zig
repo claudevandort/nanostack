@@ -319,12 +319,17 @@ fn handleSqs(
     host_id: []const u8,
     target_header: []const u8,
 ) void {
-    // SigV4 with service="sqs". Same flow as DDB: `--no-auth` bypasses.
-    if (!self.config.no_auth) {
+    // SigV4 with service="sqs". Capture the verified Principal so the
+    // SQS authz hook (Phase B) can evaluate queue policies against it.
+    // `--no-auth` short-circuits to the configured access_key as owner
+    // (matches S3).
+    const principal: sigv4.Principal = if (self.config.no_auth)
+        sigv4.Principal.awsAccount(self.config.access_key)
+    else blk: {
         const verify_headers = collectHeaders(arena, req) catch {
             return respondSqsError(res, request_id, host_id, .{ .code = .internal_server_error });
         };
-        _ = sigv4.verify(arena, .{
+        const p = sigv4.verify(arena, .{
             .method = if (req.method == .OTHER) req.method_string else @tagName(req.method),
             .path = req.url.path,
             .query = req.url.query,
@@ -344,7 +349,8 @@ fn handleSqs(
                 .message = "The security token included in the request is invalid.",
             });
         };
-    }
+        break :blk p;
+    };
 
     if (!std.mem.startsWith(u8, target_header, sqs.target_prefix)) {
         return respondSqsError(res, request_id, host_id, .{
@@ -375,6 +381,9 @@ fn handleSqs(
         .region = self.config.region,
         .account_id = self.config.account_id,
         .base_url = base_url,
+        .principal = principal,
+        .no_auth = self.config.no_auth,
+        .access_key = self.config.access_key,
         .request = .{
             .headers = svc_headers,
             .body = req.body() orelse "",

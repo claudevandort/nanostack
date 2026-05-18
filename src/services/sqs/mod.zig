@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const storage = @import("../../storage/mod.zig");
 const errors = @import("../../wire/sqs/errors.zig");
+const principal_mod = @import("../../auth/principal.zig");
 const queues_handler = @import("queues.zig");
 const messages_handler = @import("messages.zig");
 const tags_handler = @import("tags.zig");
@@ -48,6 +49,14 @@ pub const Context = struct {
     /// Base URL clients use to reach queues, e.g. `http://127.0.0.1:4566`.
     /// Appended with `/<account_id>/<queue_name>` to form QueueUrls.
     base_url: []const u8 = "http://127.0.0.1:4566",
+    /// Verified Principal from SigV4 (or `anonymous()` for unsigned
+    /// requests). Used by the queue-policy authz hook (v0.3.3).
+    principal: principal_mod.Principal = .{ .kind = .anonymous, .id = "" },
+    /// `--no-auth` mode: SigV4 already skipped, authz hook also skips.
+    no_auth: bool = false,
+    /// Configured owner access_key. The authz hook uses this for the
+    /// "owner-implicit-allow" short-circuit.
+    access_key: []const u8 = "test",
     request: RequestData = .{},
 };
 
