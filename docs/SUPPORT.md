@@ -140,13 +140,17 @@ Documented divergences (intentional):
 
 ## SQS
 
-SQS is the third AWS service nanostack covers, opt-in via `--services sqs` (or `--services s3,dynamodb,sqs` to enable all three). v0.3.0 shipped 17 ops; v0.3.1 added FIFO queues. **v0.3.2 closes all SUPPORT.md ↔ behaviour drift and lands the remaining 6 ops:**
+SQS is the third AWS service nanostack covers, opt-in via `--services sqs` (or `--services s3,dynamodb,sqs` to enable all three). v0.3.0 shipped 17 ops; v0.3.1 added FIFO queues; v0.3.2 added the remaining 6 ops + cold-start safety + the MessageRetentionPeriod sweeper. **v0.3.3 lands Queue Policy enforcement** — the Policy attribute (mutated by `AddPermission` / `RemovePermission` / `SetQueueAttributes`) is now evaluated on every request via the existing `auth/policy_eval.zig`. After v0.3.3, SQS is feature-complete + fully enforced.
 
-- **Cold-start safety**: messages + FIFO dedup history are rehydrated from disk on startup (the v0.3.0 documentation claimed this; v0.3.2 makes it real).
-- **MessageRetentionPeriod is now enforced** by a second background sweeper thread (configurable via `--sqs-retention-sweep-interval-seconds N`, default 60s).
-- **`ListDeadLetterSourceQueues`** wires the reverse-lookup from a DLQ to its source queues.
-- **`AddPermission` / `RemovePermission`** mutate the Policy attribute as AWS-real syntactic sugar. The Policy attribute remains accept-store-roundtrip at evaluation time (queue-policy enforcement deferred to v0.3.3).
-- **`StartMessageMoveTask` / `CancelMessageMoveTask` / `ListMessageMoveTasks`** ship the DLQ redrive API. Synchronous execution model: the task drains the DLQ on Start and immediately completes.
+The authz cascade (in `src/services/sqs/authz.zig`):
+
+1. `--no-auth` mode → allow (matches the S3 hook bypass).
+2. Account-scoped op (`CreateQueue` / `ListQueues`) → require non-anonymous principal; otherwise deny.
+3. Queue-scoped op + principal is the configured `--access-key` → allow (**owner-implicit-allow**, matches AWS).
+4. Queue-scoped op + queue has no Policy → deny.
+5. Queue has a Policy → evaluate via `policy_eval`. `.allow` → allow; `.deny` short-circuits; `.no_match` → default-deny (AWS-exact).
+
+Anonymous requests can be granted access through a `Principal: "*"` policy attached via `AddPermission` (Allow only) or `SetQueueAttributes` (Allow or Deny).
 
 | Operation | Status | Milestone |
 |---|---|---|
@@ -168,7 +172,7 @@ SQS is the third AWS service nanostack covers, opt-in via `--services sqs` (or `
 | UntagQueue | supported | v0.3.0 |
 | ListQueueTags | supported | v0.3.0 |
 | ListDeadLetterSourceQueues | supported (walks queues whose RedrivePolicy targets the given DLQ; sorted lex-ascending) | v0.3.2 |
-| AddPermission | supported (constructs an IAM-style Statement and merges it into the Policy attribute; duplicate Label → InvalidParameterValue) | v0.3.2 |
+| AddPermission | supported (constructs an IAM-style Statement and merges it into the Policy attribute; duplicate Label → InvalidParameterValue; **resulting policy is enforced at request time**) | v0.3.2, eval v0.3.3 |
 | RemovePermission | supported (drops the matching Sid; clears the Policy attribute when no statements remain; unknown Label → InvalidParameterValue) | v0.3.2 |
 | StartMessageMoveTask | supported (synchronous drain DLQ → destination at call time; auto-derives DestinationArn from the DLQ's redrive-source when omitted; **MaxNumberOfMessagesPerSecond accepted but ignored**) | v0.3.2 |
 | CancelMessageMoveTask | supported (returns the moved count; tasks are always immediately COMPLETED under our sync model, so cancellation is effectively a count read) | v0.3.2 |
@@ -182,7 +186,9 @@ Documented divergences (intentional):
 - **No connection-cancellation detection on long polling.** A client that drops mid-poll keeps the handler sleeping until the deadline. AWS-real would notice and return immediately.
 - **No rate limits.** AWS enforces per-account caps on queues + sends/sec. We accept everything.
 - **No encryption at rest** (no SSE-SQS, no SSE-KMS). Same divergence as DDB backups.
-- **Queue Policy attribute is accepted, not evaluated** (deferred to v0.3.3). `AddPermission` / `RemovePermission` mutate the attribute correctly but the resulting policy isn't enforced at request time. To gate access today, use SigV4 + `--no-auth`/`--access-key`.
+- **Cross-account principals not supported.** SigV4 in nanostack verifies only against the configured `--access-key`; a request signed with a different account's key fails verification before reaching policy evaluation. Anonymous (`Principal: "*"`) grants work end-to-end via raw unsigned requests; explicit cross-account `Principal: { AWS: "arn:aws:iam::<other-account>:root" }` grants don't have a way to be exercised in nanostack.
+- **`AddPermission` only constructs Allow statements** (AWS-real shares this constraint). Users who need Deny statements must install a hand-built Policy via `SetQueueAttributes`.
+- **Policy `Condition` blocks are skipped** (statement evaluates as `no_match`, same caveat as the S3 evaluator). Inherited from `auth/policy_eval.zig`.
 - **`MessageMoveTask` runs synchronously.** Real AWS executes tasks asynchronously with `MaxNumberOfMessagesPerSecond` throttling and exposes intermediate `RUNNING` status. We drain on Start, never expose `RUNNING`. `MaxNumberOfMessagesPerSecond` accepted but ignored. Move tasks are in-memory only — not persisted across restart.
 - **MessageMoveTask cancellation is a count read.** Because tasks complete synchronously on Start, `CancelMessageMoveTask` always returns the final moved count rather than cutting a running task short.
 
