@@ -7119,20 +7119,13 @@ fn vtSnsPublishBatch(ctx: *anyopaque, allocator: Allocator, in: storage.PublishB
     return snsPublishBatch(@ptrCast(@alignCast(ctx)), allocator, in);
 }
 fn vtSnsTagTopic(ctx: *anyopaque, in: storage.TagTopicInput) storage.Error!void {
-    _ = ctx;
-    _ = in;
-    return storage.Error.InvalidParameterValue;
+    return snsTagTopic(@ptrCast(@alignCast(ctx)), in);
 }
 fn vtSnsUntagTopic(ctx: *anyopaque, in: storage.UntagTopicInput) storage.Error!void {
-    _ = ctx;
-    _ = in;
-    return storage.Error.InvalidParameterValue;
+    return snsUntagTopic(@ptrCast(@alignCast(ctx)), in);
 }
 fn vtSnsListTopicTags(ctx: *anyopaque, allocator: Allocator, topic_name: []const u8) storage.Error!storage.ListTopicTagsOutput {
-    _ = ctx;
-    _ = allocator;
-    _ = topic_name;
-    return .{ .tags = &.{} };
+    return snsListTopicTags(@ptrCast(@alignCast(ctx)), allocator, topic_name);
 }
 
 pub fn snsCreateTopic(self: *Fs, in: storage.CreateTopicInput) storage.Error!*const storage.SnsTopicSlot {
@@ -7629,6 +7622,56 @@ pub fn snsPublishBatch(self: *Fs, allocator: Allocator, in: storage.PublishBatch
         .successful = successful.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory,
         .failed = failed.toOwnedSlice(allocator) catch return storage.Error.OutOfMemory,
     };
+}
+
+// ---------------------------------------------------------------------------
+// SNS tags (Phase E)
+
+pub fn snsTagTopic(self: *Fs, in: storage.TagTopicInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const slot = self.sns_topics.get(in.topic_name) orelse return storage.Error.TopicNotFound;
+    for (in.tags) |t| {
+        const k = self.allocator.dupe(u8, t.key) catch return storage.Error.OutOfMemory;
+        const v = self.allocator.dupe(u8, t.value) catch {
+            self.allocator.free(k);
+            return storage.Error.OutOfMemory;
+        };
+        // Overwrite if exists.
+        if (slot.tags.fetchRemove(k)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
+        }
+        slot.tags.put(self.allocator, k, v) catch return storage.Error.OutOfMemory;
+    }
+}
+
+pub fn snsUntagTopic(self: *Fs, in: storage.UntagTopicInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const slot = self.sns_topics.get(in.topic_name) orelse return storage.Error.TopicNotFound;
+    for (in.keys) |k| {
+        if (slot.tags.fetchRemove(k)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
+        }
+    }
+}
+
+pub fn snsListTopicTags(self: *Fs, allocator: Allocator, topic_name: []const u8) storage.Error!storage.ListTopicTagsOutput {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const slot = self.sns_topics.get(topic_name) orelse return storage.Error.TopicNotFound;
+    var out = allocator.alloc(storage.Tag, slot.tags.count()) catch return storage.Error.OutOfMemory;
+    var i: usize = 0;
+    var it = slot.tags.iterator();
+    while (it.next()) |entry| : (i += 1) {
+        out[i] = .{
+            .key = allocator.dupe(u8, entry.key_ptr.*) catch return storage.Error.OutOfMemory,
+            .value = allocator.dupe(u8, entry.value_ptr.*) catch return storage.Error.OutOfMemory,
+        };
+    }
+    return .{ .tags = out };
 }
 
 fn loadSubscriptionsForTopic(self: *Fs, slot: *storage.SnsTopicSlot) !void {

@@ -88,6 +88,10 @@ pub const Context = struct {
     /// in the bucket's NotificationConfiguration. Null when nanostack
     /// was started without `--services sqs`.
     sqs_backend: ?storage.SqsBackend = null,
+    /// Optional SNS backend (v0.4.0). When present, S3 → SNS event
+    /// notification dispatch is enabled for matching TopicConfiguration
+    /// entries. Null when nanostack was started without `--services sns`.
+    sns_backend: ?storage.SnsBackend = null,
     /// Per-request arena, owned by the HTTP server. The result's body and
     /// header values are allocated here and live until the response is sent.
     allocator: Allocator,

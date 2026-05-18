@@ -14,6 +14,7 @@ const principal_mod = @import("../../auth/principal.zig");
 const topics_handler = @import("topics.zig");
 const subs_handler = @import("subscriptions.zig");
 const publish_handler = @import("publish.zig");
+const tags_handler = @import("tags.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -79,6 +80,11 @@ pub fn handle(ctx: Context) Result {
     // Publish (Phase D).
     if (std.mem.eql(u8, action, "Publish")) return publish_handler.publish(ctx);
     if (std.mem.eql(u8, action, "PublishBatch")) return publish_handler.publishBatch(ctx);
+
+    // Tags (Phase E).
+    if (std.mem.eql(u8, action, "TagResource")) return tags_handler.tagResource(ctx);
+    if (std.mem.eql(u8, action, "UntagResource")) return tags_handler.untagResource(ctx);
+    if (std.mem.eql(u8, action, "ListTagsForResource")) return tags_handler.listTagsForResource(ctx);
 
     return .{ .err = .{
         .code = .invalid_action,
