@@ -317,6 +317,131 @@ def test_list_dlq_sources_only_returns_matching_dlq(fresh_sqs):
             fresh_sqs.delete_queue(QueueUrl=u)
 
 
+# ---------- Phase D.1 — AddPermission / RemovePermission ----------
+
+
+def test_add_permission_creates_policy(fresh_sqs):
+    name = f"q_{secrets.token_hex(4)}"
+    url = fresh_sqs.create_queue(QueueName=name)["QueueUrl"]
+    try:
+        fresh_sqs.add_permission(
+            QueueUrl=url,
+            Label="grant1",
+            AWSAccountIds=["111122223333"],
+            Actions=["SendMessage"],
+        )
+        attrs = fresh_sqs.get_queue_attributes(
+            QueueUrl=url, AttributeNames=["Policy"]
+        )["Attributes"]
+        policy = attrs.get("Policy")
+        assert policy is not None
+        assert "grant1" in policy
+        assert "111122223333" in policy
+        assert "sqs:SendMessage" in policy
+    finally:
+        fresh_sqs.delete_queue(QueueUrl=url)
+
+
+def test_add_permission_appends_to_existing_policy(fresh_sqs):
+    name = f"q_{secrets.token_hex(4)}"
+    url = fresh_sqs.create_queue(QueueName=name)["QueueUrl"]
+    try:
+        fresh_sqs.add_permission(
+            QueueUrl=url,
+            Label="grant1",
+            AWSAccountIds=["111122223333"],
+            Actions=["SendMessage"],
+        )
+        fresh_sqs.add_permission(
+            QueueUrl=url,
+            Label="grant2",
+            AWSAccountIds=["444455556666"],
+            Actions=["ReceiveMessage"],
+        )
+        policy = fresh_sqs.get_queue_attributes(
+            QueueUrl=url, AttributeNames=["Policy"]
+        )["Attributes"]["Policy"]
+        assert "grant1" in policy
+        assert "grant2" in policy
+        assert "sqs:SendMessage" in policy
+        assert "sqs:ReceiveMessage" in policy
+    finally:
+        fresh_sqs.delete_queue(QueueUrl=url)
+
+
+def test_add_permission_duplicate_label_rejected(fresh_sqs):
+    name = f"q_{secrets.token_hex(4)}"
+    url = fresh_sqs.create_queue(QueueName=name)["QueueUrl"]
+    try:
+        fresh_sqs.add_permission(
+            QueueUrl=url,
+            Label="grant1",
+            AWSAccountIds=["111122223333"],
+            Actions=["SendMessage"],
+        )
+        with pytest.raises(botocore.exceptions.ClientError) as exc:
+            fresh_sqs.add_permission(
+                QueueUrl=url,
+                Label="grant1",
+                AWSAccountIds=["444455556666"],
+                Actions=["ReceiveMessage"],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    finally:
+        fresh_sqs.delete_queue(QueueUrl=url)
+
+
+def test_remove_permission_drops_matching_statement(fresh_sqs):
+    name = f"q_{secrets.token_hex(4)}"
+    url = fresh_sqs.create_queue(QueueName=name)["QueueUrl"]
+    try:
+        fresh_sqs.add_permission(
+            QueueUrl=url, Label="grant1",
+            AWSAccountIds=["111122223333"], Actions=["SendMessage"],
+        )
+        fresh_sqs.add_permission(
+            QueueUrl=url, Label="grant2",
+            AWSAccountIds=["444455556666"], Actions=["ReceiveMessage"],
+        )
+        fresh_sqs.remove_permission(QueueUrl=url, Label="grant1")
+        policy = fresh_sqs.get_queue_attributes(
+            QueueUrl=url, AttributeNames=["Policy"]
+        )["Attributes"]["Policy"]
+        assert "grant1" not in policy
+        assert "grant2" in policy
+    finally:
+        fresh_sqs.delete_queue(QueueUrl=url)
+
+
+def test_remove_permission_clears_policy_when_no_statements_left(fresh_sqs):
+    name = f"q_{secrets.token_hex(4)}"
+    url = fresh_sqs.create_queue(QueueName=name)["QueueUrl"]
+    try:
+        fresh_sqs.add_permission(
+            QueueUrl=url, Label="grant1",
+            AWSAccountIds=["111122223333"], Actions=["SendMessage"],
+        )
+        fresh_sqs.remove_permission(QueueUrl=url, Label="grant1")
+        attrs = fresh_sqs.get_queue_attributes(
+            QueueUrl=url, AttributeNames=["Policy"]
+        )["Attributes"]
+        # Policy attribute is gone or empty after the last statement is removed.
+        assert "Policy" not in attrs or not attrs["Policy"]
+    finally:
+        fresh_sqs.delete_queue(QueueUrl=url)
+
+
+def test_remove_permission_unknown_label_rejected(fresh_sqs):
+    name = f"q_{secrets.token_hex(4)}"
+    url = fresh_sqs.create_queue(QueueName=name)["QueueUrl"]
+    try:
+        with pytest.raises(botocore.exceptions.ClientError) as exc:
+            fresh_sqs.remove_permission(QueueUrl=url, Label="nonexistent")
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    finally:
+        fresh_sqs.delete_queue(QueueUrl=url)
+
+
 def test_sweep_interval_flag_validates_range():
     """`--sqs-retention-sweep-interval-seconds 0` is out of range."""
     bin_path = os.environ.get("NANOSTACK_BIN")

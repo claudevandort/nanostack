@@ -1931,6 +1931,28 @@ pub const ListDeadLetterSourceQueuesOutput = struct {
     queue_names: []const []const u8,
 };
 
+/// Input for AddPermission (v0.3.2). The handler builds the queue ARN
+/// + action list with `sqs:` prefix and passes them down.
+pub const AddPermissionInput = struct {
+    queue_name: []const u8,
+    /// Statement Sid. Must be unique per queue policy.
+    label: []const u8,
+    /// AWS account IDs to grant the listed actions to (one or more).
+    /// Rendered as `arn:aws:iam::<acct>:root` in the Principal.
+    aws_account_ids: []const []const u8,
+    /// `sqs:Foo` action names. AWS-real accepts them without the prefix
+    /// on the wire; the handler adds the prefix before this struct.
+    actions: []const []const u8,
+    /// The queue's ARN, built by the handler from the configured region
+    /// + account_id + queue_name.
+    queue_arn: []const u8,
+};
+
+pub const RemovePermissionInput = struct {
+    queue_name: []const u8,
+    label: []const u8,
+};
+
 pub const SqsBackend = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -1954,6 +1976,8 @@ pub const SqsBackend = struct {
         listQueueTags: *const fn (ctx: *anyopaque, allocator: Allocator, queue_name: []const u8) Error!ListQueueTagsOutput,
         // v0.3.2 robustness.
         listDeadLetterSourceQueues: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListDeadLetterSourceQueuesInput) Error!ListDeadLetterSourceQueuesOutput,
+        addPermission: *const fn (ctx: *anyopaque, in: AddPermissionInput) Error!void,
+        removePermission: *const fn (ctx: *anyopaque, in: RemovePermissionInput) Error!void,
     };
 
     pub fn createQueue(self: SqsBackend, in: CreateQueueInput) Error!*const SqsQueueSlot {
@@ -2000,6 +2024,12 @@ pub const SqsBackend = struct {
     }
     pub fn listDeadLetterSourceQueues(self: SqsBackend, allocator: Allocator, in: ListDeadLetterSourceQueuesInput) Error!ListDeadLetterSourceQueuesOutput {
         return self.vtable.listDeadLetterSourceQueues(self.ctx, allocator, in);
+    }
+    pub fn addPermission(self: SqsBackend, in: AddPermissionInput) Error!void {
+        return self.vtable.addPermission(self.ctx, in);
+    }
+    pub fn removePermission(self: SqsBackend, in: RemovePermissionInput) Error!void {
+        return self.vtable.removePermission(self.ctx, in);
     }
 };
 

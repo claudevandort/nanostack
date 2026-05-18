@@ -325,6 +325,78 @@ fn requestedHas(requested: []const []const u8, name: []const u8) bool {
 }
 
 // ---------------------------------------------------------------------------
+// AddPermission / RemovePermission (v0.3.2)
+
+pub const AddPermissionRequest = struct {
+    queue_name: []const u8,
+    label: []const u8,
+    aws_account_ids: []const []const u8,
+    /// Action names from the wire — without the `sqs:` prefix. Caller
+    /// adds the prefix before passing to storage.
+    actions: []const []const u8,
+};
+
+pub fn parseAddPermission(allocator: Allocator, body: []const u8) ParseError!AddPermissionRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const root = parsed.value.object;
+
+    const url_v = root.get("QueueUrl") orelse return ParseError.Malformed;
+    if (url_v != .string) return ParseError.Malformed;
+    const name = try allocator.dupe(u8, queueNameFromUrl(url_v.string));
+
+    const label_v = root.get("Label") orelse return ParseError.Malformed;
+    if (label_v != .string or label_v.string.len == 0) return ParseError.Malformed;
+    const label = try allocator.dupe(u8, label_v.string);
+
+    const accts_v = root.get("AWSAccountIds") orelse return ParseError.Malformed;
+    if (accts_v != .array or accts_v.array.items.len == 0) return ParseError.Malformed;
+    const accts = try allocator.alloc([]const u8, accts_v.array.items.len);
+    for (accts_v.array.items, 0..) |entry, i| {
+        if (entry != .string) return ParseError.Malformed;
+        accts[i] = try allocator.dupe(u8, entry.string);
+    }
+
+    const actions_v = root.get("Actions") orelse return ParseError.Malformed;
+    if (actions_v != .array or actions_v.array.items.len == 0) return ParseError.Malformed;
+    const actions = try allocator.alloc([]const u8, actions_v.array.items.len);
+    for (actions_v.array.items, 0..) |entry, i| {
+        if (entry != .string) return ParseError.Malformed;
+        actions[i] = try allocator.dupe(u8, entry.string);
+    }
+
+    return .{
+        .queue_name = name,
+        .label = label,
+        .aws_account_ids = accts,
+        .actions = actions,
+    };
+}
+
+pub const RemovePermissionRequest = struct {
+    queue_name: []const u8,
+    label: []const u8,
+};
+
+pub fn parseRemovePermission(allocator: Allocator, body: []const u8) ParseError!RemovePermissionRequest {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return ParseError.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return ParseError.Malformed;
+    const root = parsed.value.object;
+    const url_v = root.get("QueueUrl") orelse return ParseError.Malformed;
+    if (url_v != .string) return ParseError.Malformed;
+    const label_v = root.get("Label") orelse return ParseError.Malformed;
+    if (label_v != .string or label_v.string.len == 0) return ParseError.Malformed;
+    return .{
+        .queue_name = try allocator.dupe(u8, queueNameFromUrl(url_v.string)),
+        .label = try allocator.dupe(u8, label_v.string),
+    };
+}
+
+// ---------------------------------------------------------------------------
 // ListDeadLetterSourceQueues (v0.3.2)
 
 /// Returns the DLQ's queue name. Both input shapes (`QueueUrl` —

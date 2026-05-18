@@ -83,6 +83,8 @@ pub fn handle(ctx: Context) Result {
 
     // Robustness ops (v0.3.2).
     if (std.mem.eql(u8, target, "ListDeadLetterSourceQueues")) return queues_handler.listDeadLetterSourceQueues(ctx);
+    if (std.mem.eql(u8, target, "AddPermission")) return queues_handler.addPermission(ctx);
+    if (std.mem.eql(u8, target, "RemovePermission")) return queues_handler.removePermission(ctx);
 
     // Anything else: 400 with operation name in the message. Phase 2+
     // adds messages / batches / long polling.

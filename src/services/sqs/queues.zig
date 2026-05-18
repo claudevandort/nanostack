@@ -105,6 +105,42 @@ pub fn listDeadLetterSourceQueues(ctx: Context) Result {
     return .{ .ok = .{ .body = body } };
 }
 
+pub fn addPermission(ctx: Context) Result {
+    const req = wire.parseAddPermission(ctx.allocator, ctx.request.body) catch |err|
+        return .{ .err = mapParseErr(err) };
+    // Add the "sqs:" prefix to each action name. AWS-real accepts both
+    // shorthand and fully-qualified; we always store the fully-qualified
+    // form for evaluator simplicity.
+    var prefixed: std.ArrayList([]const u8) = .empty;
+    for (req.actions) |a| {
+        const owned = std.fmt.allocPrint(ctx.allocator, "sqs:{s}", .{a}) catch
+            return .{ .err = .{ .code = .internal_server_error } };
+        prefixed.append(ctx.allocator, owned) catch
+            return .{ .err = .{ .code = .internal_server_error } };
+    }
+    // Build queue ARN.
+    const arn = std.fmt.allocPrint(ctx.allocator, "arn:aws:sqs:{s}:{s}:{s}", .{ ctx.region, ctx.account_id, req.queue_name }) catch
+        return .{ .err = .{ .code = .internal_server_error } };
+    ctx.backend.addPermission(.{
+        .queue_name = req.queue_name,
+        .label = req.label,
+        .aws_account_ids = req.aws_account_ids,
+        .actions = prefixed.items,
+        .queue_arn = arn,
+    }) catch |err| return .{ .err = mapStorageErr(err) };
+    return .{ .ok = .{ .body = "{}" } };
+}
+
+pub fn removePermission(ctx: Context) Result {
+    const req = wire.parseRemovePermission(ctx.allocator, ctx.request.body) catch |err|
+        return .{ .err = mapParseErr(err) };
+    ctx.backend.removePermission(.{
+        .queue_name = req.queue_name,
+        .label = req.label,
+    }) catch |err| return .{ .err = mapStorageErr(err) };
+    return .{ .ok = .{ .body = "{}" } };
+}
+
 // ---------------------------------------------------------------------------
 // Error mapping
 

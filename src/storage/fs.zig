@@ -878,6 +878,8 @@ const sqs_vtable: storage.SqsBackend.VTable = .{
     .untagQueue = vtSqsUntagQueue,
     .listQueueTags = vtSqsListQueueTags,
     .listDeadLetterSourceQueues = vtSqsListDeadLetterSourceQueues,
+    .addPermission = vtSqsAddPermission,
+    .removePermission = vtSqsRemovePermission,
 };
 
 fn vtSqsCreateQueue(ctx: *anyopaque, in: storage.CreateQueueInput) storage.Error!*const storage.SqsQueueSlot {
@@ -924,6 +926,12 @@ fn vtSqsListQueueTags(ctx: *anyopaque, allocator: Allocator, queue_name: []const
 }
 fn vtSqsListDeadLetterSourceQueues(ctx: *anyopaque, allocator: Allocator, in: storage.ListDeadLetterSourceQueuesInput) storage.Error!storage.ListDeadLetterSourceQueuesOutput {
     return sqsListDeadLetterSourceQueues(@ptrCast(@alignCast(ctx)), allocator, in);
+}
+fn vtSqsAddPermission(ctx: *anyopaque, in: storage.AddPermissionInput) storage.Error!void {
+    return sqsAddPermission(@ptrCast(@alignCast(ctx)), in);
+}
+fn vtSqsRemovePermission(ctx: *anyopaque, in: storage.RemovePermissionInput) storage.Error!void {
+    return sqsRemovePermission(@ptrCast(@alignCast(ctx)), in);
 }
 
 const dynamo_vtable: storage.DynamoBackend.VTable = .{
@@ -6539,6 +6547,184 @@ pub fn sqsListQueueTags(self: *Fs, allocator: Allocator, queue_name: []const u8)
         };
     }
     return .{ .tags = out };
+}
+
+/// AddPermission (v0.3.2). Constructs an IAM-style Statement and
+/// merges it into the queue's Policy attribute. If no policy exists,
+/// creates a fresh one with Version="2012-10-17".
+pub fn sqsAddPermission(self: *Fs, in: storage.AddPermissionInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(in.queue_name) orelse return storage.Error.QueueNotFound;
+
+    // Reject duplicate-label adds. AWS-exact behaviour.
+    if (slot.attrs.policy) |existing| {
+        if (statementExists(existing, in.label)) return storage.Error.InvalidParameterValue;
+    }
+
+    const new_policy = buildPolicyAdd(self.allocator, slot.attrs.policy, in) catch |err| switch (err) {
+        error.OutOfMemory => return storage.Error.OutOfMemory,
+        else => return storage.Error.InvalidParameterValue,
+    };
+    if (slot.attrs.policy) |old| self.allocator.free(old);
+    slot.attrs.policy = new_policy;
+    writeQueueAttrs(self, slot) catch return storage.Error.Io;
+}
+
+fn buildPolicyAdd(allocator: Allocator, existing_policy: ?[]const u8, in: storage.AddPermissionInput) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("Version");
+    try s.write("2012-10-17");
+    try s.objectField("Statement");
+    try s.beginArray();
+
+    // Re-emit pre-existing statements via the same Stringify so the
+    // comma separators get tracked correctly. We re-derive each
+    // statement's shape from the parsed Value rather than calling
+    // Stringify.value (which doesn't share state with s).
+    if (existing_policy) |existing| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, existing, .{});
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("Statement")) |stmt_v| {
+                if (stmt_v == .array) {
+                    for (stmt_v.array.items) |st| {
+                        try s.write(st);
+                    }
+                }
+            }
+        }
+    }
+
+    // Append the new statement.
+    try s.beginObject();
+    try s.objectField("Sid");
+    try s.write(in.label);
+    try s.objectField("Effect");
+    try s.write("Allow");
+    try s.objectField("Principal");
+    try s.beginObject();
+    try s.objectField("AWS");
+    try s.beginArray();
+    for (in.aws_account_ids) |acct| {
+        var buf: [128]u8 = undefined;
+        const arn = try std.fmt.bufPrint(&buf, "arn:aws:iam::{s}:root", .{acct});
+        try s.write(arn);
+    }
+    try s.endArray();
+    try s.endObject();
+    try s.objectField("Action");
+    try s.beginArray();
+    for (in.actions) |action| try s.write(action);
+    try s.endArray();
+    try s.objectField("Resource");
+    try s.write(in.queue_arn);
+    try s.endObject();
+
+    try s.endArray();
+    try s.endObject();
+
+    return aw.toOwnedSlice();
+}
+
+/// RemovePermission: parse the existing Policy, drop the statement with
+/// the matching Sid. If no statements remain, clear the Policy.
+pub fn sqsRemovePermission(self: *Fs, in: storage.RemovePermissionInput) storage.Error!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    const slot = self.sqs_queues.get(in.queue_name) orelse return storage.Error.QueueNotFound;
+    const existing = slot.attrs.policy orelse return storage.Error.InvalidParameterValue;
+
+    const result = buildPolicyRemove(self.allocator, existing, in.label) catch |err| switch (err) {
+        error.OutOfMemory => return storage.Error.OutOfMemory,
+        error.LabelNotFound, error.MalformedExistingPolicy => return storage.Error.InvalidParameterValue,
+        else => return storage.Error.Io,
+    };
+
+    self.allocator.free(slot.attrs.policy.?);
+    if (result.kept == 0) {
+        if (result.body) |b| self.allocator.free(b);
+        slot.attrs.policy = null;
+    } else {
+        slot.attrs.policy = result.body.?;
+    }
+    writeQueueAttrs(self, slot) catch return storage.Error.Io;
+}
+
+const RemoveResult = struct { body: ?[]u8, kept: usize };
+
+fn buildPolicyRemove(allocator: Allocator, existing: []const u8, label: []const u8) !RemoveResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, existing, .{}) catch
+        return error.MalformedExistingPolicy;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.MalformedExistingPolicy;
+    const root = parsed.value.object;
+    const stmt_v = root.get("Statement") orelse return error.MalformedExistingPolicy;
+    if (stmt_v != .array) return error.MalformedExistingPolicy;
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    try s.objectField("Version");
+    if (root.get("Version")) |v| {
+        if (v == .string) try s.write(v.string) else try s.write("2012-10-17");
+    } else try s.write("2012-10-17");
+    try s.objectField("Statement");
+    try s.beginArray();
+    var kept: usize = 0;
+    var dropped: bool = false;
+    for (stmt_v.array.items) |st| {
+        if (st == .object) {
+            if (st.object.get("Sid")) |sid_v| {
+                if (sid_v == .string and std.mem.eql(u8, sid_v.string, label)) {
+                    dropped = true;
+                    continue;
+                }
+            }
+        }
+        try s.write(st);
+        kept += 1;
+    }
+    try s.endArray();
+    try s.endObject();
+
+    if (!dropped) return error.LabelNotFound;
+
+    if (kept == 0) {
+        return .{ .body = null, .kept = 0 };
+    }
+    return .{ .body = try aw.toOwnedSlice(), .kept = kept };
+}
+
+/// Quick string-scan check: does the given policy JSON have a
+/// statement with Sid="<label>"? Used to reject duplicate AddPermission.
+fn statementExists(policy_json: []const u8, label: []const u8) bool {
+    var sid_key_buf: [128]u8 = undefined;
+    // Look for `"Sid":"<label>"` or `"Sid": "<label>"` (with optional whitespace).
+    const needle = std.fmt.bufPrint(&sid_key_buf, "\"Sid\"", .{}) catch return false;
+    var cur: usize = 0;
+    while (std.mem.indexOfPos(u8, policy_json, cur, needle)) |idx| {
+        var p = idx + needle.len;
+        while (p < policy_json.len and (policy_json[p] == ':' or policy_json[p] == ' ')) : (p += 1) {}
+        if (p >= policy_json.len or policy_json[p] != '"') {
+            cur = idx + needle.len;
+            continue;
+        }
+        p += 1;
+        const start = p;
+        while (p < policy_json.len and policy_json[p] != '"') : (p += 1) {}
+        if (p > policy_json.len) return false;
+        if (std.mem.eql(u8, policy_json[start..p], label)) return true;
+        cur = p;
+    }
+    return false;
 }
 
 /// Reverse-walk: find every queue whose `RedrivePolicy.deadLetterTargetArn`
