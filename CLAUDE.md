@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**nanostack** is a snappy, accurate AWS emulator for local development, written in Zig. Single static binary (~0.8 MB stripped), sub-second cold start, ~11 MB idle RSS. Currently `v0.2.1` — multi-service: S3 (68/107 Smithy ops, real bucket-policy / ACL / PAB enforcement) + DynamoDB (18 ops including UpdateItem with full UpdateExpression, queryable GSI/LSI, batch, atomic transactions, restart-persistent items, 573-word reserved-word enforcement). Both services verified against Python + JS + AWS CLI v2 conformance suites. Opt-in via `--services s3,dynamodb`. Pre-`v1.0.0`; minor breaking changes are expected.
+**nanostack** is a snappy, accurate AWS emulator for local development, written in Zig. Single static binary (~0.8 MB stripped), sub-second cold start, ~11 MB idle RSS. Currently `v0.4.1` — four services on the same port: **S3** (68/107 Smithy ops, real bucket-policy / ACL / PAB enforcement), **DynamoDB** (18 ops, full UpdateExpression, queryable GSI/LSI, batch + atomic transactions, 573-word reserved-word enforcement), **SQS** (23 ops including FIFO + Queue Policy enforcement), **SNS** (19 ops including AddPermission/RemovePermission + FilterPolicy evaluation). Cross-service wiring: S3 → SQS event notifications, S3 → SNS → SQS multi-hop fan-out. All services verified against Python + JS + AWS CLI v2 conformance suites. Opt-in via `--services s3,dynamodb,sqs,sns`. Pre-`v1.0.0`; minor breaking changes are expected.
 
 The wedge is **accuracy beats LocalStack on the surface we cover**. See `docs/PRD.md` for the full product spec, `docs/SUPPORT.md` for the live op matrix + accuracy-wins-vs-LocalStack section + drift tracking table.
 

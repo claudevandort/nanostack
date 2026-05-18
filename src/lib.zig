@@ -97,6 +97,7 @@ pub const sns_params = @import("wire/sns/params.zig");
 pub const sns_errors = @import("wire/sns/errors.zig");
 pub const sns_xml_response = @import("wire/sns/xml_response.zig");
 pub const sns_state = @import("storage/sns_state.zig");
+pub const sns_filter = @import("services/sns/filter.zig");
 pub const versioning_service = @import("services/s3/versioning.zig");
 pub const tagging_service = @import("services/s3/tagging.zig");
 pub const acl_service = @import("services/s3/acl.zig");
@@ -216,6 +217,7 @@ test {
     _ = sns_errors;
     _ = sns_xml_response;
     _ = sns_state;
+    _ = sns_filter;
     _ = versioning_service;
     _ = tagging_service;
     _ = acl_service;

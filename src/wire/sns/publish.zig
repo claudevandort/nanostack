@@ -94,18 +94,21 @@ pub fn parsePublishBatch(allocator: Allocator, params: []const params_mod.Param)
         var id_buf: [128]u8 = undefined;
         var msg_buf: [128]u8 = undefined;
         var subj_buf: [128]u8 = undefined;
+        var attrs_prefix_buf: [128]u8 = undefined;
         const id_key = std.fmt.bufPrint(&id_buf, "PublishBatchRequestEntries.member.{d}.Id", .{n}) catch continue;
         const msg_key = std.fmt.bufPrint(&msg_buf, "PublishBatchRequestEntries.member.{d}.Message", .{n}) catch continue;
         const subj_key = std.fmt.bufPrint(&subj_buf, "PublishBatchRequestEntries.member.{d}.Subject", .{n}) catch continue;
+        const attrs_prefix = std.fmt.bufPrint(&attrs_prefix_buf, "PublishBatchRequestEntries.member.{d}.MessageAttributes.entry.", .{n}) catch continue;
         const id = params_mod.get(params, id_key) orelse continue;
         const msg = params_mod.get(params, msg_key) orelse continue;
         var subj: ?[]const u8 = null;
         if (params_mod.get(params, subj_key)) |sj| subj = try allocator.dupe(u8, sj);
+        const attrs_json = serializeMessageAttributes(allocator, params, attrs_prefix) catch null;
         entries[i] = .{
             .id = try allocator.dupe(u8, id),
             .message = try allocator.dupe(u8, msg),
             .subject = subj,
-            .message_attributes_json = null, // not yet wired for batch
+            .message_attributes_json = attrs_json,
         };
     }
     return .{ .topic_name = topic, .entries = entries };

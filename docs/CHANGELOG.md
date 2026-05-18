@@ -16,6 +16,47 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-05-18
+
+**Patch release: SNS robustness.**
+
+Per the [versioning scheme](#versioning-scheme), patch releases mark "a significant pinned cut of work" inside one service. v0.4.1 closes the four documented divergences flagged in v0.4.0's SUPPORT.md:
+
+1. **Tags now persist across restart.** `TagResource` / `UntagResource` write through to `<data-dir>/profiles/<profile>/sns/topics/<name>/tags.json` atomically; `loadSingleTopic` rehydrates them on cold start. Mirrors the SQS v0.3.0 pattern.
+
+2. **`AddPermission` / `RemovePermission` implemented.** The IAM-style "syntactic sugar over Policy mutation" surface now matches SQS: `AddPermission` builds an Allow Statement, merges into the topic Policy, and `RemovePermission` drops the matching Sid (clearing the Policy entirely when the last statement is removed). Duplicate Label → InvalidParameterValue. The resulting Policy is still **accept-store-roundtrip** (not evaluated at request time) — enforcement deferred to v0.4.2, mirroring the v0.3.2 → v0.3.3 SQS trajectory.
+
+3. **`PublishBatch` carries per-entry MessageAttributes.** Each entry's `PublishBatchRequestEntries.member.{n}.MessageAttributes.entry.*` parameters are now serialized into the entry's `message_attributes_json` field so SQS subscribers see the correct attrs on their SNS envelope. Single-message `Publish` already did this; `PublishBatch` was hardcoding null.
+
+4. **`FilterPolicy` evaluated at publish time.** Subscriptions with a `FilterPolicy` attribute (set via `SetSubscriptionAttributes`) now gate which messages reach them. v0.4.1 evaluates the most common shape — top-level string-array matches like `{"category": ["news", "sports"]}` with AND across keys and OR within each rule. Operator objects (`prefix`, `anything-but`, `numeric`, `exists`, `cidr`, `suffix`) are treated as no-match and skip delivery — documented divergence; the operator set is a future v0.4.x patch.
+
+### Added
+
+- `src/wire/sns/permissions.zig` — query-string parsers for `AddPermission` / `RemovePermission`.
+- `src/services/sns/permissions.zig` — handlers; builds topic ARN from `region + account_id + topic_name`, applies the `sns:` prefix to action names.
+- `src/services/sns/filter.zig` — `evaluatePolicy(policy_json, message_attributes_json, allocator) bool`. Standalone, with 7 Zig unit tests covering no-attribute / no-match / multi-value match / AND / unsupported-operator / malformed-policy.
+- 2 new `SnsBackend` vtable entries (`addPermission`, `removePermission`) + `SnsAddPermissionInput` / `SnsRemovePermissionInput` types in `src/storage/mod.zig`.
+- `topicTagsPath` / `writeTopicTags` / `loadTopicTags` in `src/storage/fs.zig`.
+
+### Changed
+
+- `snsPublish` subscription loop now checks the per-sub `filter_policy` after the protocol filter.
+- `snsTagTopic` / `snsUntagTopic` call `writeTopicTags` after the in-memory mutation.
+- `parsePublishBatch` in `src/wire/sns/publish.zig` per-entry-serializes MessageAttributes (no more hardcoded null).
+- SUPPORT.md SNS section: removed the "Tags in-memory only" and "Filter policies not enforced" divergences; added the "Topic Policy not evaluated" divergence with a v0.4.2 promise; added `AddPermission` + `RemovePermission` rows to the op table.
+
+### Tests
+
+- Python: 542 → 558 (+16 in new `tests/conformance/python/sns/test_sns_robustness.py`: 3 tags-persistence, 5 AddPermission/RemovePermission, 2 PublishBatch attrs, 6 FilterPolicy).
+- JS: 115 → 118 (+3 in `tests/conformance/js/sns/robustness.test.ts`).
+- AWS CLI: 51 → 53 (+2 in `tests/conformance/awscli/sns/test_robustness.py`).
+
+### Deferred to follow-up patches
+
+- **v0.4.2**: Topic Policy enforcement (request-time authz). The ops + storage are already in place; this is the "wire the eval into the SNS handlers" half.
+- **v0.4.x**: FilterPolicy operator set (`prefix`, `anything-but`, `numeric`, `exists`, `cidr`, `suffix`).
+- **v0.4.3+**: FIFO topics.
+
 ## [0.4.0] — 2026-05-18
 
 **Minor release: SNS joins S3 + DynamoDB + SQS.**

@@ -15,6 +15,7 @@ const topics_handler = @import("topics.zig");
 const subs_handler = @import("subscriptions.zig");
 const publish_handler = @import("publish.zig");
 const tags_handler = @import("tags.zig");
+const perms_handler = @import("permissions.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -85,6 +86,10 @@ pub fn handle(ctx: Context) Result {
     if (std.mem.eql(u8, action, "TagResource")) return tags_handler.tagResource(ctx);
     if (std.mem.eql(u8, action, "UntagResource")) return tags_handler.untagResource(ctx);
     if (std.mem.eql(u8, action, "ListTagsForResource")) return tags_handler.listTagsForResource(ctx);
+
+    // Permissions (v0.4.1 Phase B).
+    if (std.mem.eql(u8, action, "AddPermission")) return perms_handler.addPermission(ctx);
+    if (std.mem.eql(u8, action, "RemovePermission")) return perms_handler.removePermission(ctx);
 
     return .{ .err = .{
         .code = .invalid_action,
