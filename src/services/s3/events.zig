@@ -87,8 +87,8 @@ const InternalDispatch = struct {
 };
 
 fn dispatchInternal(ctx: mod.Context, bucket: []const u8, d: InternalDispatch) void {
-    // Short-circuit when SQS isn't enabled — common case for S3-only deployments.
-    const sqs = ctx.sqs_backend orelse return;
+    // Short-circuit when neither SQS nor SNS is enabled.
+    if (ctx.sqs_backend == null and ctx.sns_backend == null) return;
 
     // Fetch the notification config (per-request arena allocation —
     // freed when the request ends).
@@ -96,26 +96,9 @@ fn dispatchInternal(ctx: mod.Context, bucket: []const u8, d: InternalDispatch) v
     if (cfg.entries.len == 0) return;
 
     for (cfg.entries) |entry| {
-        // SNS / Lambda targets aren't supported yet — accept-store-roundtrip only.
-        if (entry.target != .queue) continue;
-
-        // Event match: walk entry.events, look for an exact or wildcard match.
+        // Event + filter match (shared by all targets).
         if (!eventListMatches(entry.events, d.event_name)) continue;
-
-        // Filter match: prefix + suffix rules AND together.
         if (!filterMatches(entry.filter, d.key)) continue;
-
-        const queue_name = extractQueueName(entry.arn) orelse {
-            std.log.warn("s3 events: skipping malformed queue ARN {s}", .{entry.arn});
-            continue;
-        };
-
-        // Confirm the queue actually exists; AWS would drop on a stale
-        // ARN with no log, but we surface a warning for local-dev.
-        _ = sqs.getQueueUrl(queue_name) catch {
-            std.log.warn("s3 events: target queue {s} does not exist, dropping {s} event", .{ queue_name, d.event_name });
-            continue;
-        };
 
         const body = buildEnvelope(ctx.allocator, .{
             .region = ctx.region,
@@ -132,17 +115,63 @@ fn dispatchInternal(ctx: mod.Context, bucket: []const u8, d: InternalDispatch) v
             continue;
         };
 
-        const send_out = sqs.sendMessage(ctx.allocator, .{
-            .queue_name = queue_name,
-            .body = body,
-        }) catch |err| {
-            std.log.warn("s3 events: SendMessage to {s} failed: {s}", .{ queue_name, @errorName(err) });
-            continue;
-        };
-        // Send succeeded; the message id is owned by the per-request arena.
-        _ = send_out;
+        switch (entry.target) {
+            .queue => dispatchToQueue(ctx, entry.arn, body, d.event_name),
+            .topic => dispatchToTopic(ctx, entry.arn, body, d.event_name),
+            .lambda => {}, // Lambda not supported yet.
+        }
     }
 }
+
+fn dispatchToQueue(ctx: mod.Context, arn: []const u8, body: []const u8, event_name: []const u8) void {
+    const sqs = ctx.sqs_backend orelse return;
+    const queue_name = extractQueueName(arn) orelse {
+        std.log.warn("s3 events: skipping malformed queue ARN {s}", .{arn});
+        return;
+    };
+    _ = sqs.getQueueUrl(queue_name) catch {
+        std.log.warn("s3 events: target queue {s} does not exist, dropping {s} event", .{ queue_name, event_name });
+        return;
+    };
+    const send_out = sqs.sendMessage(ctx.allocator, .{
+        .queue_name = queue_name,
+        .body = body,
+    }) catch |err| {
+        std.log.warn("s3 events: SendMessage to {s} failed: {s}", .{ queue_name, @errorName(err) });
+        return;
+    };
+    _ = send_out;
+}
+
+fn dispatchToTopic(ctx: mod.Context, arn: []const u8, body: []const u8, event_name: []const u8) void {
+    const sns = ctx.sns_backend orelse return;
+    const topic_name = extractTopicName(arn) orelse {
+        std.log.warn("s3 events: skipping malformed topic ARN {s}", .{arn});
+        return;
+    };
+    _ = sns.getTopicAttributes(topic_name) catch {
+        std.log.warn("s3 events: target topic {s} does not exist, dropping {s} event", .{ topic_name, event_name });
+        return;
+    };
+    const out = sns.publish(ctx.allocator, .{
+        .topic_name = topic_name,
+        .message = body,
+    }) catch |err| {
+        std.log.warn("s3 events: Publish to {s} failed: {s}", .{ topic_name, @errorName(err) });
+        return;
+    };
+    _ = out;
+}
+
+/// Extract the topic name from an SNS ARN. Returns null if not a
+/// well-formed `arn:aws:sns:...` value.
+pub fn extractTopicName(arn: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, arn, "arn:aws:sns:")) return null;
+    const last_colon = std.mem.lastIndexOfScalar(u8, arn, ':') orelse return null;
+    if (last_colon + 1 >= arn.len) return null;
+    return arn[last_colon + 1 ..];
+}
+
 
 /// Match an event name against the list of configured event filters.
 /// Supports exact match + wildcard suffixes:

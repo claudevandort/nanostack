@@ -59,6 +59,12 @@ pub const Error = error{
     // SQS FIFO (v0.3.1).
     InvalidParameterValue,
     MissingParameter,
+    // SNS (v0.4.0).
+    TopicNotFound,
+    TopicAlreadyExists,
+    InvalidTopicName,
+    InvalidProtocol,
+    SubscriptionNotFound,
     Io,
     OutOfMemory,
 };
@@ -2101,6 +2107,229 @@ pub const SqsBackend = struct {
     }
     pub fn listMessageMoveTasks(self: SqsBackend, allocator: Allocator, in: ListMessageMoveTasksInput) Error!ListMessageMoveTasksOutput {
         return self.vtable.listMessageMoveTasks(self.ctx, allocator, in);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// SNS (v0.4.0)
+
+pub const sns_state = @import("sns_state.zig");
+pub const SnsTopicSlot = sns_state.SnsTopicSlot;
+pub const Subscription = sns_state.Subscription;
+pub const TopicAttributes = sns_state.TopicAttributes;
+pub const SnsProtocol = sns_state.Protocol;
+
+pub const CreateTopicInput = struct {
+    name: []const u8,
+    attrs: TopicAttributes = .{},
+    tags: []const Tag = &.{},
+};
+
+pub const ListTopicsInput = struct {
+    next_token: ?[]const u8 = null,
+};
+
+pub const ListTopicsOutput = struct {
+    /// Each entry is a topic ARN. Caller-owned.
+    topic_arns: []const []const u8,
+    next_token: ?[]const u8 = null,
+};
+
+pub const SetTopicAttributesInput = struct {
+    topic_name: []const u8,
+    attribute_name: []const u8,
+    attribute_value: []const u8,
+};
+
+pub const SubscribeInput = struct {
+    topic_name: []const u8,
+    protocol: SnsProtocol,
+    endpoint: []const u8,
+    /// Subscription attributes (RawMessageDelivery / FilterPolicy /
+    /// DeliveryPolicy). Optional at subscribe time.
+    raw_message_delivery: bool = false,
+    filter_policy: ?[]const u8 = null,
+    delivery_policy: ?[]const u8 = null,
+};
+
+pub const SubscribeOutput = struct {
+    /// Owned by caller. Format: `<topic-arn>:<sub_id>`.
+    subscription_arn: []const u8,
+};
+
+pub const UnsubscribeInput = struct {
+    subscription_arn: []const u8,
+};
+
+pub const ListSubscriptionsInput = struct {
+    next_token: ?[]const u8 = null,
+};
+
+pub const ListSubscriptionsByTopicInput = struct {
+    topic_name: []const u8,
+    next_token: ?[]const u8 = null,
+};
+
+pub const SubscriptionInfo = struct {
+    subscription_arn: []const u8,
+    topic_arn: []const u8,
+    protocol: []const u8,
+    endpoint: []const u8,
+    owner: []const u8,
+};
+
+pub const ListSubscriptionsOutput = struct {
+    subscriptions: []const SubscriptionInfo,
+    next_token: ?[]const u8 = null,
+};
+
+pub const SetSubscriptionAttributesInput = struct {
+    subscription_arn: []const u8,
+    attribute_name: []const u8,
+    attribute_value: []const u8,
+};
+
+pub const ConfirmSubscriptionInput = struct {
+    topic_name: []const u8,
+    /// Confirmation token. Accepted as opaque (auto-confirmed in nanostack).
+    token: []const u8,
+};
+
+pub const PublishInput = struct {
+    topic_name: []const u8,
+    message: []const u8,
+    subject: ?[]const u8 = null,
+    /// MessageAttributes raw JSON (rendered as the envelope's
+    /// `MessageAttributes` field). Optional.
+    message_attributes_json: ?[]const u8 = null,
+};
+
+pub const PublishOutput = struct {
+    /// AWS-style UUID. Caller-owned.
+    message_id: []const u8,
+};
+
+pub const PublishBatchEntry = struct {
+    id: []const u8,
+    message: []const u8,
+    subject: ?[]const u8 = null,
+    message_attributes_json: ?[]const u8 = null,
+};
+
+pub const PublishBatchInput = struct {
+    topic_name: []const u8,
+    entries: []const PublishBatchEntry,
+};
+
+pub const PublishBatchSuccess = struct {
+    id: []const u8,
+    message_id: []const u8,
+};
+
+pub const PublishBatchFailure = struct {
+    id: []const u8,
+    code: []const u8,
+    message: []const u8,
+    sender_fault: bool,
+};
+
+pub const PublishBatchOutput = struct {
+    successful: []const PublishBatchSuccess,
+    failed: []const PublishBatchFailure,
+};
+
+pub const TagTopicInput = struct {
+    topic_name: []const u8,
+    tags: []const Tag,
+};
+
+pub const UntagTopicInput = struct {
+    topic_name: []const u8,
+    keys: []const []const u8,
+};
+
+pub const ListTopicTagsOutput = struct {
+    tags: []const Tag,
+};
+
+pub const SnsBackend = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        // Topics.
+        createTopic: *const fn (ctx: *anyopaque, in: CreateTopicInput) Error!*const SnsTopicSlot,
+        deleteTopic: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
+        listTopics: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListTopicsInput) Error!ListTopicsOutput,
+        getTopicAttributes: *const fn (ctx: *anyopaque, name: []const u8) Error!*const SnsTopicSlot,
+        setTopicAttributes: *const fn (ctx: *anyopaque, in: SetTopicAttributesInput) Error!void,
+        // Subscriptions.
+        subscribe: *const fn (ctx: *anyopaque, allocator: Allocator, in: SubscribeInput) Error!SubscribeOutput,
+        unsubscribe: *const fn (ctx: *anyopaque, in: UnsubscribeInput) Error!void,
+        listSubscriptions: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListSubscriptionsInput) Error!ListSubscriptionsOutput,
+        listSubscriptionsByTopic: *const fn (ctx: *anyopaque, allocator: Allocator, in: ListSubscriptionsByTopicInput) Error!ListSubscriptionsOutput,
+        getSubscriptionAttributes: *const fn (ctx: *anyopaque, arn: []const u8) Error!*const Subscription,
+        setSubscriptionAttributes: *const fn (ctx: *anyopaque, in: SetSubscriptionAttributesInput) Error!void,
+        confirmSubscription: *const fn (ctx: *anyopaque, allocator: Allocator, in: ConfirmSubscriptionInput) Error!SubscribeOutput,
+        // Publish.
+        publish: *const fn (ctx: *anyopaque, allocator: Allocator, in: PublishInput) Error!PublishOutput,
+        publishBatch: *const fn (ctx: *anyopaque, allocator: Allocator, in: PublishBatchInput) Error!PublishBatchOutput,
+        // Tags.
+        tagTopic: *const fn (ctx: *anyopaque, in: TagTopicInput) Error!void,
+        untagTopic: *const fn (ctx: *anyopaque, in: UntagTopicInput) Error!void,
+        listTopicTags: *const fn (ctx: *anyopaque, allocator: Allocator, topic_name: []const u8) Error!ListTopicTagsOutput,
+    };
+
+    pub fn createTopic(self: SnsBackend, in: CreateTopicInput) Error!*const SnsTopicSlot {
+        return self.vtable.createTopic(self.ctx, in);
+    }
+    pub fn deleteTopic(self: SnsBackend, name: []const u8) Error!void {
+        return self.vtable.deleteTopic(self.ctx, name);
+    }
+    pub fn listTopics(self: SnsBackend, allocator: Allocator, in: ListTopicsInput) Error!ListTopicsOutput {
+        return self.vtable.listTopics(self.ctx, allocator, in);
+    }
+    pub fn getTopicAttributes(self: SnsBackend, name: []const u8) Error!*const SnsTopicSlot {
+        return self.vtable.getTopicAttributes(self.ctx, name);
+    }
+    pub fn setTopicAttributes(self: SnsBackend, in: SetTopicAttributesInput) Error!void {
+        return self.vtable.setTopicAttributes(self.ctx, in);
+    }
+    pub fn subscribe(self: SnsBackend, allocator: Allocator, in: SubscribeInput) Error!SubscribeOutput {
+        return self.vtable.subscribe(self.ctx, allocator, in);
+    }
+    pub fn unsubscribe(self: SnsBackend, in: UnsubscribeInput) Error!void {
+        return self.vtable.unsubscribe(self.ctx, in);
+    }
+    pub fn listSubscriptions(self: SnsBackend, allocator: Allocator, in: ListSubscriptionsInput) Error!ListSubscriptionsOutput {
+        return self.vtable.listSubscriptions(self.ctx, allocator, in);
+    }
+    pub fn listSubscriptionsByTopic(self: SnsBackend, allocator: Allocator, in: ListSubscriptionsByTopicInput) Error!ListSubscriptionsOutput {
+        return self.vtable.listSubscriptionsByTopic(self.ctx, allocator, in);
+    }
+    pub fn getSubscriptionAttributes(self: SnsBackend, arn: []const u8) Error!*const Subscription {
+        return self.vtable.getSubscriptionAttributes(self.ctx, arn);
+    }
+    pub fn setSubscriptionAttributes(self: SnsBackend, in: SetSubscriptionAttributesInput) Error!void {
+        return self.vtable.setSubscriptionAttributes(self.ctx, in);
+    }
+    pub fn confirmSubscription(self: SnsBackend, allocator: Allocator, in: ConfirmSubscriptionInput) Error!SubscribeOutput {
+        return self.vtable.confirmSubscription(self.ctx, allocator, in);
+    }
+    pub fn publish(self: SnsBackend, allocator: Allocator, in: PublishInput) Error!PublishOutput {
+        return self.vtable.publish(self.ctx, allocator, in);
+    }
+    pub fn publishBatch(self: SnsBackend, allocator: Allocator, in: PublishBatchInput) Error!PublishBatchOutput {
+        return self.vtable.publishBatch(self.ctx, allocator, in);
+    }
+    pub fn tagTopic(self: SnsBackend, in: TagTopicInput) Error!void {
+        return self.vtable.tagTopic(self.ctx, in);
+    }
+    pub fn untagTopic(self: SnsBackend, in: UntagTopicInput) Error!void {
+        return self.vtable.untagTopic(self.ctx, in);
+    }
+    pub fn listTopicTags(self: SnsBackend, allocator: Allocator, topic_name: []const u8) Error!ListTopicTagsOutput {
+        return self.vtable.listTopicTags(self.ctx, allocator, topic_name);
     }
 };
 

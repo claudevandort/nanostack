@@ -404,14 +404,55 @@ These will only be added if a real user hits a setup-script gap; not on any road
 - Select, inventory, analytics.
 - Server-side encryption (SSE-S3, SSE-KMS, SSE-C). Headers accepted, not enforced.
 
+## SNS
+
+SNS is the fourth AWS service nanostack covers, opt-in via `--services sns` (or include it in a multi-service list like `--services s3,sqs,sns`). v0.4.0 ships **17 ops** — full topic CRUD, subscriptions, publish + fan-out to SQS subscribers, tags. Standard topics only; FIFO topics are deferred. Subscription protocols: `sqs` fires fan-out; `lambda` / `http` / `https` / `email` / `email-json` / `sms` are accept-store-roundtrip (subscriptions persist but never deliver — Lambda lands in v0.5.0, the rest are out of scope).
+
+**Wire protocol divergence**: unlike DDB / modern SQS, SNS uses the AWS query protocol — `application/x-www-form-urlencoded` request bodies + XML responses + an `Action=<Op>` body parameter (not `X-Amz-Target` header). nanostack detects SNS requests by sniffing `Action=` in the body before falling through to S3.
+
+| Operation | Status | Milestone |
+|---|---|---|
+| CreateTopic | supported (DisplayName / Policy / DeliveryPolicy / KmsMasterKeyId attrs; duplicate-name idempotent; .fifo suffix rejected) | v0.4.0 |
+| DeleteTopic | supported (immediate; idempotent) | v0.4.0 |
+| ListTopics | supported (lex-sorted ARNs) | v0.4.0 |
+| GetTopicAttributes | supported (TopicArn / Owner / DisplayName / Policy / DeliveryPolicy / KmsMasterKeyId / SubscriptionsConfirmed/Pending/Deleted) | v0.4.0 |
+| SetTopicAttributes | supported (mutates DisplayName / Policy / DeliveryPolicy / KmsMasterKeyId; unknown attribute names silently accepted) | v0.4.0 |
+| Subscribe | supported (sqs protocol auto-confirms; others accept-store-roundtrip) | v0.4.0 |
+| Unsubscribe | supported (idempotent) | v0.4.0 |
+| ListSubscriptions | supported (across all topics) | v0.4.0 |
+| ListSubscriptionsByTopic | supported | v0.4.0 |
+| GetSubscriptionAttributes | supported (SubscriptionArn / TopicArn / Protocol / Endpoint / Owner / ConfirmationWasAuthenticated / RawMessageDelivery / FilterPolicy? / DeliveryPolicy?) | v0.4.0 |
+| SetSubscriptionAttributes | supported (RawMessageDelivery enforced; FilterPolicy + DeliveryPolicy stored but **not evaluated**) | v0.4.0 |
+| ConfirmSubscription | supported (accepts arbitrary token; auto-confirms the first unconfirmed sub on the topic) | v0.4.0 |
+| Publish | supported (delivers SNS envelope JSON to SQS subscribers; raw bytes when RawMessageDelivery=true; MessageAttributes round-trip into envelope) | v0.4.0 |
+| PublishBatch | supported (per-entry Successful / Failed split) | v0.4.0 |
+| TagResource | supported (in-memory tags; max 50 tags) | v0.4.0 |
+| UntagResource | supported | v0.4.0 |
+| ListTagsForResource | supported | v0.4.0 |
+
+Documented divergences (intentional):
+- **Query wire protocol only.** No JSON migration to track; modern AWS SDKs (boto3, aws-sdk-js v3, AWS CLI v2) all use query.
+- **FIFO topics deferred.** `.fifo` suffix rejected. Future v0.4.x patch.
+- **Filter policies not enforced.** `FilterPolicy` subscription attribute round-trips through Set/GetSubscriptionAttributes but doesn't gate which messages reach the subscriber. Documented divergence; same complexity profile as S3 bucket-policy Conditions.
+- **Only `sqs` protocol fires.** `lambda` / `http` / `https` / `email` / `email-json` / `sms` subscriptions are stored but never deliver.
+- **`ConfirmSubscription` auto-confirms** SQS subs at Subscribe time; for non-SQS protocols, the confirmation is a no-op that flips the persisted bit (since those subs never fire anyway).
+- **Signature fields are stubs.** `Signature` is the literal `"nanostack-stub"`; `SigningCertURL` is `https://nanostack.local/cert.pem`. nanostack doesn't do KMS-style signing. Matches LocalStack.
+- **MessageAttributes only on envelope path.** When `RawMessageDelivery=true`, MessageAttributes are not propagated to the SQS message's MessageAttributes field. AWS does this; we don't (yet).
+- **Cross-account principals out of scope.** Same SigV4 limitation as the rest of nanostack — only the configured `--access-key` validates.
+- **Tags are in-memory only.** Not persisted across restart. Same trade-off as the dedup window before v0.3.2.
+
 ## Cross-service wiring
 
-The first cross-service flow landed in v0.3.4: **S3 → SQS event notifications**. Configured via `PutBucketNotificationConfiguration` with a `QueueConfiguration` entry. Events fire fire-and-forget when `--services` includes both `s3` and `sqs`.
+Two cross-service flows landed:
+- **v0.3.4**: S3 → SQS event notifications via `QueueConfiguration` entries.
+- **v0.4.0**: S3 → SNS event notifications via `TopicConfiguration` entries, plus SNS → SQS fan-out via the new SNS Subscribe + Publish surface. The two compose: **S3 → SNS → SQS multi-hop works end-to-end.**
 
 | Flow | Status | Notes |
 |---|---|---|
 | S3 → SQS event notifications | supported (v0.3.4) | PutObject / CopyObject / CompleteMultipartUpload → `s3:ObjectCreated:*`; DeleteObject / DeleteObjects → `s3:ObjectRemoved:Delete` or `:DeleteMarkerCreated`. Filter rules (prefix + suffix). Wildcard event matchers (`s3:ObjectCreated:*`, `s3:*`). |
-| S3 → SNS notifications | not supported | TopicConfiguration is parsed + stored, never fires. SNS service not implemented (planned v0.4.0). |
+| S3 → SNS notifications | supported (v0.4.0) | TopicConfiguration entries now fire to SNS topics. The Message field of the SNS publish carries the S3 event envelope verbatim. |
+| SNS → SQS fan-out | supported (v0.4.0) | One Publish → every SQS subscriber receives the SNS envelope (or raw Message bytes with RawMessageDelivery=true). |
+| S3 → SNS → SQS multi-hop | supported (v0.4.0) | Combines the above. The SQS subscriber sees an SNS envelope whose `Message` field is the S3 event envelope. |
 | S3 → Lambda notifications | not supported | CloudFunctionConfiguration is parsed + stored, never fires. Lambda service not implemented (planned v0.5.0). |
 | DynamoDB Streams → SQS | not supported | DDB Streams emit to their own `GetRecords` API (v0.2.2). Cross-service piping deferred. |
 

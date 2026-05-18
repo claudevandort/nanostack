@@ -48,7 +48,13 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
 
-    try server.run(arena, &config, init, fs.backend(), dynamo_backend, sqs_backend);
+    // SNS backend (v0.4.0): opt-in via --services sns.
+    const sns_backend: ?storage.SnsBackend = if (config.hasService("sns"))
+        fs.snsBackend()
+    else
+        null;
+
+    try server.run(arena, &config, init, fs.backend(), dynamo_backend, sqs_backend, sns_backend);
 }
 
 fn resolveDataDir(

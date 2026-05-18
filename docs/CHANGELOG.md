@@ -16,6 +16,62 @@ We are very far from `1.0.0`. Anything below it should be treated as "useful but
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-18
+
+**Minor release: SNS joins S3 + DynamoDB + SQS.**
+
+Per the [versioning scheme](#versioning-scheme), minor releases mark "one AWS service fully implemented against the real-AWS surface." nanostack now covers **four services on the same port**: S3 (since v0.1.x), DynamoDB (since v0.2.x), SQS (since v0.3.x), and SNS.
+
+Beyond just "fourth service," v0.4.0 unlocks two new flows:
+- **SNS → SQS fan-out** — one Publish reaches every SQS subscriber on the topic.
+- **S3 → SNS → SQS multi-hop** — `PutBucketNotificationConfiguration` with a TopicConfiguration now fires through SNS to every downstream SQS sub. The canonical "fan-out a file-upload event" workflow works end-to-end.
+
+Opt-in via `--services sns` (or `--services s3,sqs,sns` for the multi-hop). Default is still S3-only.
+
+### Added — SNS v1 surface (17 ops)
+
+**Topics (Phase B, 5 ops):** CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttributes. DisplayName / Policy / DeliveryPolicy / KmsMasterKeyId attributes round-trip. Duplicate-name creates are idempotent.
+
+**Subscriptions (Phase C, 7 ops):** Subscribe, Unsubscribe, ListSubscriptions, ListSubscriptionsByTopic, GetSubscriptionAttributes, SetSubscriptionAttributes, ConfirmSubscription. `sqs` subscriptions auto-confirm; lambda/http/email/sms are accept-store-roundtrip.
+
+**Publish (Phase D, 2 ops):** Publish, PublishBatch. Walks the topic's subscriptions, delivers the AWS-format SNS envelope JSON (Type=Notification + MessageId + TopicArn + Subject? + Message + Timestamp + SignatureVersion=1 + Signature stub + SigningCertURL + MessageAttributes?). `RawMessageDelivery=true` subscriptions get the raw `Message` bytes (no envelope wrapper).
+
+**Tags (Phase E, 3 ops):** TagResource, UntagResource, ListTagsForResource.
+
+### Added — cross-service wiring
+
+- **S3 → SNS dispatch** (`src/services/s3/events.zig`): TopicConfiguration entries on `PutBucketNotificationConfiguration` now fire to SNS topics. The published Message body is the S3 event envelope verbatim.
+- **SNS → SQS dispatch** (`src/storage/fs.zig::snsPublish`): walks the topic's subscriptions, calls `sqsSendMessage` for each `protocol=sqs` sub.
+- **Multi-hop S3 → SNS → SQS** works by composition. Test coverage in `tests/conformance/python/sns/test_tags_and_s3.py::test_s3_to_sns_to_sqs_multi_hop`.
+
+### Added — wire infrastructure
+
+The first AWS query-protocol service in nanostack:
+- **`src/wire/sns/params.zig`** — `application/x-www-form-urlencoded` decoder with `+` → space, `%XX` → byte, and `Member.N` indexed list iteration.
+- **`src/wire/sns/xml_response.zig`** — `<{Action}Response>` envelope per the AWS spec.
+- **`src/wire/sns/errors.zig`** — XML `<ErrorResponse>` with Type=Sender/Receiver + Code + Message + RequestId.
+
+`src/server.zig` detects SNS requests by sniffing the `Action=` parameter from the body (path=`/` + method=POST), routes to a new `handleSns` shim that mirrors `handleSqs`.
+
+### Tests
+
+- Python: 514 → 542 (+28 across topics/subscriptions/publish/tags+s3).
+- JS: 109 → 115 (+6 — topics + publish + fan-out).
+- AWS CLI: 47 → 51 (+4 — create+list+subscribe+publish+tag).
+
+### Documented divergences (new in v0.4.0)
+
+- **FIFO topics deferred** — `.fifo` suffix rejected.
+- **Filter policies not enforced** — `FilterPolicy` round-trips but doesn't gate delivery.
+- **Only `sqs` protocol fires** — lambda/http/email/sms accept-store-roundtrip only.
+- **Signature fields are stubs** — `Signature="nanostack-stub"`, `SigningCertURL="https://nanostack.local/cert.pem"`. Matches LocalStack.
+- **MessageAttributes only on envelope path** — `RawMessageDelivery=true` subs don't get MessageAttributes copied onto the SQS message.
+- **Tags are in-memory only** — not persisted across restart.
+
+### Strategic note
+
+After v0.4.0, the cross-service dispatch pattern is proven across **two flows** (S3→SQS, S3→SNS, plus SNS→SQS fan-out). v0.5.0 will reuse it again for Lambda triggers (S3→Lambda, SQS→Lambda, SNS→Lambda). v1.0.0's "multi-service workflow-ready" claim is increasingly demonstrable.
+
 ## [0.3.4] — 2026-05-18
 
 **Patch release: S3 → SQS event notifications. The strategic unlock.**

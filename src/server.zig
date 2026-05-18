@@ -19,6 +19,9 @@ const dynamodb = @import("services/dynamodb/mod.zig");
 const ddb_errors = @import("wire/dynamodb/errors.zig");
 const sqs = @import("services/sqs/mod.zig");
 const sqs_errors = @import("wire/sqs/errors.zig");
+const sns = @import("services/sns/mod.zig");
+const sns_errors = @import("wire/sns/errors.zig");
+const sns_params = @import("wire/sns/params.zig");
 
 pub const App = struct {
     config: *const cli.Config,
@@ -28,6 +31,8 @@ pub const App = struct {
     dynamo_backend: ?storage.DynamoBackend = null,
     /// SQS backend, present when `--services` includes `sqs`.
     sqs_backend: ?storage.SqsBackend = null,
+    /// SNS backend, present when `--services` includes `sns` (v0.4.0).
+    sns_backend: ?storage.SnsBackend = null,
 
     /// `handle` takeover circumvents httpz's pattern router so our service
     /// layer sees every request. AWS APIs are not a fit for path-pattern
@@ -90,6 +95,22 @@ pub const App = struct {
                 });
             }
             return handleDynamo(self, req, res, arena, request_id, host_id, target_header.?);
+        }
+
+        // SNS uses the AWS query protocol — no X-Amz-Target header,
+        // body starts with `Action=<Op>&...` form-urlencoded. Detect
+        // before falling through to S3.
+        if (target_header == null and req.method == .POST and std.mem.eql(u8, req.url.path, "/")) {
+            const body = req.body() orelse "";
+            if (sniffSnsAction(body) != null) {
+                if (!self.config.hasService("sns")) {
+                    return respondSnsError(res, request_id, host_id, .{
+                        .code = .invalid_parameter,
+                        .message = "SNS is not enabled. Restart nanostack with --services s3,sns (or similar).",
+                    });
+                }
+                return handleSns(self, req, res, arena, request_id, host_id);
+            }
         }
 
         // ---------- SigV4 verification (S3) ----------
@@ -163,6 +184,7 @@ pub const App = struct {
         const result = s3.handle(.{
             .backend = self.backend,
             .sqs_backend = self.sqs_backend,
+            .sns_backend = self.sns_backend,
             .allocator = arena,
             .owner_id = self.config.access_key,
             .owner_display_name = "nanostack",
@@ -434,6 +456,133 @@ fn respondSqsError(
     res.body = body;
 }
 
+/// Peek at a request body to detect an SNS `Action=<Op>` parameter.
+/// Returns the action string slice (borrows from `body`) or null.
+fn sniffSnsAction(body: []const u8) ?[]const u8 {
+    // Look at the first ~256 bytes — Action is conventionally the first
+    // param.
+    const window = body[0..@min(body.len, 256)];
+    var start: usize = 0;
+    while (start < window.len) {
+        const eq = std.mem.indexOfScalarPos(u8, window, start, '=') orelse return null;
+        const amp = std.mem.indexOfScalarPos(u8, window, eq + 1, '&') orelse window.len;
+        if (std.mem.eql(u8, window[start..eq], "Action")) {
+            return window[eq + 1 .. amp];
+        }
+        if (amp == window.len) return null;
+        start = amp + 1;
+    }
+    return null;
+}
+
+fn handleSns(
+    self: *App,
+    req: *httpz.Request,
+    res: *httpz.Response,
+    arena: Allocator,
+    request_id: []const u8,
+    host_id: []const u8,
+) void {
+    // SigV4 with service="sns". Capture Principal (used later by an
+    // SNS-side authz hook when AddPermission lands).
+    const principal: sigv4.Principal = if (self.config.no_auth)
+        sigv4.Principal.awsAccount(self.config.access_key)
+    else blk: {
+        const verify_headers = collectHeaders(arena, req) catch {
+            return respondSnsError(res, request_id, host_id, .{ .code = .internal_error });
+        };
+        const p = sigv4.verify(arena, .{
+            .method = if (req.method == .OTHER) req.method_string else @tagName(req.method),
+            .path = req.url.path,
+            .query = req.url.query,
+            .headers = verify_headers,
+            .body = req.body() orelse "",
+        }, .{
+            .access_key = self.config.access_key,
+            .secret_key = self.config.secret_key,
+        }, .{
+            .region = self.config.region,
+            .service = "sns",
+            .now_unix = fs_backend.nowUnixSeconds(self.io),
+            .skew_tolerance_seconds = self.config.skew_seconds,
+        }) catch {
+            return respondSnsError(res, request_id, host_id, .{ .code = .invalid_security });
+        };
+        break :blk p;
+    };
+
+    // Parse the body params once; service dispatch + handlers reuse.
+    const params = sns_params.parse(arena, req.body() orelse "") catch {
+        return respondSnsError(res, request_id, host_id, .{ .code = .invalid_parameter });
+    };
+
+    const action_opt = sns_params.get(params, "Action");
+    const action = action_opt orelse {
+        return respondSnsError(res, request_id, host_id, .{
+            .code = .invalid_action,
+            .message = "Missing Action parameter.",
+        });
+    };
+
+    const host_header = req.header("host") orelse "127.0.0.1";
+    var base_url_buf: [256]u8 = undefined;
+    const base_url = std.fmt.bufPrint(&base_url_buf, "http://{s}", .{host_header}) catch
+        return respondSnsError(res, request_id, host_id, .{ .code = .internal_error });
+
+    const result = sns.handle(.{
+        .backend = self.sns_backend orelse unreachable,
+        .allocator = arena,
+        .region = self.config.region,
+        .account_id = self.config.account_id,
+        .base_url = base_url,
+        .principal = principal,
+        .no_auth = self.config.no_auth,
+        .access_key = self.config.access_key,
+        .request = .{ .params = params, .action = action, .request_id = request_id },
+    });
+
+    switch (result) {
+        .ok => |out| respondSnsOk(res, request_id, host_id, out),
+        .err => |e| respondSnsError(res, request_id, host_id, e),
+    }
+}
+
+fn respondSnsOk(
+    res: *httpz.Response,
+    request_id: []const u8,
+    host_id: []const u8,
+    out: sns.Output,
+) void {
+    res.status = out.status;
+    res.header("x-amz-request-id", request_id);
+    res.header("x-amzn-RequestId", request_id);
+    res.header("x-amz-id-2", host_id);
+    for (out.extra_headers) |h| res.header(h.name, h.value);
+    res.header("Content-Type", "text/xml");
+    res.content_type = null;
+    res.body = out.body;
+}
+
+fn respondSnsError(
+    res: *httpz.Response,
+    request_id: []const u8,
+    host_id: []const u8,
+    e: sns.ErrorBody,
+) void {
+    const body = sns_errors.render(res.arena, e.code, e.message, request_id) catch {
+        res.status = 500;
+        res.body = "";
+        return;
+    };
+    res.status = e.code.httpStatus();
+    res.header("x-amz-request-id", request_id);
+    res.header("x-amzn-RequestId", request_id);
+    res.header("x-amz-id-2", host_id);
+    res.header("Content-Type", "text/xml");
+    res.content_type = null;
+    res.body = body;
+}
+
 fn mapVerifyError(e: sigv4.VerifyError) errors.Code {
     return switch (e) {
         sigv4.VerifyError.InvalidAccessKeyId => .invalid_access_key_id,
@@ -555,6 +704,7 @@ pub fn run(
     backend: storage.Backend,
     dynamo_backend: ?storage.DynamoBackend,
     sqs_backend: ?storage.SqsBackend,
+    sns_backend: ?storage.SnsBackend,
 ) !void {
     const address = try std.Io.net.IpAddress.parse(config.bind, config.port);
 
@@ -573,7 +723,7 @@ pub fn run(
         return;
     }
 
-    var app: App = .{ .config = config, .io = init.io, .backend = backend, .dynamo_backend = dynamo_backend, .sqs_backend = sqs_backend };
+    var app: App = .{ .config = config, .io = init.io, .backend = backend, .dynamo_backend = dynamo_backend, .sqs_backend = sqs_backend, .sns_backend = sns_backend };
     // Allow up to 64 MiB request bodies. AWS S3 caps single-PUT and
     // per-part uploads at 5 GiB, but httpz preallocates a per-worker pool
     // sized by `max_body_size` — anything close to AWS's ceiling OOMs the
