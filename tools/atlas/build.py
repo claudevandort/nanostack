@@ -162,11 +162,64 @@ def parse_divergences(lines: list[str]) -> list[dict]:
 # SUPPORT.md
 
 
+# AWS docs URL conventions per service. Op name appended verbatim.
+AWS_DOC_PATTERN: dict[str, str] = {
+    "S3": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_{op}.html",
+    "DynamoDB": "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_{op}.html",
+    "SQS": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_{op}.html",
+    "SNS": "https://docs.aws.amazon.com/sns/latest/api/API_{op}.html",
+}
+
+SERVICE_DIR_KEY: dict[str, str] = {
+    "S3": "s3",
+    "DynamoDB": "dynamodb",
+    "SQS": "sqs",
+    "SNS": "sns",
+}
+
+
+def code_paths_for(service_name: str) -> list[dict]:
+    """Conventional directories where a service's request flow lives.
+
+    Intentionally directories, not files — saves us from parsing
+    dispatch tables, which would drift on every refactor.
+    """
+    key = SERVICE_DIR_KEY.get(service_name)
+    if not key:
+        return []
+    return [
+        {"label": "Service handlers", "path": f"src/services/{key}/"},
+        {"label": "Wire layer (parsers + renderers)", "path": f"src/wire/{key}/"},
+        {"label": "Python conformance tests", "path": f"tests/conformance/python/{key}/"},
+        {"label": "JS conformance tests", "path": f"tests/conformance/js/{key}/"},
+        {"label": "AWS CLI conformance tests", "path": f"tests/conformance/awscli/{key}/"},
+    ]
+
+
+def aws_doc_url(service_name: str, op: str) -> str | None:
+    """Build the canonical AWS API reference URL for an op.
+
+    Heuristic: only emit a URL for ops whose name looks like a real
+    AWS API call (CamelCase, starts with a verb). Skip rows that
+    document features rather than operations, e.g. "ConditionExpression".
+    """
+    pat = AWS_DOC_PATTERN.get(service_name)
+    if not pat:
+        return None
+    if not op or not op[0].isupper():
+        return None
+    # Reject rows that are clearly features/grammar elements, not API ops.
+    if " " in op or "/" in op or "(" in op:
+        return None
+    return pat.format(op=op)
+
+
 @dataclass
 class ServiceData:
     name: str
     ops: list[dict] = field(default_factory=list)
     divergences: list[dict] = field(default_factory=list)
+    code_paths: list[dict] = field(default_factory=list)
 
 
 def parse_support(text: str) -> tuple[list[ServiceData], dict, list[dict]]:
@@ -195,7 +248,7 @@ def parse_support(text: str) -> tuple[list[ServiceData], dict, list[dict]]:
         body = section_lines(text, heading_re, stop_re)
         if not body:
             continue
-        sd = ServiceData(name=name)
+        sd = ServiceData(name=name, code_paths=code_paths_for(name))
         # Capture only the FIRST `Operation`-column table per service.
         # S3's section has several capability / config / tagging tables
         # too, but for the matrix we want the canonical op list — the
@@ -211,11 +264,13 @@ def parse_support(text: str) -> tuple[list[ServiceData], dict, list[dict]]:
                 for r in rows:
                     if len(r.cells) >= 3:
                         status_text = r.cells[1]
+                        op_name = r.cells[0]
                         sd.ops.append({
-                            "name": r.cells[0],
+                            "name": op_name,
                             "status_text": status_text,
                             "status": classify_status(status_text),
                             "milestone": r.cells[2],
+                            "aws_doc_url": aws_doc_url(name, op_name),
                         })
                 break  # one op table per service is enough for the matrix.
             # Not the op table; advance past it.

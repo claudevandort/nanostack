@@ -186,7 +186,11 @@ function renderMatrix() {
       m.className = "op-milestone";
       m.textContent = op.milestone;
       row.append(n, m);
-      row.addEventListener("click", () => showOpDetail(svc, op));
+      row.addEventListener("click", () => {
+        document.querySelectorAll(".op.selected").forEach((e) => e.classList.remove("selected"));
+        row.classList.add("selected");
+        showOpDetail(svc, op);
+      });
       list.append(row);
     });
     col.append(list);
@@ -224,6 +228,8 @@ function showServiceDetail(svc) {
 function showOpDetail(svc, op) {
   const c = document.getElementById("side-content");
   c.replaceChildren();
+
+  // Heading + status badge.
   const h = document.createElement("h3");
   h.textContent = `${svc.name}.${op.name}`;
   c.appendChild(h);
@@ -234,12 +240,12 @@ function showOpDetail(svc, op) {
   sw.style.background = `var(--st-${op.status})`;
   row.append(sw, document.createTextNode(STATUS_LABEL[op.status] || op.status));
   c.appendChild(row);
-  const h4 = document.createElement("h4");
-  h4.textContent = "Status (verbatim)";
-  c.appendChild(h4);
-  const p = document.createElement("p");
-  p.textContent = op.status_text;
-  c.appendChild(p);
+
+  // Verbatim status (strip leftover **bold** markers from SUPPORT.md prose).
+  const cleanedStatus = (op.status_text || "").replace(/\*\*(.+?)\*\*/g, "$1");
+  appendSection(c, "Status (verbatim)", cleanedStatus);
+
+  // Milestone.
   const m4 = document.createElement("h4");
   m4.textContent = "Milestone";
   c.appendChild(m4);
@@ -247,7 +253,103 @@ function showOpDetail(svc, op) {
   mp.className = "mono";
   mp.textContent = op.milestone;
   c.appendChild(mp);
+
+  // AWS docs link (if real-AWS API op).
+  if (op.aws_doc_url) {
+    const h4 = document.createElement("h4");
+    h4.textContent = "AWS API reference";
+    c.appendChild(h4);
+    const a = document.createElement("a");
+    a.href = op.aws_doc_url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.className = "mono";
+    a.textContent = op.aws_doc_url.replace(/^https?:\/\//, "");
+    c.appendChild(a);
+  }
+
+  // Code paths — where this op's request flow lives in the repo.
+  if (svc.code_paths?.length) {
+    const h4 = document.createElement("h4");
+    h4.textContent = "Where it lives";
+    c.appendChild(h4);
+    const ul = document.createElement("ul");
+    ul.className = "code-paths";
+    svc.code_paths.forEach((cp) => {
+      const li = document.createElement("li");
+      const lbl = document.createElement("div");
+      lbl.className = "code-path-label";
+      lbl.textContent = cp.label;
+      const pathRow = document.createElement("div");
+      pathRow.className = "code-path-row";
+      const code = document.createElement("code");
+      code.textContent = cp.path;
+      const btn = document.createElement("button");
+      btn.className = "copy-btn";
+      btn.textContent = "copy";
+      btn.title = "Copy path to clipboard";
+      btn.addEventListener("click", () => copyToClipboard(cp.path, btn));
+      pathRow.append(code, btn);
+      li.append(lbl, pathRow);
+      ul.append(li);
+    });
+    c.appendChild(ul);
+  }
+
+  // Related divergences — any divergence whose title or body mentions
+  // the op name (case-insensitive, word-bounded).
+  const related = findRelatedDivergences(svc, op);
+  if (related.length) {
+    const h4 = document.createElement("h4");
+    h4.textContent = "Related divergences";
+    c.appendChild(h4);
+    const ul = document.createElement("ul");
+    related.forEach((d) => {
+      const li = document.createElement("li");
+      const s = document.createElement("strong");
+      s.textContent = d.title + ". ";
+      li.appendChild(s);
+      li.append(document.createTextNode(d.body));
+      ul.appendChild(li);
+    });
+    c.appendChild(ul);
+  }
+
   openSidePanel();
+}
+
+function appendSection(parent, heading, body) {
+  const h4 = document.createElement("h4");
+  h4.textContent = heading;
+  parent.appendChild(h4);
+  const p = document.createElement("p");
+  p.textContent = body;
+  parent.appendChild(p);
+}
+
+function findRelatedDivergences(svc, op) {
+  if (!svc.divergences?.length) return [];
+  const re = new RegExp(`\\b${escapeRegExp(op.name)}\\b`, "i");
+  return svc.divergences.filter((d) => re.test(d.title) || re.test(d.body));
+}
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function copyToClipboard(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+    const original = btn.textContent;
+    btn.textContent = "copied";
+    btn.classList.add("copied");
+    setTimeout(() => {
+      btn.textContent = original;
+      btn.classList.remove("copied");
+    }, 1200);
+  } catch {
+    btn.textContent = "manual";
+  }
 }
 
 // ---------------------------------------------------------------- WIRING
@@ -482,7 +584,7 @@ function openSidePanel() {
 }
 function closeSidePanel() {
   document.getElementById("side-panel").hidden = true;
-  document.querySelectorAll(".timeline-pill.selected, .wiring-flow.selected").forEach((e) => e.classList.remove("selected"));
+  document.querySelectorAll(".timeline-pill.selected, .wiring-flow.selected, .op.selected").forEach((e) => e.classList.remove("selected"));
 }
 
 // ---------------------------------------------------------------- TOOLTIP
