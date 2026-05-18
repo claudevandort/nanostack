@@ -11,6 +11,8 @@ const storage = @import("../../storage/mod.zig");
 const errors = @import("../../wire/sns/errors.zig");
 const params_mod = @import("../../wire/sns/params.zig");
 const principal_mod = @import("../../auth/principal.zig");
+const sns_action_map = @import("../../auth/sns_action_map.zig");
+const authz = @import("authz.zig");
 const topics_handler = @import("topics.zig");
 const subs_handler = @import("subscriptions.zig");
 const publish_handler = @import("publish.zig");
@@ -61,6 +63,16 @@ pub const Context = struct {
 
 pub fn handle(ctx: Context) Result {
     const action = ctx.request.action;
+
+    // Topic Policy authz hook (v0.4.2). Runs after action match, before
+    // op dispatch. Only known actions get this far. `--no-auth` bypasses
+    // inside `authz.check`. Owner-implicit-allow short-circuits for
+    // requests signed with the configured access_key.
+    if (sns_action_map.actionFor(action).len > 0) {
+        if (authz.check(ctx, action) == .deny) {
+            return .{ .err = .{ .code = .authorization_error } };
+        }
+    }
 
     // Topics (Phase B).
     if (std.mem.eql(u8, action, "CreateTopic")) return topics_handler.createTopic(ctx);

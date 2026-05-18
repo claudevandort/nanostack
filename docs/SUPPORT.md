@@ -406,7 +406,7 @@ These will only be added if a real user hits a setup-script gap; not on any road
 
 ## SNS
 
-SNS is the fourth AWS service nanostack covers, opt-in via `--services sns` (or include it in a multi-service list like `--services s3,sqs,sns`). v0.4.0 shipped 17 ops; **v0.4.1 lands 2 more (`AddPermission` / `RemovePermission`)**, **persists tags across restart**, **evaluates `FilterPolicy` at publish time** (exact string-array matches), and **carries per-entry MessageAttributes through `PublishBatch`**. Standard topics only; FIFO topics are deferred. Subscription protocols: `sqs` fires fan-out; `lambda` / `http` / `https` / `email` / `email-json` / `sms` are accept-store-roundtrip (subscriptions persist but never deliver — Lambda lands in v0.5.0, the rest are out of scope).
+SNS is the fourth AWS service nanostack covers, opt-in via `--services sns` (or include it in a multi-service list like `--services s3,sqs,sns`). v0.4.0 shipped 17 ops; v0.4.1 added `AddPermission` / `RemovePermission`, tags persistence, FilterPolicy evaluation, and PublishBatch per-entry attrs; **v0.4.2 enforces the Topic Policy attribute at request time** via the new `services/sns/authz.zig` hook (mirrors the v0.3.3 SQS authz pattern). After v0.4.2, SNS is feature-complete + fully enforced modulo FIFO topics. Subscription protocols: `sqs` fires fan-out; `lambda` / `http` / `https` / `email` / `email-json` / `sms` are accept-store-roundtrip.
 
 **Wire protocol divergence**: unlike DDB / modern SQS, SNS uses the AWS query protocol — `application/x-www-form-urlencoded` request bodies + XML responses + an `Action=<Op>` body parameter (not `X-Amz-Target` header). nanostack detects SNS requests by sniffing `Action=` in the body before falling through to S3.
 
@@ -426,7 +426,7 @@ SNS is the fourth AWS service nanostack covers, opt-in via `--services sns` (or 
 | ConfirmSubscription | supported (accepts arbitrary token; auto-confirms the first unconfirmed sub on the topic) | v0.4.0 |
 | Publish | supported (delivers SNS envelope JSON to SQS subscribers; raw bytes when RawMessageDelivery=true; MessageAttributes round-trip into envelope; **gated by subscription FilterPolicy as of v0.4.1**) | v0.4.0, filter eval v0.4.1 |
 | PublishBatch | supported (per-entry Successful / Failed split; **per-entry MessageAttributes as of v0.4.1**) | v0.4.0, attrs v0.4.1 |
-| AddPermission | supported (constructs an IAM-style Statement and merges it into the Policy attribute; duplicate Label → InvalidParameterValue; **resulting policy is accept-store-roundtrip — not enforced** — enforcement deferred to v0.4.2) | v0.4.1 |
+| AddPermission | supported (constructs an IAM-style Statement and merges it into the Policy attribute; duplicate Label → InvalidParameterValue; **resulting policy is enforced at request time as of v0.4.2**) | v0.4.1, eval v0.4.2 |
 | RemovePermission | supported (drops the matching statement; clears the Policy attribute when the last statement is removed) | v0.4.1 |
 | TagResource | supported (**persisted across restart as of v0.4.1**; max 50 tags) | v0.4.0, persistence v0.4.1 |
 | UntagResource | supported (persisted) | v0.4.0, persistence v0.4.1 |
@@ -435,7 +435,8 @@ SNS is the fourth AWS service nanostack covers, opt-in via `--services sns` (or 
 Documented divergences (intentional):
 - **Query wire protocol only.** No JSON migration to track; modern AWS SDKs (boto3, aws-sdk-js v3, AWS CLI v2) all use query.
 - **FIFO topics deferred.** `.fifo` suffix rejected. Future v0.4.x patch.
-- **Topic Policy attribute is accept-store-roundtrip.** `AddPermission` / `RemovePermission` / `SetTopicAttributes` all mutate the Policy correctly and `GetTopicAttributes` returns it, but the policy is **not evaluated at request time**. Enforcement deferred to v0.4.2 — mirrors the v0.3.2 → v0.3.3 SQS trajectory.
+- **Internal cross-service dispatch bypasses the authz hook.** `s3/events.zig` calls `snsPublish` at the storage layer (S3 → SNS notifications), and the SNS handler dispatches `sqsSendMessage` directly for fan-out — neither path reaches the SNS authz hook. Same documented divergence as v0.3.4 S3 → SQS dispatch. AWS uses a service-principal model we don't surface.
+- **Topic-policy Condition blocks unsupported.** `auth/policy_eval.zig` skips Condition blocks (treats them as no-match), the same constraint that applies to S3 bucket policies and SQS queue policies. A statement with a Condition block evaluates as `no_match` and contributes nothing to the decision.
 - **Filter-policy operators deferred.** v0.4.1 evaluates exact string-array shapes (e.g. `{"category": ["news", "sports"]}`); operator objects (`prefix`, `anything-but`, `numeric`, `exists`, `cidr`, `suffix`) are treated as no-match (the subscription is filtered out). AND across top-level keys, OR within a rule array. Future v0.4.x patch will land the operator set.
 - **Only `sqs` protocol fires.** `lambda` / `http` / `https` / `email` / `email-json` / `sms` subscriptions are stored but never deliver.
 - **`ConfirmSubscription` auto-confirms** SQS subs at Subscribe time; for non-SQS protocols, the confirmation is a no-op that flips the persisted bit (since those subs never fire anyway).
