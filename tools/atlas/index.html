@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>nanostack atlas</title>
+  <link rel="stylesheet" href="atlas.css" />
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-row">
+      <div class="hero-version">
+        <span class="version-pill" id="version-pill">v—</span>
+        <span class="version-label">nanostack</span>
+      </div>
+      <button id="theme-toggle" class="theme-toggle" aria-label="Toggle theme">theme</button>
+    </div>
+    <p class="hero-tagline" id="hero-tagline"></p>
+    <div class="tiles" id="headline-tiles"></div>
+  </header>
+
+  <main class="layout">
+    <section class="panel panel-matrix">
+      <h2>Service surface</h2>
+      <p class="panel-hint">Hover an op for the verbatim SUPPORT.md status. Filter by status using the badges. The matrix renders the first <code>Operation</code>-column table per service — multi-table sections (S3 cross-cutting / lock / config) live in SUPPORT.md.</p>
+      <div class="status-legend" id="status-legend"></div>
+      <div class="matrix" id="matrix"></div>
+    </section>
+
+    <section class="panel panel-wiring">
+      <h2>Cross-service wiring</h2>
+      <p class="panel-hint">Click a flow for divergence notes.</p>
+      <div class="wiring" id="wiring"></div>
+    </section>
+
+    <section class="panel panel-timeline">
+      <h2>Version trajectory</h2>
+      <p class="panel-hint">Click a pill for the release summary.</p>
+      <div class="timeline" id="timeline"></div>
+    </section>
+
+    <section class="panel panel-bench">
+      <h2>Performance baseline</h2>
+      <p class="panel-hint">From <code>docs/BENCH.md</code> — dev-machine numbers, ReleaseFast + strip.</p>
+      <div class="bench-grid" id="bench-grid"></div>
+    </section>
+  </main>
+
+  <aside id="side-panel" class="side-panel" hidden>
+    <button class="side-close" id="side-close" aria-label="Close">×</button>
+    <div id="side-content"></div>
+  </aside>
+
+  <script src="atlas.js"></script>
+</body>
+</html>
