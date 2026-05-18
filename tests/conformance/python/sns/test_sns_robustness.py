@@ -242,3 +242,87 @@ def test_remove_permission_clears_policy_when_empty(sns):
         assert "Policy" not in attrs or not attrs["Policy"]
     finally:
         sns.delete_topic(TopicArn=arn)
+
+
+# ---------- Phase C — PublishBatch MessageAttributes ----------
+
+
+def _drain(sqs, queue_url, max_wait_s=3.0):
+    deadline = time.time() + max_wait_s
+    msgs = []
+    while time.time() < deadline:
+        out = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+        got = out.get("Messages", [])
+        if not got:
+            if msgs:
+                return msgs
+            continue
+        for m in got:
+            msgs.append(m)
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=m["ReceiptHandle"])
+    return msgs
+
+
+def test_publish_batch_per_entry_message_attributes(sns, sqs):
+    tname = f"t_{secrets.token_hex(4)}"
+    qname = f"q_{secrets.token_hex(4)}"
+    topic_arn = sns.create_topic(Name=tname)["TopicArn"]
+    queue_url = sqs.create_queue(QueueName=qname)["QueueUrl"]
+    queue_arn = f"arn:aws:sqs:us-east-1:000000000000:{qname}"
+    try:
+        sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)
+        sns.publish_batch(
+            TopicArn=topic_arn,
+            PublishBatchRequestEntries=[
+                {
+                    "Id": "e1",
+                    "Message": "first",
+                    "MessageAttributes": {
+                        "category": {"DataType": "String", "StringValue": "news"},
+                    },
+                },
+                {
+                    "Id": "e2",
+                    "Message": "second",
+                    "MessageAttributes": {
+                        "category": {"DataType": "String", "StringValue": "sports"},
+                    },
+                },
+            ],
+        )
+        msgs = _drain(sqs, queue_url)
+        assert len(msgs) == 2
+        envelopes = sorted(
+            (json.loads(m["Body"]) for m in msgs),
+            key=lambda e: e["Message"],
+        )
+        # First entry: Message="first", category="news"
+        assert envelopes[0]["Message"] == "first"
+        assert envelopes[0]["MessageAttributes"]["category"]["Value"] == "news"
+        # Second entry: Message="second", category="sports"
+        assert envelopes[1]["Message"] == "second"
+        assert envelopes[1]["MessageAttributes"]["category"]["Value"] == "sports"
+    finally:
+        sns.delete_topic(TopicArn=topic_arn)
+        sqs.delete_queue(QueueUrl=queue_url)
+
+
+def test_publish_batch_entry_without_attrs(sns, sqs):
+    tname = f"t_{secrets.token_hex(4)}"
+    qname = f"q_{secrets.token_hex(4)}"
+    topic_arn = sns.create_topic(Name=tname)["TopicArn"]
+    queue_url = sqs.create_queue(QueueName=qname)["QueueUrl"]
+    queue_arn = f"arn:aws:sqs:us-east-1:000000000000:{qname}"
+    try:
+        sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)
+        sns.publish_batch(
+            TopicArn=topic_arn,
+            PublishBatchRequestEntries=[{"Id": "x", "Message": "no-attrs"}],
+        )
+        msgs = _drain(sqs, queue_url)
+        env = json.loads(msgs[0]["Body"])
+        assert env["Message"] == "no-attrs"
+        assert "MessageAttributes" not in env
+    finally:
+        sns.delete_topic(TopicArn=topic_arn)
+        sqs.delete_queue(QueueUrl=queue_url)
