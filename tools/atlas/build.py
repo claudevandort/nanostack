@@ -15,7 +15,10 @@ truth for it. If the docs and data.json drift, rerun this script.
 
 from __future__ import annotations
 
+import argparse
+import datetime as dt
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, asdict, field
@@ -32,6 +35,8 @@ PRD_MD = DOCS / "PRD.md"
 COVERAGE_MD = DOCS / "COVERAGE.md"
 BENCH_MD = DOCS / "BENCH.md"
 CLAUDE_MD = REPO_ROOT / "CLAUDE.md"
+
+DEFAULT_PLANS_DIR = Path.home() / ".claude" / "plans"
 
 
 # ---------------------------------------------------------------------------
@@ -460,10 +465,285 @@ def parse_claude_intro(text: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Plan parsing (~/.claude/plans/<slug>.md)
+#
+# Plans vary in structure across files: some use "Decisions Taken",
+# others "Approach + File changes" tables. We do a generic H2 walk
+# first; then run a small layer of enrichers that attach extra
+# structure when a section matches a known shape. Unknown sections
+# fall through to a freeform card on the frontend.
+
+
+def find_active_plan(plans_dir: Path) -> Path | None:
+    """Return the most-recently-modified `.md` file in ``plans_dir``."""
+    if not plans_dir.exists() or not plans_dir.is_dir():
+        return None
+    candidates = list(plans_dir.glob("*.md"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+H1_RE = re.compile(r"^#\s+(.+?)\s*$")
+H2_RE = re.compile(r"^##\s+(.+?)\s*$")
+H3_RE = re.compile(r"^###\s+(.+?)\s*$")
+NUMBERED_RE = re.compile(r"^(\d+)\.\s+(.+)$")
+BULLET_RE = re.compile(r"^[-*]\s+(.+)$")
+
+
+def _classify_section(title: str) -> str:
+    t = title.strip().lower()
+    if t in ("context", "background", "approach", "summary"):
+        return "context"
+    if t in ("decisions taken", "decisions", "approach (numbered)"):
+        return "decisions"
+    if t == "scope":
+        return "scope"
+    if t in ("critical files", "file changes", "files"):
+        return "files"
+    if t in ("open items", "out of scope", "out of scope (explicit)", "boundaries", "deferred", "open questions"):
+        return "boundaries"
+    return "freeform"
+
+
+def _split_h2_sections(lines: list[str]) -> list[dict]:
+    """Walk markdown lines, returning a list of `{title, raw_lines}` per H2."""
+    sections: list[dict] = []
+    current: dict | None = None
+    for line in lines:
+        m = H2_RE.match(line)
+        if m:
+            if current is not None:
+                sections.append(current)
+            current = {"title": m.group(1), "raw_lines": []}
+        else:
+            if current is not None:
+                current["raw_lines"].append(line)
+    if current is not None:
+        sections.append(current)
+    # Trim trailing blank lines per section.
+    for s in sections:
+        while s["raw_lines"] and not s["raw_lines"][-1].strip():
+            s["raw_lines"].pop()
+    return sections
+
+
+def _enrich_decisions(raw_lines: list[str]) -> list[str] | None:
+    """Extract numbered list items (decisions/approach steps). Returns
+    items joined with their continuation paragraphs, or None if no
+    numbered items found."""
+    items: list[str] = []
+    current: list[str] | None = None
+    for line in raw_lines:
+        m = NUMBERED_RE.match(line.strip())
+        if m:
+            if current is not None:
+                items.append("\n".join(current).strip())
+            current = [m.group(2)]
+        elif current is not None and (line.startswith(" ") or line.startswith("\t") or not line.strip() or BULLET_RE.match(line.strip()) is None):
+            # Either an indented continuation, a blank line within an item,
+            # or any non-numbered prose — fold into the current item.
+            current.append(line)
+    if current is not None:
+        items.append("\n".join(current).strip())
+    return items if items else None
+
+
+def _enrich_scope_phases(raw_lines: list[str]) -> list[dict] | None:
+    """Split a Scope section into phase cards by `### Phase *` H3s."""
+    phases: list[dict] = []
+    current: dict | None = None
+    for line in raw_lines:
+        m = H3_RE.match(line)
+        if m and "phase" in m.group(1).lower():
+            if current is not None:
+                phases.append(current)
+            current = {"title": m.group(1), "raw_lines": []}
+        else:
+            if current is not None:
+                current["raw_lines"].append(line)
+    if current is not None:
+        phases.append(current)
+    # Trim each phase's trailing blank lines.
+    for p in phases:
+        while p["raw_lines"] and not p["raw_lines"][-1].strip():
+            p["raw_lines"].pop()
+    return phases if phases else None
+
+
+def _enrich_files(raw_lines: list[str]) -> dict | None:
+    """Split Critical Files into Modified vs New lists.
+
+    Supports two shapes:
+      ### Modified / ### New  (H3 sub-headings)
+      **Modified:** / **New:** (bold inline labels)
+    """
+    modified: list[str] = []
+    new: list[str] = []
+    bucket: list[str] | None = None
+    for line in raw_lines:
+        h3 = H3_RE.match(line)
+        if h3:
+            t = h3.group(1).strip().lower()
+            if "modified" in t:
+                bucket = modified
+            elif "new" in t:
+                bucket = new
+            else:
+                bucket = None
+            continue
+        # Bold-label sentinels.
+        stripped = line.strip()
+        if stripped.startswith("**Modified") or stripped.startswith("**modified"):
+            bucket = modified
+            continue
+        if stripped.startswith("**New") or stripped.startswith("**new"):
+            bucket = new
+            continue
+        if bucket is None:
+            continue
+        m = BULLET_RE.match(stripped)
+        if m:
+            bucket.append(m.group(1))
+    if not modified and not new:
+        return None
+    return {"modified": modified, "new": new}
+
+
+def _enrich_boundaries(raw_lines: list[str]) -> list[str] | None:
+    """Pull top-level bullets from an Open Items / Out of Scope section."""
+    items: list[str] = []
+    current: list[str] | None = None
+    for line in raw_lines:
+        m = BULLET_RE.match(line.lstrip())
+        if m and not line.startswith(" ") and not line.startswith("\t"):
+            if current is not None:
+                items.append("\n".join(current).strip())
+            current = [m.group(1)]
+        elif current is not None:
+            current.append(line)
+    if current is not None:
+        items.append("\n".join(current).strip())
+    return items if items else None
+
+
+def parse_plan(text: str) -> dict:
+    """Parse a plan markdown into the atlas plan-board structure."""
+    lines = text.splitlines()
+    title = ""
+    for line in lines:
+        m = H1_RE.match(line)
+        if m:
+            title = m.group(1)
+            break
+
+    raw_sections = _split_h2_sections(lines)
+    sections: list[dict] = []
+    for s in raw_sections:
+        kind = _classify_section(s["title"])
+        body = "\n".join(s["raw_lines"]).strip()
+        record: dict = {
+            "title": s["title"],
+            "type": kind,
+            "body": body,
+        }
+        if kind == "decisions":
+            extracted = _enrich_decisions(s["raw_lines"])
+            if extracted:
+                record["items"] = extracted
+            else:
+                record["type"] = "freeform"
+        elif kind == "scope":
+            phases = _enrich_scope_phases(s["raw_lines"])
+            if phases:
+                record["phases"] = [
+                    {"title": p["title"], "body": "\n".join(p["raw_lines"]).strip()}
+                    for p in phases
+                ]
+            else:
+                record["type"] = "freeform"
+        elif kind == "files":
+            split = _enrich_files(s["raw_lines"])
+            if split:
+                record["modified"] = split["modified"]
+                record["new"] = split["new"]
+            else:
+                record["type"] = "freeform"
+        elif kind == "boundaries":
+            items = _enrich_boundaries(s["raw_lines"])
+            if items:
+                record["items"] = items
+            else:
+                record["type"] = "freeform"
+        sections.append(record)
+    return {"title": title, "sections": sections}
+
+
+def build_plan_payload(plans_dir: Path) -> dict:
+    """Top-level orchestrator. Always returns a JSON-safe dict, even on
+    error — frontend reads `present` to branch."""
+    plans_dir = plans_dir.expanduser()
+    path = find_active_plan(plans_dir)
+    if path is None:
+        return {
+            "present": False,
+            "reason": "no .md files in plans dir",
+            "source_dir": str(plans_dir),
+        }
+    parsed = parse_plan(path.read_text())
+    mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
+    return {
+        "present": True,
+        "slug": path.stem,
+        "source_path": str(path),
+        "source_dir": str(plans_dir),
+        "mtime": mtime.isoformat(),
+        "title": parsed["title"],
+        "sections": parsed["sections"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 
 
 def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(description="Build the atlas data + plan JSON.")
+    ap.add_argument("--plan-only", action="store_true",
+                    help="Skip re-parsing project docs; refresh plan.json only.")
+    ap.add_argument("--data-only", action="store_true",
+                    help="Skip the plan parse; refresh data.json only.")
+    ap.add_argument("--plans-dir", default=os.environ.get("PLANS_DIR"),
+                    help="Override the plans directory. Default ~/.claude/plans/")
+    args = ap.parse_args(argv)
+
+    plans_dir = Path(args.plans_dir) if args.plans_dir else DEFAULT_PLANS_DIR
+
+    if not args.plan_only:
+        _build_data_json()
+
+    if not args.data_only:
+        _build_plan_json(plans_dir)
+
+    return 0
+
+
+def _build_plan_json(plans_dir: Path) -> None:
+    payload = build_plan_payload(plans_dir)
+    out_path = ATLAS / "plan.json"
+    out_path.write_text(json.dumps(payload, indent=2) + "\n")
+    rel = out_path.relative_to(REPO_ROOT)
+    if payload.get("present"):
+        print(f"wrote {rel}")
+        print(f"  plan: {payload['title'][:60]}{'…' if len(payload['title']) > 60 else ''}")
+        print(f"  slug: {payload['slug']}")
+        print(f"  sections: {len(payload['sections'])}")
+    else:
+        print(f"wrote {rel} (empty-state — {payload['reason']})")
+
+
+def _build_data_json() -> None:
     services, cross, wedge = parse_support(SUPPORT_MD.read_text())
     changelog = parse_changelog(CHANGELOG_MD.read_text())
     trajectory = parse_trajectory(PRD_MD.read_text())
@@ -518,7 +798,6 @@ def main(argv: list[str]) -> int:
     print(f"  bench metrics: {len(bench)}")
     print(f"  s3 smithy coverage: {coverage.get('s3')}")
     print(f"  latest tests: {latest_tests}")
-    return 0
 
 
 if __name__ == "__main__":

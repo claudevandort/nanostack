@@ -19,7 +19,7 @@ The wedge is **accuracy beats LocalStack on the surface we cover**. See `docs/PR
 | Run the perf gate | `zig build bench` (wraps `bench/run.sh` — builds ReleaseFast+strip, drives `bench/driver.py`) |
 | Release build | `zig build -Doptimize=ReleaseFast -Dstrip=true` |
 | Smithy coverage report | `python3 scripts/smithy_coverage.py` (regenerates `docs/COVERAGE.md`) |
-| Refresh project atlas | `python3 tools/atlas/build.py` (re-parses docs into `tools/atlas/data.json`; open `tools/atlas/index.html` to view) |
+| Refresh project atlas | `python3 tools/atlas/build.py` (re-parses docs into `tools/atlas/data.json` + the active plan into `tools/atlas/plan.json`; open `tools/atlas/index.html` to view, or `tools/atlas/plan.html` for the plan board). `--plan-only` skips the doc parse for fast plan-board refreshes; `--plans-dir <path>` overrides the lookup. |
 
 ### Conformance suites (CI gate)
 

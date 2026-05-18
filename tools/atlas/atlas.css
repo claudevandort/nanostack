@@ -494,6 +494,213 @@ ul.code-paths li {
 .copy-btn:hover { background: var(--bg-elev); color: var(--fg); }
 .copy-btn.copied { color: var(--accent); border-color: var(--accent); }
 
+/* ---------------------------------------------------------------- PAGE NAV */
+
+.page-nav {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.page-nav-link {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg-mute);
+  text-decoration: none;
+  padding: 3px 0;
+  border-bottom: 2px solid transparent;
+  transition: color 120ms ease-out, border-color 120ms ease-out;
+}
+.page-nav-link:hover { color: var(--fg); }
+.page-nav-link.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.page-nav .theme-toggle { margin-left: auto; }
+
+/* ---------------------------------------------------------------- PLAN BOARD */
+
+.layout-plan {
+  grid-template-columns: 1fr;
+}
+
+#plan-hero {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.plan-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--fg);
+  letter-spacing: 0.01em;
+}
+.plan-meta {
+  font-size: 12px;
+  color: var(--fg-soft);
+}
+.plan-slug, .plan-mtime {
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+.plan-section {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 18px 20px;
+  margin-bottom: 14px;
+}
+.plan-section h2 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--fg);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.plan-section h5 {
+  margin: 12px 0 4px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--fg-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.plan-section p, .plan-section li {
+  color: var(--fg-mute);
+  line-height: 1.55;
+  margin: 0 0 8px;
+}
+.plan-section p:last-child, .plan-section li:last-child { margin-bottom: 0; }
+.plan-section ul { padding-left: 18px; margin: 6px 0; }
+.plan-section ol { padding-left: 0; margin: 0; list-style: none; counter-reset: dec; }
+.plan-section pre {
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-x: auto;
+  color: var(--fg);
+  margin: 6px 0;
+}
+.plan-section code {
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  background: var(--bg-elev-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: var(--fg);
+}
+.plan-section a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.plan-section a:hover { text-decoration: underline; }
+.plan-section .muted { color: var(--fg-soft); font-style: italic; }
+
+/* Decisions — numbered card stack. */
+
+.decision-list { counter-reset: dec; }
+.decision-card {
+  counter-increment: dec;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--st-supported);
+  border-radius: var(--radius);
+  padding: 10px 14px 10px 38px;
+  margin-bottom: 8px;
+  position: relative;
+}
+.decision-card::before {
+  content: counter(dec);
+  position: absolute;
+  left: 12px;
+  top: 10px;
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--st-supported);
+  background: var(--st-supported-bg);
+  padding: 1px 7px;
+  border-radius: 999px;
+}
+
+/* Scope — horizontal phase rail. */
+
+.phase-rail {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+.phase-card {
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-top: 3px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  max-height: 540px;
+  overflow-y: auto;
+}
+.phase-card h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  letter-spacing: 0.01em;
+}
+
+/* Files — 2-col Modified | New split. */
+
+.files-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+@media (max-width: 720px) {
+  .files-split { grid-template-columns: 1fr; }
+}
+.files-col h4 {
+  margin: 0 0 6px;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-soft);
+}
+.files-list {
+  list-style: none;
+  padding-left: 0;
+  margin: 0;
+}
+.files-list li {
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  margin-bottom: 4px;
+  font-size: 12.5px;
+}
+
+/* Boundaries — warning-tone card grid. */
+
+.boundaries-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 8px;
+}
+.boundary-card {
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--st-roundtrip);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  font-size: 12.5px;
+}
+.boundary-card p { margin-bottom: 0; }
+
 /* ---------------------------------------------------------------- TOOLTIP */
 
 .tooltip {
