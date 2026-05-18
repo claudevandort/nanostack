@@ -24,3 +24,4 @@ bench/driver/bench
 # Atlas plan board — generated from the user's private ~/.claude/plans/.
 # Committing it would leak private plan content into the public repo.
 tools/atlas/plan.json
+tools/atlas/plan.overlay.json

@@ -1,7 +1,17 @@
 // Plan board — renders plan.json from build.py into a card view.
-// Read-only; the source is ~/.claude/plans/<slug>.md.
+// Annotations are layered on top via plan.overlay.json, which the
+// dev server (`tools/atlas/serve.py`) accepts PUTs to. The plan .md
+// is canonical; the overlay is the user's reactions on top.
 
 let PLAN = null;
+let OVERLAY = { annotations: {} };
+const FLAGS = [
+  { id: "none", label: "—", color: "var(--st-unknown)" },
+  { id: "agreed", label: "✓ agreed", color: "var(--st-enforced)" },
+  { id: "question", label: "? question", color: "var(--st-roundtrip)" },
+  { id: "blocked", label: "! blocked", color: "var(--st-not_supported)" },
+  { id: "out", label: "🚫 out", color: "var(--st-partial)" },
+];
 
 async function init() {
   initTheme();
@@ -15,12 +25,26 @@ async function init() {
     return;
   }
 
+  // Overlay is optional; 404 / parse-error → start with an empty one.
+  try {
+    const resp = await fetch("./plan.overlay.json");
+    if (resp.ok) {
+      const j = await resp.json();
+      if (j && typeof j === "object" && j.annotations) {
+        OVERLAY = j;
+      }
+    }
+  } catch {
+    // ignore
+  }
+
   if (!PLAN || PLAN.present === false) {
     renderEmpty();
     return;
   }
   renderHero();
   renderSections();
+  attachGlobalKeys();
 }
 
 // ---------------------------------------------------------------- THEME
@@ -105,6 +129,7 @@ function renderSection(s) {
 function proseCard(title, body, extraClass = "") {
   const sec = section(title, extraClass);
   sec.appendChild(renderBlocks(body));
+  decorateCard(sec, cardId(extraClass || "prose", 0, title + body));
   return sec;
 }
 
@@ -112,10 +137,11 @@ function decisionsCard(s) {
   const sec = section(s.title, "decisions");
   const list = document.createElement("ol");
   list.className = "decision-list";
-  (s.items || []).forEach((text) => {
+  (s.items || []).forEach((text, i) => {
     const li = document.createElement("li");
     li.className = "decision-card";
     li.appendChild(renderBlocks(text));
+    decorateCard(li, cardId("decision", i, text));
     list.appendChild(li);
   });
   sec.appendChild(list);
@@ -126,13 +152,14 @@ function scopeCard(s) {
   const sec = section(s.title, "scope");
   const rail = document.createElement("div");
   rail.className = "phase-rail";
-  (s.phases || []).forEach((p) => {
+  (s.phases || []).forEach((p, i) => {
     const card = document.createElement("article");
     card.className = "phase-card";
     const h = document.createElement("h3");
     h.textContent = p.title;
     card.appendChild(h);
     card.appendChild(renderBlocks(p.body));
+    decorateCard(card, cardId("phase", i, p.title + p.body));
     rail.appendChild(card);
   });
   sec.appendChild(rail);
@@ -177,10 +204,11 @@ function boundariesCard(s) {
   const sec = section(s.title, "boundaries");
   const grid = document.createElement("div");
   grid.className = "boundaries-grid";
-  (s.items || []).forEach((text) => {
+  (s.items || []).forEach((text, i) => {
     const card = document.createElement("div");
     card.className = "boundary-card";
     card.appendChild(renderBlocks(text));
+    decorateCard(card, cardId("boundary", i, text));
     grid.appendChild(card);
   });
   sec.appendChild(grid);
@@ -306,6 +334,222 @@ function mdInline(text) {
 function stripMd(text) {
   if (!text) return "";
   return text.replace(/\*\*([^*]+)\*\*/g, "$1").replace(/`([^`]+)`/g, "$1");
+}
+
+// ---------------------------------------------------------------- ANNOTATIONS
+
+// Deterministic 4-hex-char hash of the card's content. Stable across
+// --plan-only rebuilds when the content doesn't change.
+function shortHash(s) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return ("0000" + h.toString(16)).slice(-4);
+}
+
+function cardId(kind, index, content) {
+  return `${kind}-${index}-${shortHash(content || "")}`;
+}
+
+function decorateCard(el, id) {
+  el.dataset.cardId = id;
+  el.classList.add("annotatable");
+  el.tabIndex = 0;
+  const ann = OVERLAY.annotations?.[id];
+  if (ann && (ann.flag !== "none" || (ann.note && ann.note.trim()))) {
+    renderBadge(el, ann);
+  }
+  el.addEventListener("click", (ev) => {
+    if (ev.target.closest(".annotation-editor")) return;
+    if (ev.target.closest(".annotation-badge")) {
+      // Let click on badge open the editor too — same handler.
+    }
+    if (el.querySelector(":scope > .annotation-editor")) return;
+    openEditor(el, id);
+  });
+  el.addEventListener("keydown", (ev) => {
+    if (ev.key === "e" && !el.querySelector(":scope > .annotation-editor")) {
+      ev.preventDefault();
+      openEditor(el, id);
+    }
+  });
+}
+
+function renderBadge(el, ann) {
+  // Replace any existing badge.
+  el.querySelectorAll(":scope > .annotation-badge").forEach((b) => b.remove());
+  if (!ann || (ann.flag === "none" && !ann.note?.trim())) return;
+  const badge = document.createElement("div");
+  badge.className = "annotation-badge";
+  badge.dataset.flag = ann.flag;
+  const f = FLAGS.find((x) => x.id === ann.flag) ?? FLAGS[0];
+  const dot = document.createElement("span");
+  dot.className = "annotation-badge-dot";
+  dot.style.background = f.color;
+  badge.append(dot);
+  if (ann.note && ann.note.trim()) {
+    const note = document.createElement("span");
+    note.className = "annotation-badge-note";
+    note.textContent = ann.note;
+    badge.append(note);
+  } else {
+    badge.append(document.createTextNode(f.label));
+  }
+  el.appendChild(badge);
+}
+
+function openEditor(card, id) {
+  closeAllEditors();
+  const ann = OVERLAY.annotations?.[id] ?? { flag: "none", note: "" };
+
+  const editor = document.createElement("div");
+  editor.className = "annotation-editor";
+  editor.dataset.cardId = id;
+
+  const pillRow = document.createElement("div");
+  pillRow.className = "flag-pill-row";
+  FLAGS.forEach((f) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "flag-pill";
+    btn.dataset.flag = f.id;
+    btn.textContent = f.label;
+    btn.style.setProperty("--pill-color", f.color);
+    if (f.id === ann.flag) btn.classList.add("active");
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      pillRow.querySelectorAll(".flag-pill").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+    });
+    pillRow.append(btn);
+  });
+
+  const ta = document.createElement("textarea");
+  ta.className = "annotation-textarea";
+  ta.maxLength = 800;
+  ta.placeholder = "Optional note. Markdown: **bold**, `code`, [link](url).";
+  ta.value = ann.note || "";
+
+  const counter = document.createElement("div");
+  counter.className = "annotation-counter";
+  const updateCounter = () => {
+    counter.textContent = `${ta.value.length} / 800`;
+  };
+  updateCounter();
+  ta.addEventListener("input", updateCounter);
+
+  const actions = document.createElement("div");
+  actions.className = "annotation-actions";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "annotation-save";
+  save.textContent = "Save";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "annotation-cancel";
+  cancel.textContent = "Cancel";
+
+  cancel.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    editor.remove();
+  });
+  save.addEventListener("click", async (ev) => {
+    ev.stopPropagation();
+    const flag = pillRow.querySelector(".flag-pill.active")?.dataset.flag ?? "none";
+    const note = ta.value.trim();
+    save.disabled = true;
+    const ok = await persistAnnotation(id, { flag, note });
+    if (ok) {
+      // Update in-memory OVERLAY + badge + close.
+      if (flag === "none" && !note) {
+        delete OVERLAY.annotations[id];
+        // Wipe badge.
+        card.querySelectorAll(":scope > .annotation-badge").forEach((b) => b.remove());
+      } else {
+        OVERLAY.annotations[id] = { flag, note, updated_at: new Date().toISOString() };
+        renderBadge(card, OVERLAY.annotations[id]);
+      }
+      toast("saved", "ok");
+      editor.remove();
+    } else {
+      save.disabled = false;
+    }
+  });
+
+  actions.append(save, cancel);
+  editor.append(pillRow, ta, counter, actions);
+  card.appendChild(editor);
+  setTimeout(() => ta.focus(), 0);
+}
+
+function closeAllEditors() {
+  document.querySelectorAll(".annotation-editor").forEach((e) => e.remove());
+}
+
+async function persistAnnotation(id, value) {
+  // Update in-memory OVERLAY copy, then PUT the full overlay.
+  const next = JSON.parse(JSON.stringify(OVERLAY));
+  if (!next.annotations) next.annotations = {};
+  if (value.flag === "none" && !value.note) {
+    delete next.annotations[id];
+  } else {
+    next.annotations[id] = {
+      flag: value.flag,
+      note: value.note,
+      updated_at: new Date().toISOString(),
+    };
+  }
+  next.plan_slug = PLAN.slug;
+  next.plan_mtime = PLAN.mtime;
+  try {
+    const resp = await fetch("./plan.overlay.json", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(next),
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      let msg = `HTTP ${resp.status}`;
+      try {
+        const j = JSON.parse(body);
+        if (j.error) msg = j.error;
+      } catch {}
+      toast(`save failed: ${msg}`, "err");
+      return false;
+    }
+    return true;
+  } catch (err) {
+    toast(`save failed: ${err.message || err}`, "err");
+    return false;
+  }
+}
+
+function attachGlobalKeys() {
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") closeAllEditors();
+  });
+  document.addEventListener("click", (ev) => {
+    // Close editors when clicking outside any card.
+    if (!ev.target.closest(".annotatable")) closeAllEditors();
+  });
+}
+
+let _toastTimer = null;
+function toast(text, kind = "ok") {
+  let el = document.getElementById("atlas-toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "atlas-toast";
+    el.className = "atlas-toast";
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.dataset.kind = kind;
+  el.classList.add("visible");
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.remove("visible"), 1500);
 }
 
 init();

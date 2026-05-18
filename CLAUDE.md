@@ -20,6 +20,7 @@ The wedge is **accuracy beats LocalStack on the surface we cover**. See `docs/PR
 | Release build | `zig build -Doptimize=ReleaseFast -Dstrip=true` |
 | Smithy coverage report | `python3 scripts/smithy_coverage.py` (regenerates `docs/COVERAGE.md`) |
 | Refresh project atlas | `python3 tools/atlas/build.py` (re-parses docs into `tools/atlas/data.json` + the active plan into `tools/atlas/plan.json`; open `tools/atlas/index.html` to view, or `tools/atlas/plan.html` for the plan board). `--plan-only` skips the doc parse for fast plan-board refreshes; `--plans-dir <path>` overrides the lookup. |
+| Serve atlas (writeable) | `python3 tools/atlas/serve.py` — the writeable variant of `http.server` that the interactive plan board needs (accepts PUT on `/plan.overlay.json`). Default port 8765; `--port N` overrides. |
 
 ### Conformance suites (CI gate)
 
