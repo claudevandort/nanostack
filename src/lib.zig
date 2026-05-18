@@ -91,6 +91,7 @@ pub const storage_etag = @import("storage/etag.zig");
 pub const s3 = @import("services/s3/mod.zig");
 pub const preconditions = @import("services/s3/preconditions.zig");
 pub const multipart_service = @import("services/s3/multipart.zig");
+pub const s3_events = @import("services/s3/events.zig");
 pub const versioning_service = @import("services/s3/versioning.zig");
 pub const tagging_service = @import("services/s3/tagging.zig");
 pub const acl_service = @import("services/s3/acl.zig");
@@ -204,6 +205,7 @@ test {
     _ = s3;
     _ = preconditions;
     _ = multipart_service;
+    _ = s3_events;
     _ = versioning_service;
     _ = tagging_service;
     _ = acl_service;

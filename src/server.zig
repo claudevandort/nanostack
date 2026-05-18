@@ -162,6 +162,7 @@ pub const App = struct {
 
         const result = s3.handle(.{
             .backend = self.backend,
+            .sqs_backend = self.sqs_backend,
             .allocator = arena,
             .owner_id = self.config.access_key,
             .owner_display_name = "nanostack",

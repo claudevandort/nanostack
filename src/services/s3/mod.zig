@@ -81,6 +81,12 @@ pub const RequestData = struct {
 
 pub const Context = struct {
     backend: storage.Backend,
+    /// Optional SQS backend (v0.3.4). When present, S3 → SQS event
+    /// notification dispatch is enabled — `events.dispatchObjectCreated`
+    /// and friends call into it for matching QueueConfiguration entries
+    /// in the bucket's NotificationConfiguration. Null when nanostack
+    /// was started without `--services sqs`.
+    sqs_backend: ?storage.SqsBackend = null,
     /// Per-request arena, owned by the HTTP server. The result's body and
     /// header values are allocated here and live until the response is sent.
     allocator: Allocator,
